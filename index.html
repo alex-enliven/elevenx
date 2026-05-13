@@ -5963,7 +5963,7 @@ const PRICING = {
 
 // ─── FalClient ────────────────────────────────────────────────────────────
 
-window.ElevenX.FalClient = class {
+class FalClient {
   /**
    * @param {object} opts
    * @param {string} opts.workerUrl   — base URL of the Cloudflare Worker proxy
@@ -6239,19 +6239,27 @@ window.ElevenX.FalClient = class {
  * @param {"standard"|"fast"} tier
  * @param {"text"|"image"|"reference"} mode
  */
-window.ElevenX.estimateSeedanceCost = function(durationSeconds, tier = "standard", mode = "image") {
+function estimateSeedanceCost(durationSeconds, tier = "standard", mode = "image") {
   if (tier === "fast") return durationSeconds * PRICING.seedance_2_fast_720p_per_sec;
   if (mode === "image") return durationSeconds * PRICING.seedance_2_i2v_standard_720p_per_sec;
   return durationSeconds * PRICING.seedance_2_standard_720p_per_sec;
 }
 
-window.ElevenX.estimateSeedreamCost = function(numImages = 1, mode = "text_to_image") {
+function estimateSeedreamCost(numImages = 1, mode = "text_to_image") {
   const rate = mode === "edit" ? PRICING.seedream_v45_edit : PRICING.seedream_v45_text_to_image;
   return numImages * rate;
 }
 
-window.ElevenX.FAL_ENDPOINTS = { SEEDANCE, SEEDREAM, KLING };
-window.ElevenX.FAL_PRICING = PRICING;
+const FAL_ENDPOINTS = { SEEDANCE, SEEDREAM, KLING };
+const FAL_PRICING = PRICING;
+
+
+/* === auto-exposed to ElevenX namespace === */
+window.ElevenX.FalClient = FalClient;
+window.ElevenX.estimateSeedanceCost = estimateSeedanceCost;
+window.ElevenX.estimateSeedreamCost = estimateSeedreamCost;
+window.ElevenX.FAL_ENDPOINTS = FAL_ENDPOINTS;
+window.ElevenX.FAL_PRICING = FAL_PRICING;
 
 })();
 </script>
@@ -6292,7 +6300,7 @@ window.ElevenX.FAL_PRICING = PRICING;
  * @param {boolean} [ctx.currentShotHasKeyframe] — does keyframes/start exist
  * @returns {{ mode: "text_to_video"|"image_to_video"|"reference_to_video", rationale: string, explicit: boolean }}
  */
-window.ElevenX.resolveMode = function(shot, ctx = {}) {
+function resolveMode(shot, ctx = {}) {
   if (!shot) throw new Error("resolveMode: shot is required");
   const declared = shot.generation?.mode;
 
@@ -6373,7 +6381,7 @@ window.ElevenX.resolveMode = function(shot, ctx = {}) {
  * Pre-flight checks for a shot before firing Seedance.
  * Returns { ok, errors[], warnings[] }. Caller decides whether to block.
  */
-window.ElevenX.preflightShot = function(shot, ctx = {}) {
+function preflightShot(shot, ctx = {}) {
   const errors = [];
   const warnings = [];
   if (!shot) {
@@ -6426,6 +6434,11 @@ window.ElevenX.preflightShot = function(shot, ctx = {}) {
   return { ok: errors.length === 0, errors, warnings };
 }
 
+
+/* === auto-exposed to ElevenX namespace === */
+window.ElevenX.resolveMode = resolveMode;
+window.ElevenX.preflightShot = preflightShot;
+
 })();
 </script>
 
@@ -6466,7 +6479,7 @@ const GLOBAL_NEGATIVE =
  * @param {object} [input.assets]   — { startImageUrl, endImageUrl, referenceImageUrls[] }
  * @returns {{ prompt: string, body: object, attachmentsUsed: object }}
  */
-window.ElevenX.composeSeedance = function({ shot, cast, environment, series, episode, mode, assets }) {
+function composeSeedance({ shot, cast, environment, series, episode, mode, assets }) {
   if (!shot) throw new Error("composeSeedance: shot is required");
   if (!mode) throw new Error("composeSeedance: mode is required");
   cast = cast || [];
@@ -6706,7 +6719,7 @@ function formatCastCanon(c, shot) {
 /**
  * Seedance accepts integer 4..15 OR "auto". Clamp & coerce.
  */
-window.ElevenX.clampDuration = function(d) {
+function clampDuration(d) {
   if (d == null || d === "auto") return "auto";
   const n = Math.round(Number(d));
   if (Number.isNaN(n)) return "auto";
@@ -6722,7 +6735,7 @@ window.ElevenX.clampDuration = function(d) {
  * @param {object} character — cast bible entry
  * @param {"head_on"|"three_quarter"|"full_body"} angle
  */
-window.ElevenX.composeCastReferencePrompt = function(character, angle = "head_on") {
+function composeCastReferencePrompt(character, angle = "head_on") {
   const id   = character.identity || {};
   const phys = character.physical || {};
   const wrd  = character.wardrobe?.episode_default || {};
@@ -6776,7 +6789,7 @@ window.ElevenX.composeCastReferencePrompt = function(character, angle = "head_on
  * @param {object} character — cast bible entry
  * @param {"three_quarter"|"full_body"} angle — target angle
  */
-window.ElevenX.composeCastReferenceEditPrompt = function(character, angle) {
+function composeCastReferenceEditPrompt(character, angle) {
   const id   = character.identity || {};
   const phys = character.physical || {};
   const wrd  = character.wardrobe?.episode_default || {};
@@ -6826,7 +6839,7 @@ window.ElevenX.composeCastReferenceEditPrompt = function(character, angle) {
  * `detail` is then generated as an edit using the wide as reference —
  * same physical room, closer / different framing.
  */
-window.ElevenX.composeEnvironmentReferenceEditPrompt = function(environment, kind = "detail") {
+function composeEnvironmentReferenceEditPrompt(environment, kind = "detail") {
   const a = environment.architecture || {};
   const l = environment.lighting || {};
 
@@ -6864,7 +6877,7 @@ window.ElevenX.composeEnvironmentReferenceEditPrompt = function(environment, kin
 /**
  * Compose a Seedream prompt for an environment wide reference.
  */
-window.ElevenX.composeEnvironmentReferencePrompt = function(environment, kind = "wide") {
+function composeEnvironmentReferencePrompt(environment, kind = "wide") {
   const a = environment.architecture || {};
   const l = environment.lighting || {};
   const angleClause = kind === "wide"
@@ -6887,6 +6900,15 @@ window.ElevenX.composeEnvironmentReferencePrompt = function(environment, kind = 
     num_images: 1,
   };
 }
+
+
+/* === auto-exposed to ElevenX namespace === */
+window.ElevenX.composeSeedance = composeSeedance;
+window.ElevenX.clampDuration = clampDuration;
+window.ElevenX.composeCastReferencePrompt = composeCastReferencePrompt;
+window.ElevenX.composeCastReferenceEditPrompt = composeCastReferenceEditPrompt;
+window.ElevenX.composeEnvironmentReferenceEditPrompt = composeEnvironmentReferenceEditPrompt;
+window.ElevenX.composeEnvironmentReferencePrompt = composeEnvironmentReferencePrompt;
 
 })();
 </script>
@@ -6920,7 +6942,7 @@ window.ElevenX.composeEnvironmentReferencePrompt = function(environment, kind = 
  * @param {number} [opts.quality=0.95] — for jpeg only
  * @returns {Promise<Blob>} — image Blob; .type matches opts.format
  */
-window.ElevenX.extractLastFrameBlob = async function(videoSource, opts = {}) {
+async function extractLastFrameBlob(videoSource, opts = {}) {
   const offsetMs = opts.offsetFromEndMs ?? 80;
   const format = opts.format || "png";
   const quality = opts.quality ?? 0.95;
@@ -6972,7 +6994,7 @@ window.ElevenX.extractLastFrameBlob = async function(videoSource, opts = {}) {
 /**
  * Convenience: extract the last frame as a data: URL (small clips only).
  */
-window.ElevenX.extractLastFrameDataUrl = async function(videoSource, opts = {}) {
+async function extractLastFrameDataUrl(videoSource, opts = {}) {
   const blob = await extractLastFrameBlob(videoSource, opts);
   return blobToDataUrl(blob);
 }
@@ -6981,7 +7003,7 @@ window.ElevenX.extractLastFrameDataUrl = async function(videoSource, opts = {}) 
  * Compute SHA-256 of the extracted frame so the provenance sidecar can
  * record the exact bytes that were fed into the next Seedance call.
  */
-window.ElevenX.extractLastFrameWithHash = async function(videoSource, opts = {}) {
+async function extractLastFrameWithHash(videoSource, opts = {}) {
   const blob = await extractLastFrameBlob(videoSource, opts);
   const buf = await blob.arrayBuffer();
   const hashBuf = await crypto.subtle.digest("SHA-256", buf);
@@ -7007,7 +7029,7 @@ window.ElevenX.extractLastFrameWithHash = async function(videoSource, opts = {})
  * @param {function} [args.onProgress]
  * @returns {Promise<Array<{ videoBlob: Blob, lastFrame: Blob, segmentIndex: number, cost: number }>>}
  */
-window.ElevenX.chainSeedanceClips = async function({ falClient, segments, startImageUrl, onProgress }) {
+async function chainSeedanceClips({ falClient, segments, startImageUrl, onProgress }) {
   if (typeof document === "undefined") {
     throw new Error("chainSeedanceClips is browser-only (uses lastFrame extraction). Use Node tool for headless chaining.");
   }
@@ -7101,6 +7123,13 @@ function blobToDataUrl(blob) {
     r.readAsDataURL(blob);
   });
 }
+
+
+/* === auto-exposed to ElevenX namespace === */
+window.ElevenX.extractLastFrameBlob = extractLastFrameBlob;
+window.ElevenX.extractLastFrameDataUrl = extractLastFrameDataUrl;
+window.ElevenX.extractLastFrameWithHash = extractLastFrameWithHash;
+window.ElevenX.chainSeedanceClips = chainSeedanceClips;
 
 })();
 </script>
