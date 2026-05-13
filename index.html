@@ -4009,6 +4009,54 @@ a { color: inherit; text-decoration: none; }
   margin-top: auto;       /* push to bottom of card */
 }
 .s4 { padding: 16px 24px; }
+
+/* Shot context strip — sits between the title and the video preview */
+.elx-shot-ctx {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 14px;
+  background: #14141a; border: 1px solid #2a2a35; border-radius: 8px;
+  margin-bottom: 12px;
+  font-family: Inter, system-ui, sans-serif; font-size: 12px;
+}
+.elx-shot-ctx__num { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #c9a25a; font-size: 13px; }
+.elx-shot-ctx__tc  { font-family: 'JetBrains Mono', monospace; color: #9a9aab; }
+.elx-shot-ctx__mode { padding: 2px 7px; border-radius: 10px; background: rgba(99,102,241,0.18); color: #8487f5; font-size: 10px; font-family: 'JetBrains Mono', monospace; }
+.elx-shot-ctx__verb { color: #e8e8ee; }
+.elx-shot-ctx__focal { flex-basis: 100%; color: #c0c0ce; margin-top: 4px; font-family: 'EB Garamond', Georgia, serif; font-style: italic; font-size: 13px; line-height: 1.4; }
+
+/* Right rail — dynamic shot detail */
+.elx-rail { font-family: Inter, system-ui, sans-serif; font-size: 12px; color: #e8e8ee; padding: 4px 0 24px; }
+.elx-rail__head { padding: 4px 16px 12px; border-bottom: 1px solid #2a2a35; margin-bottom: 12px; }
+.elx-rail__shot-num { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #c9a25a; font-size: 11px; letter-spacing: 0.06em; }
+.elx-rail__shot-name { font-size: 16px; font-weight: 600; margin-top: 2px; }
+.elx-rail__section { padding: 0 16px 14px; border-bottom: 1px solid rgba(42,42,53,0.5); margin-bottom: 12px; }
+.elx-rail__section:last-child { border-bottom: none; }
+.elx-rail__label { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.10em; text-transform: uppercase; color: #9a9aab; margin-bottom: 6px; }
+.elx-rail__moment { font-family: 'EB Garamond', Georgia, serif; font-size: 15px; line-height: 1.4; }
+.elx-rail__emotion { font-size: 11px; color: #9a9aab; margin-top: 4px; font-style: italic; }
+.elx-rail__cast-row { padding: 8px 0; border-bottom: 1px solid rgba(42,42,53,0.4); }
+.elx-rail__cast-row:last-child { border-bottom: none; }
+.elx-rail__cast-name { font-weight: 600; font-size: 13px; }
+.elx-rail__cast-meta { font-size: 10px; color: #9a9aab; font-family: 'JetBrains Mono', monospace; margin-top: 1px; }
+.elx-rail__cast-action { font-size: 12px; color: #c0c0ce; margin-top: 4px; line-height: 1.4; }
+.elx-rail__cast-dialogue { font-size: 12px; color: #c9a25a; margin-top: 4px; line-height: 1.4; font-family: 'EB Garamond', Georgia, serif; font-style: italic; }
+.elx-rail__muted { color: #9a9aab; font-size: 11px; }
+.elx-rail__kv { display: flex; justify-content: space-between; padding: 3px 0; font-size: 11px; }
+.elx-rail__kv > span:first-child { color: #9a9aab; font-family: 'JetBrains Mono', monospace; }
+.elx-rail__ambient, .elx-rail__score { font-size: 11px; color: #c0c0ce; margin-top: 6px; font-style: italic; line-height: 1.4; }
+.elx-rail__inherit { font-size: 11px; color: #9a9aab; margin-top: 4px; }
+.elx-rail__watch { margin-top: 6px; padding: 6px 8px; background: rgba(251,191,36,0.06); border-left: 2px solid #fbbf24; border-radius: 0 4px 4px 0; }
+.elx-rail__watch-fail { font-size: 11px; color: #fbbf24; }
+.elx-rail__watch-fix { font-size: 11px; color: #c0c0ce; margin-top: 2px; font-style: italic; }
+
+/* Show prompt block — collapsible preview of the actual Seedance payload */
+.elx-prompt-block { margin-top: 14px; }
+.elx-prompt { background: #0a0a0c; border: 1px solid #2a2a35; border-radius: 8px; padding: 10px 14px; }
+.elx-prompt__summary { cursor: pointer; font-size: 11px; color: #9a9aab; font-family: 'JetBrains Mono', monospace; letter-spacing: 0.04em; padding: 4px 0; }
+.elx-prompt__summary:hover { color: #c9a25a; }
+.elx-prompt__pre { font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.5; color: #c0c0ce; white-space: pre-wrap; word-break: break-word; max-height: 60vh; overflow-y: auto; padding: 12px; background: #14141a; border-radius: 4px; margin: 10px 0 6px; }
+.elx-prompt__note { font-size: 10px; color: #5a5a6e; padding: 2px 0; }
+
 .take { background: #14141a; border: 1px solid #2a2a35; border-radius: 6px; padding: 8px; min-width: 110px; cursor: pointer; transition: border-color .15s; }
 .take:hover { border-color: #c9a25a; }
 .take.is-approved { border-color: #c9a25a; border-width: 2px; }
@@ -6469,12 +6517,32 @@ const GLOBAL_NEGATIVE =
 /**
  * Build the full prompt + Seedance body for a shot.
  *
+ * Uses the structured format Seedance 2.0 was trained on, verified against:
+ *   - IIEleven Creative's published prompt examples (May 2026)
+ *   - fal.ai's Seedance 2.0 prompting guide
+ *   - mindstudio.ai's timeline-prompting article
+ *
+ * Section order (each section is a [Label] block, separated by blank lines):
+ *   [Aesthetic]       visual style + grade language
+ *   [Storyline]       narrative context (why this shot matters)
+ *   [Characters]      cast in frame, who they are, what they do
+ *   [Environment]     location with critical props named
+ *   [Action Sequence] beat-by-beat with internal timecodes + SFX callouts
+ *   [Production Brief] camera + lens + lighting + duration + aspect
+ *   [Negative Prompt] anti-patterns + repeat critical props "MUST be visible"
+ *
+ * Critical Seedance behavior we counter-engineer:
+ *   • Missing props → repeat prop names in Action Sequence + Negative
+ *   • Silence at start → explicit SFX: callouts in Action Sequence opening
+ *   • Wrong actions → number shots, describe exact action per beat
+ *   • Identity drift → restate distinctive features per character
+ *
  * @param {object} input
- * @param {object} input.shot       — parsed shot.yaml
- * @param {object[]} input.cast     — array of resolved character bible entries (only those in this shot)
+ * @param {object} input.shot       — parsed shot.yaml (flat, after normalization)
+ * @param {object[]} input.cast     — resolved character bible entries (only those in this shot)
  * @param {object} input.environment — resolved environment bible entry for shot.location.location_id
- * @param {object} [input.series]   — parent series.yaml (for style bible)
- * @param {object} [input.episode]  — parent episode.yaml (for visual overrides)
+ * @param {object} [input.series]   — parent series.yaml (style bible)
+ * @param {object} [input.episode]  — parent episode.yaml (audio plan, director vision)
  * @param {string} input.mode       — "text_to_video" | "image_to_video" | "reference_to_video"
  * @param {object} [input.assets]   — { startImageUrl, endImageUrl, referenceImageUrls[] }
  * @returns {{ prompt: string, body: object, attachmentsUsed: object }}
@@ -6485,64 +6553,98 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
   cast = cast || [];
   assets = assets || {};
 
-  const sections = [];
+  // Collect "critical props" — environment props that MUST appear; we'll
+  // repeat them in the action sequence + name them in the negative prompt.
+  const criticalProps = (environment?.props || []).slice(0, 4);
 
-  // 1. REFERENCE LABELING (only for reference_to_video)
-  if (mode === "reference_to_video" && (assets.referenceImageUrls?.length || 0) > 0) {
-    const refs = assets.referenceImageUrls;
-    const labels = [];
-    let idx = 0;
-    for (const c of cast) {
-      const charRefs = [c.references?.head_on, c.references?.three_quarter, c.references?.full_body]
-        .filter(Boolean);
-      for (let i = 0; i < charRefs.length && idx < refs.length; i++) {
-        const angle = ["head-on", "three-quarter", "full body"][i] || "extra";
-        labels.push(`Image ${idx + 1}: ${c.display_name} — ${angle} portrait`);
-        idx++;
-      }
-    }
-    if (environment && idx < refs.length) {
-      labels.push(`Image ${idx + 1}: ${environment.display_name} — wide environment reference`);
-      idx++;
-    }
-    if (labels.length > 0) {
-      sections.push("Reference images attached:\n" + labels.join("\n"));
-    }
-  }
+  const blocks = [];
 
-  // 2. STYLE / GRADE INVARIANTS
+  // ── [Aesthetic] — visual + grade language ────────────────────────────
   const style = series?.style_bible?.visual_grammar || {};
   const grade = series?.style_bible?.color_grade || {};
-  const styleLine = [
-    "Visual style: documentary-cinematic realism",
-    style.lens_feel ? `, ${style.lens_feel}` : "",
-    grade.shadows ? `. Color grade: ${grade.shadows} shadows` : "",
-    grade.midtones ? `, ${grade.midtones} midtones` : "",
-    ". Natural skin texture. Subtle film grain. No over-smoothing.",
-  ].filter(Boolean).join("");
-  sections.push(styleLine);
+  const aesthetic = [
+    "Documentary-cinematic realism",
+    style.lens_feel || "35mm equivalent lens, slight shallow depth",
+    "natural skin texture, subtle film grain, no over-smoothing",
+    grade.shadows ? `${grade.shadows} shadows` : null,
+    grade.midtones ? `${grade.midtones} midtones` : null,
+    "soft warm skin tones, slight green-cyan lift",
+  ].filter(Boolean).join(". ") + ".";
+  blocks.push(`[Aesthetic] ${aesthetic}`);
 
-  // 3. THE MOMENT
-  if (shot.the_moment) {
-    const m = shot.the_moment;
-    const moment = [
-      `Shot ${shot.shot_number} (${shot.timecode?.in || "?"}–${shot.timecode?.out || "?"}, ${shot.timecode?.duration_seconds || "?"}s).`,
-      m.verb ? `The moment: ${m.verb}` : "",
-      m.focal_point ? ` — ${m.focal_point}` : "",
-      m.emotional_beat ? `. Emotional beat: ${m.emotional_beat}.` : "",
-    ].filter(Boolean).join("");
-    sections.push(moment);
+  // ── [Storyline] — narrative context ──────────────────────────────────
+  const m = shot.the_moment || {};
+  const seriesTitle = series?.series?.display_name || series?.display_name || "";
+  const episodeTitle = episode?.episode?.display_name || episode?.display_name || "";
+  const storyParts = [];
+  if (seriesTitle || episodeTitle) {
+    storyParts.push(`${seriesTitle ? seriesTitle + " — " : ""}${episodeTitle || ""}.`.trim());
+  }
+  storyParts.push(`Shot ${shot.shot_number} of the episode: ${shot.display_name || shot.id}.`);
+  if (m.verb && m.focal_point) {
+    storyParts.push(`The moment: ${m.verb} — ${m.focal_point}.`);
+  } else if (m.focal_point) {
+    storyParts.push(`Focal point: ${m.focal_point}.`);
+  }
+  if (m.emotional_beat) storyParts.push(`Emotional beat: ${m.emotional_beat}.`);
+  blocks.push(`[Storyline] ${storyParts.join(" ")}`);
+
+  // ── [Characters] — who's in frame + brief descriptors ────────────────
+  const charLines = cast.map(c => formatCharacterCompact(c, shot)).filter(Boolean);
+  if (charLines.length === 0 && (shot.cast_in_frame || []).length > 0) {
+    // We have cast in frame but no full bible records — fall back to bare names
+    charLines.push(...(shot.cast_in_frame || []).map(c => `${c.character_id || ""}${c.action ? ` — ${c.action}` : ""}`));
+  }
+  const charBlock = charLines.length > 0
+    ? `[Characters] ${charLines.join(" / ")}.`
+    : `[Characters] No characters in close focus this shot — background figures only.`;
+  blocks.push(charBlock);
+
+  // Off-frame note (voices may carry). Use display_name when we have a
+  // bible entry; otherwise fall back to the character_id prettified.
+  const offFrameNames = (shot.cast_off_frame || []).map(c => {
+    const id = c.character_id || c;
+    if (typeof id !== "string") return null;
+    const bible = cast.find(b => b.character_id === id || b.id === id);
+    if (bible?.display_name) return bible.display_name;
+    return capitalize(id);
+  }).filter(Boolean);
+  if (offFrameNames.length > 0) {
+    blocks.push(`[Off-Frame] ${offFrameNames.join(", ")} ${offFrameNames.length === 1 ? "is" : "are"} in the scene but NOT in this shot's frame. Do NOT render them visually.`);
   }
 
-  // 4. CAST IN FRAME — restate canon (skip for text_to_video without cast)
-  if (mode !== "text_to_video" || cast.length > 0) {
-    const castLines = cast.map(c => formatCastCanon(c, shot)).filter(Boolean);
-    if (castLines.length > 0) {
-      sections.push("In frame:\n" + castLines.join("\n\n"));
-    }
+  // ── [Environment] — location with critical props named ───────────────
+  if (environment) {
+    const e = environment;
+    const a = e.architecture || {};
+    const l = e.lighting || {};
+    const envParts = [
+      `${e.display_name}.`,
+      a.type ? `${a.type}.` : "",
+      a.materials?.length ? `Materials: ${a.materials.join(", ")}.` : "",
+      // CRITICAL: name the props explicitly so they're not forgotten in action
+      criticalProps.length > 0 ? `Visible in frame: ${criticalProps.join(", ")}.` : "",
+      l.primary_source ? `Lighting: ${l.primary_source}.` : "",
+      l.quality ? `${l.quality} light.` : "",
+      l.time_of_day ? `Time of day: ${l.time_of_day}.` : "",
+      e.palette?.length ? `Palette: ${e.palette.join(", ")}.` : "",
+    ].filter(Boolean).join(" ");
+    blocks.push(`[Environment] ${envParts}`);
+  } else if (shot.location?.camera_position_note) {
+    blocks.push(`[Environment] ${shot.location.camera_position_note}.`);
   }
 
-  // 5. DIALOGUE — verbatim with double quotes for lip-sync
+  // ── [Action Sequence] — single shot with internal beat structure ─────
+  // For SINGLE-shot generation (which is our default), use one numbered beat
+  // with internal timecodes for the action progression. SFX callouts are
+  // FRONT-LOADED to avoid the "silence at start" failure mode.
+  const dur = shot.timecode?.duration_seconds || 8;
+  const camera = shot.camera || {};
+  const audio = shot.audio || {};
+  const actionBeat = composeActionBeat({ shot, cast, environment, criticalProps, camera, audio, duration: dur });
+  blocks.push(`[Action Sequence]\n${actionBeat}`);
+
+  // ── Dialogue lines (verbatim with quotes for lip-sync) ───────────────
   const dialogueLines = cast.flatMap(c => {
     const inShot = (shot.cast_in_frame || []).find(x => x.character_id === c.character_id);
     const line = inShot?.dialogue?.en || inShot?.dialogue;
@@ -6553,93 +6655,95 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
     return [`${c.display_name}${note}: "${text}"`];
   });
   if (dialogueLines.length > 0) {
-    sections.push("Dialogue (delivered with native lip-sync):\n" + dialogueLines.join("\n"));
+    blocks.push(`[Dialogue] Delivered with native lip-sync, normal speaking pace:\n${dialogueLines.join("\n")}`);
   }
 
-  // 6. CAST OFF-FRAME
-  const offFrame = (shot.cast_off_frame || []).map(c => c.character_id || c).filter(Boolean);
-  if (offFrame.length > 0) {
-    sections.push(`Off-frame (do NOT render visually): ${offFrame.join(", ")}.`);
-  }
-
-  // 7. LOCATION — restate env canon (skip if reference_to_video has env ref attached)
-  if (environment) {
-    const envLines = [
-      `Location: ${environment.display_name}`,
-      environment.architecture?.type ? `. ${environment.architecture.type}` : "",
-      environment.lighting?.primary_source ? `. Lighting: ${environment.lighting.primary_source}, ${environment.lighting.quality || ""}, ${environment.lighting.time_of_day || ""}` : "",
-      environment.palette ? `. Palette: ${environment.palette.join(", ")}` : "",
-      environment.ambient_sound ? `. Ambient: ${environment.ambient_sound}` : "",
-      ".",
-    ].filter(Boolean).join("");
-    sections.push(envLines);
-  }
-
-  // 8. CAMERA
-  if (shot.camera) {
-    const c = shot.camera;
-    const camLine = [
-      `Camera: ${c.framing || "medium"}`,
-      c.lens ? `, lens ${c.lens}` : "",
-      c.movement ? `. Movement: ${c.movement}` : "",
-      c.depth ? `. Depth of field: ${c.depth}` : "",
-      c.aspect_ratio ? `. Aspect: ${c.aspect_ratio}` : "",
-      ".",
-    ].filter(Boolean).join("");
-    sections.push(camLine);
-  }
-
-  // 9. AUDIO
-  const audio = shot.audio || {};
-  const audioLines = [
-    audio.ambient ? `Audio bed: ${audio.ambient}` : "",
-    audio.score_cue && audio.score_cue !== "none" ? `Score: ${audio.score_cue}` : "",
+  // ── [Production Brief] — camera + lens + lighting + duration ─────────
+  const prodParts = [
+    camera.framing ? `${camera.framing}` : "medium shot",
+    camera.lens ? `${camera.lens}` : "35mm equivalent",
+    camera.depth ? `${camera.depth} depth of field` : null,
+    camera.movement && camera.movement !== "locked" ? `${camera.movement}` : "locked-off camera",
+    `aspect ${camera.aspect_ratio || "16:9"}`,
+    `${dur} seconds`,
+    `720p`,
+    "practical lighting only — no studio kit",
+    "handheld breath but no jitter (unless explicitly directed otherwise)",
   ].filter(Boolean);
-  if (audioLines.length > 0) {
-    sections.push(audioLines.join(". ") + ".");
-  }
+  blocks.push(`[Production Brief] ${prodParts.join(", ")}.`);
 
-  // 10. VISUAL DISTINCTIVENESS — fires when 3+ characters in frame
+  // ── Cast lockdown / anti-patterns / watch-points ─────────────────────
+  // These are constraints layered on the action — Seedance respects them
+  // best when placed JUST before the negative prompt.
   if (shot.cast_lockdown_required || cast.length >= 3) {
     const distinct = cast.map(c => {
       const palette = c.wardrobe?.color_palette?.join(", ");
-      const sig = c.physical?.distinctive_features?.join(", ");
-      return `- ${c.display_name}: ${palette || "n/a"}; signature ${sig || "n/a"}`;
+      const sig = (c.physical?.distinctive_features || []).join(", ");
+      return `${c.display_name}: ${palette || "n/a"}; signature ${sig || "n/a"}`;
     });
-    sections.push("Visual distinctiveness — keep these characters visually distinct:\n" + distinct.join("\n"));
+    blocks.push(`[Cast Distinctiveness] These characters must remain visually distinct from each other:\n${distinct.map(d => "- " + d).join("\n")}`);
   }
 
-  // 11. HIGH-RISK STABILITY NOTES
   const highRisk = cast.filter(c => c.high_risk && c.stability_note);
   if (highRisk.length > 0) {
-    sections.push("Stability notes:\n" + highRisk.map(c => `- ${c.display_name}: ${c.stability_note}`).join("\n"));
+    blocks.push(`[Identity Locks] ${highRisk.map(c => `${c.display_name}: ${c.stability_note}`).join(" / ")}`);
   }
 
-  // 12. ANTI-PATTERNS (per-character never[])
   const antiPatterns = cast
     .filter(c => Array.isArray(c.never) && c.never.length > 0)
-    .map(c => `- ${c.display_name}: never ${c.never.join("; never ")}`);
+    .map(c => {
+      // Strip leading "never " from each item if present, so we don't end up
+      // with "never never X" in the joined output. YAML entries are written
+      // as "never X" so they read naturally on their own.
+      const items = c.never.map(n => String(n).replace(/^never\s+/i, "").trim());
+      return `${c.display_name}: never ${items.join("; never ")}`;
+    });
   if (antiPatterns.length > 0) {
-    sections.push("Anti-patterns:\n" + antiPatterns.join("\n"));
+    blocks.push(`[Anti-Patterns] ${antiPatterns.join(" / ")}.`);
   }
 
-  // 13. WATCH POINTS
   const watchPoints = shot.watch_points || [];
   if (watchPoints.length > 0) {
-    const wp = watchPoints.map(w => `- ${w.failure || ""} → ${w.surgical_fix || ""}`).filter(s => s.length > 4);
+    const wp = watchPoints.map(w => `${w.failure} → ${w.surgical_fix}`).filter(s => s && s.length > 4);
     if (wp.length > 0) {
-      sections.push("Watch points:\n" + wp.join("\n"));
+      blocks.push(`[Known Failure Modes] ${wp.join(" / ")}.`);
     }
   }
 
-  // 14. GLOBAL NEGATIVE (autoregressive tail position)
+  // ── [Negative Prompt] — universal + shot-specific + prop reinforcement
+  // We re-emphasise critical props here so the model can't forget them.
   const extraNeg = shot.prompt_engineering?.negative_prompt_additions || "";
-  const negative = extraNeg
-    ? `Negative: ${GLOBAL_NEGATIVE}. ${extraNeg}`
-    : `Negative: ${GLOBAL_NEGATIVE}.`;
-  sections.push(negative);
+  const propReinforce = criticalProps.length > 0
+    ? ` The following items MUST be visible in frame: ${criticalProps.join(", ")}.`
+    : "";
+  const negative = `${GLOBAL_NEGATIVE}.${extraNeg ? " " + extraNeg : ""}${propReinforce}`;
+  blocks.push(`[Negative Prompt] ${negative}`);
 
-  const prompt = sections.join("\n\n").trim();
+  // ── Reference labelling (only for reference_to_video) ────────────────
+  if (mode === "reference_to_video" && (assets.referenceImageUrls?.length || 0) > 0) {
+    const refs = assets.referenceImageUrls;
+    const labels = [];
+    let idx = 0;
+    for (const c of cast) {
+      const refTuples = [
+        ["head-on", c.refs?.gpt?.head_on?.dataUrl || c.refs?.seedream?.head_on?.dataUrl || c.references?.head_on],
+        ["three-quarter", c.refs?.gpt?.three_quarter?.dataUrl || c.refs?.seedream?.three_quarter?.dataUrl || c.references?.three_quarter],
+        ["full body", c.refs?.gpt?.full_body?.dataUrl || c.refs?.seedream?.full_body?.dataUrl || c.references?.full_body],
+      ].filter(([, v]) => v);
+      for (const [angle] of refTuples) {
+        if (idx < refs.length) {
+          labels.push(`Image ${idx + 1}: ${c.display_name} — ${angle} portrait`);
+          idx++;
+        }
+      }
+    }
+    if (labels.length > 0) {
+      // Prepend reference labels at the very top so the model binds refs first
+      blocks.unshift(`[Reference Images Attached]\n${labels.join("\n")}`);
+    }
+  }
+
+  const prompt = blocks.join("\n\n").trim();
 
   // ─── Build the call body per mode ────────────────────────────────────
   const duration = clampDuration(shot.timecode?.duration_seconds);
@@ -6696,6 +6800,135 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Compose the [Action Sequence] block. This is the most critical section —
+ * Seedance respects beat-by-beat description with internal timecodes,
+ * SFX callouts, and prop names repeated from [Environment].
+ *
+ * Single shot, internal timecodes carving the duration into 3 beats:
+ *   - opening (0s → ~30%): camera/setup + opening SFX
+ *   - middle  (~30% → ~70%): the verb-driven main action
+ *   - closing (~70% → end): resolution + ending tension
+ */
+function composeActionBeat({ shot, cast, environment, criticalProps, camera, audio, duration }) {
+  const beats = [];
+  const dur = duration || 8;
+  const tMid   = Math.max(2, Math.round(dur * 0.35));
+  const tLate  = Math.max(tMid + 1, Math.round(dur * 0.70));
+  const tEnd   = dur;
+
+  // BEAT 1: opening — camera setup + opening SFX
+  const opening = [];
+  // Camera setup
+  if (camera.framing) {
+    const camWord = ({
+      "wide": "Wide shot",
+      "medium": "Medium shot",
+      "close-up": "Close-up",
+      "extreme-close-up": "Extreme close-up",
+      "two-shot": "Two-shot",
+      "three-shot": "Three-shot",
+      "over-the-shoulder": "Over-the-shoulder",
+      "establishing": "Establishing wide",
+    })[camera.framing] || camera.framing;
+    opening.push(`${camWord}.`);
+  }
+  if (camera.movement && camera.movement !== "locked") {
+    opening.push(`Camera: ${camera.movement}.`);
+  }
+  // Environment recap — critical props front and center
+  if (criticalProps.length > 0) {
+    opening.push(`Visible in frame from the first frame: ${criticalProps.join(", ")}.`);
+  }
+  // EXPLICIT SFX CALLOUT — fixes "silence at start" failure mode
+  if (audio.ambient || environment?.ambient_sound) {
+    const ambient = audio.ambient || environment.ambient_sound;
+    opening.push(`SFX (audible from 0:00, NOT silence): ${ambient}.`);
+  }
+  beats.push(`[0s → ${tMid}s] ${opening.join(" ")}`);
+
+  // BEAT 2: middle — the verb-driven action
+  const middle = [];
+  if (shot.the_moment?.verb && shot.the_moment?.focal_point) {
+    // YAML verbs use snake_case ("cuts_off", "turns_back"); render as prose
+    const verbProse = capitalize(String(shot.the_moment.verb).replace(/_/g, " "));
+    middle.push(`${verbProse}: ${shot.the_moment.focal_point}.`);
+  }
+  // Cast actions — prefer display_name from bible (e.g. "Tom Hsieh") over
+  // the lowercase character_id slug ("tom") so the prompt reads naturally.
+  const castActions = (shot.cast_in_frame || [])
+    .map(c => {
+      const bibleEntry = cast.find(x => x.id === c.character_id || x.character_id === c.character_id);
+      const name = bibleEntry?.display_name || capitalize(c.character_id || "");
+      return c.action ? `${name}: ${c.action}` : null;
+    })
+    .filter(Boolean);
+  if (castActions.length > 0) {
+    middle.push(castActions.join(". ") + ".");
+  }
+  // Re-mention critical props in action context (prevents prop-amnesia)
+  if (criticalProps.length > 0 && middle.length > 0) {
+    middle.push(`The ${criticalProps[0]} remains visible throughout the action.`);
+  }
+  beats.push(`[${tMid}s → ${tLate}s] ${middle.join(" ")}`);
+
+  // BEAT 3: closing — resolution + audio sustain
+  const closing = [];
+  if (shot.continuity?.end_frame_strategy === "match_next_start") {
+    closing.push("Hold the final beat for ~0.5s — clean cut to next shot.");
+  } else if (shot.continuity?.end_frame_strategy === "land_on_still") {
+    closing.push("Slow to a still on the final frame — composition locks for cross-cut.");
+  } else {
+    closing.push("Natural resolution of the action.");
+  }
+  if (audio.score_cue && audio.score_cue !== "none") {
+    closing.push(`Score: ${audio.score_cue}.`);
+  }
+  if (!audio.score_cue || audio.score_cue === "none") {
+    closing.push("Ambient sound continues, no musical score.");
+  }
+  beats.push(`[${tLate}s → ${tEnd}s] ${closing.join(" ")}`);
+
+  return beats.join("\n");
+}
+
+function capitalize(s) {
+  if (!s) return "";
+  return s.charAt(0).toUpperCase() + s.slice(1).replace(/_/g, " ");
+}
+
+/**
+ * Compact one-line character descriptor for the [Characters] block.
+ * Format: "Name (age, nationality, archetype): action this shot"
+ */
+function formatCharacterCompact(c, shot) {
+  if (!c) return "";
+  const inShot = (shot.cast_in_frame || []).find(x => x.character_id === c.character_id);
+  const id   = c.identity || {};
+  const phys = c.physical || {};
+  const wrd  = c.wardrobe?.episode_default || {};
+  const hair = phys.hair?.color || "";
+  const distinctive = (phys.distinctive_features?.[0] || "").toLowerCase();
+  const wardrobe = wrd.top || "";
+  const action = inShot?.action || "";
+
+  const descriptor = [
+    `${c.display_name}`,
+    id.age ? `(${id.age}` : "",
+    id.nationality ? `, ${id.nationality}` : "",
+    id.archetype ? `, ${id.archetype})` : id.age ? ")" : "",
+  ].filter(s => s && s.length > 0).join("");
+
+  const visualHooks = [
+    hair ? `${hair} hair` : null,
+    distinctive || null,
+    wardrobe || null,
+  ].filter(Boolean).slice(0, 3).join(", ");
+
+  const actionPart = action ? ` — ${action}` : "";
+  return `${descriptor} [${visualHooks}]${actionPart}`;
+}
 
 function formatCastCanon(c, shot) {
   if (!c) return "";
@@ -7970,6 +8203,35 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const approved = (shot.takes || []).find(t => t.status === "approved");
     const current  = approved || takes[0];
 
+    // Resolve cast + environment from the bibles (so the rail can render them)
+    const allChars = await Storage.getAll("characters");
+    const allEnvs  = await Storage.getAll("environments");
+    const castInFrame = (shot.cast_in_frame || [])
+      .map(c => allChars.find(x => x.id === c.character_id))
+      .filter(Boolean);
+    const environment = allEnvs.find(e => e.id === shot.location?.location_id);
+
+    // Top-of-editor context strip: brief description that shows what's happening
+    const ctxBlock = $("#elx-shot-context");
+    if (ctxBlock) {
+      const moment = shot.the_moment || {};
+      const verbProse = moment.verb ? String(moment.verb).replace(/_/g, " ") : "";
+      ctxBlock.innerHTML = `
+        <div class="elx-shot-ctx">
+          <span class="elx-shot-ctx__num">S${String(shot.shot_number || "?").padStart(2,"0")}</span>
+          <span class="elx-shot-ctx__tc">${esc(shot.timecode?.in || "?")} → ${esc(shot.timecode?.out || "?")} · ${shot.timecode?.duration_seconds || "?"}s</span>
+          <span class="elx-shot-ctx__mode">${esc(shot.generation?.mode || "auto")}</span>
+          ${verbProse ? `<span class="elx-shot-ctx__verb"><em>${esc(verbProse)}</em></span>` : ""}
+          ${moment.focal_point ? `<div class="elx-shot-ctx__focal">${esc(moment.focal_point)}</div>` : ""}
+        </div>
+      `;
+    }
+
+    // Hydrate the right rail with full shot context
+    renderShotEditorRail(shot, castInFrame, environment);
+    // Render the collapsible prompt-preview block under the takes
+    renderShotPromptBlock(shot, castInFrame, environment);
+
     // Hydrate preview — use elx-* selectors to avoid the v2 mockup's own .preview-wrap class
     const preview = $(".elx-preview-wrap", root);
     if (preview) {
@@ -8633,12 +8895,139 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if ($("#elx-shot-editor", s4)) return;
     s4.innerHTML = `
       <div class="s4" id="elx-shot-editor">
-        <h2 class="s4__title" style="font-family:Inter,sans-serif; font-size:18px; margin:0 0 12px;">Shot Editor</h2>
+        <h2 class="s4__title" style="font-family:Inter,sans-serif; font-size:18px; margin:0 0 6px;">Shot Editor</h2>
+        <div class="elx-shot-context" id="elx-shot-context"></div>
         <div class="elx-preview-wrap" style="position:relative; aspect-ratio:16/9; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; overflow:hidden; margin-bottom:16px;">
           <div class="elx-preview-frame" style="width:100%; height:100%;"></div>
         </div>
         <div class="elx-takes" style="display:flex; gap:8px; flex-wrap:wrap; padding:12px; background:#14141a; border-radius:8px;"></div>
+        <div class="elx-prompt-block" id="elx-prompt-block"></div>
       </div>
+    `;
+  }
+
+  // Replace the static v2 mockup right rail with dynamic, shot-aware content.
+  // Shows: brief description, cast in frame with their action+dialogue, camera,
+  // audio direction, watch points. Falls back to mockup content if no shot selected.
+  function renderShotEditorRail(shot, cast, environment) {
+    const rail = $("#right-rail .right__body") || $(".right__body");
+    if (!rail || !shot) return;
+
+    const m = shot.the_moment || {};
+    const camera = shot.camera || {};
+    const audio = shot.audio || {};
+    const continuity = shot.continuity || {};
+    const watchPoints = shot.watch_points || [];
+
+    const castBlocks = (shot.cast_in_frame || []).map(c => {
+      const bible = cast.find(b => b.id === c.character_id);
+      const name = bible?.display_name || c.character_id;
+      const dialogue = c.dialogue?.en || (typeof c.dialogue === "string" ? c.dialogue : "");
+      return `
+        <div class="elx-rail__cast-row">
+          <div class="elx-rail__cast-name">${esc(name)}</div>
+          <div class="elx-rail__cast-meta">${esc(c.role_in_shot || "")}${c.delivery_note ? " · " + esc(c.delivery_note) : ""}</div>
+          ${c.action ? `<div class="elx-rail__cast-action">${esc(c.action)}</div>` : ""}
+          ${dialogue ? `<div class="elx-rail__cast-dialogue">"${esc(dialogue)}"</div>` : ""}
+        </div>
+      `;
+    }).join("");
+
+    const offFrame = (shot.cast_off_frame || []).map(c => {
+      const bible = cast.find(b => b.id === c.character_id);
+      return bible?.display_name || c.character_id;
+    }).filter(Boolean);
+
+    rail.innerHTML = `
+      <div class="elx-rail">
+        <div class="elx-rail__head">
+          <div class="elx-rail__shot-num">S${String(shot.shot_number || "?").padStart(2,"0")}</div>
+          <div class="elx-rail__shot-name">${esc(shot.display_name || shot.id)}</div>
+        </div>
+
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">The moment</div>
+          <div class="elx-rail__moment">${m.verb ? `<span class="mono" style="color:#c9a25a">${esc(String(m.verb).replace(/_/g," "))}</span> — ` : ""}${esc(m.focal_point || "")}</div>
+          ${m.emotional_beat ? `<div class="elx-rail__emotion">${esc(m.emotional_beat)}</div>` : ""}
+        </div>
+
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Cast in frame</div>
+          ${castBlocks || `<div class="elx-rail__muted">No named cast — background figures only.</div>`}
+          ${offFrame.length > 0 ? `<div class="elx-rail__muted" style="margin-top:8px"><strong>Off-frame:</strong> ${esc(offFrame.join(", "))}</div>` : ""}
+        </div>
+
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Camera</div>
+          <div class="elx-rail__kv"><span>Framing</span><span>${esc(camera.framing || "—")}</span></div>
+          <div class="elx-rail__kv"><span>Lens</span><span>${esc(camera.lens || "—")}</span></div>
+          <div class="elx-rail__kv"><span>Movement</span><span>${esc(camera.movement || "—")}</span></div>
+          <div class="elx-rail__kv"><span>Depth</span><span>${esc(camera.depth || "—")}</span></div>
+          <div class="elx-rail__kv"><span>Aspect</span><span>${esc(camera.aspect_ratio || "—")}</span></div>
+        </div>
+
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Audio</div>
+          <div class="elx-rail__kv"><span>Native audio</span><span>${audio.generate_native !== false ? "on" : "off"}</span></div>
+          ${audio.ambient ? `<div class="elx-rail__ambient">${esc(audio.ambient)}</div>` : ""}
+          ${audio.score_cue && audio.score_cue !== "none" ? `<div class="elx-rail__score">Score: ${esc(audio.score_cue)}</div>` : ""}
+        </div>
+
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Continuity</div>
+          <div class="elx-rail__kv"><span>Start</span><span>${esc(continuity.start_frame_strategy || "fresh")}</span></div>
+          <div class="elx-rail__kv"><span>End</span><span>${esc(continuity.end_frame_strategy || "free")}</span></div>
+          ${continuity.start_image_ref ? `<div class="elx-rail__inherit">Inherits: <span class="mono">${esc(continuity.start_image_ref)}</span></div>` : ""}
+        </div>
+
+        ${watchPoints.length > 0 ? `
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Watch points</div>
+          ${watchPoints.map(w => `
+            <div class="elx-rail__watch">
+              <div class="elx-rail__watch-fail">⚠ ${esc(w.failure || "")}</div>
+              <div class="elx-rail__watch-fix">→ ${esc(w.surgical_fix || "")}</div>
+            </div>
+          `).join("")}
+        </div>` : ""}
+
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Specs</div>
+          <div class="elx-rail__kv"><span>Mode</span><span>${esc(shot.generation?.mode || "auto")}</span></div>
+          <div class="elx-rail__kv"><span>Duration</span><span>${shot.timecode?.duration_seconds || "?"}s</span></div>
+          <div class="elx-rail__kv"><span>Timecode</span><span>${esc(shot.timecode?.in || "?")} – ${esc(shot.timecode?.out || "?")}</span></div>
+          <div class="elx-rail__kv"><span>Cost so far</span><span>${fmtUsd(shot.cost_usd || 0)}</span></div>
+        </div>
+      </div>
+    `;
+
+    // Update the rail title
+    const railTitle = $("#right-title");
+    if (railTitle) railTitle.textContent = `${shot.display_name || shot.id} · S${String(shot.shot_number || "?").padStart(2,"0")}`;
+  }
+
+  // "Show prompt" affordance — director can see exactly what'll be sent to Seedance
+  function renderShotPromptBlock(shot, cast, environment) {
+    const block = $("#elx-prompt-block");
+    if (!block || !shot) return;
+    // Try to compose a preview prompt; gracefully degrade if anything's missing
+    let prompt = "";
+    try {
+      const composed = composer.composeSeedance({
+        shot, cast, environment,
+        mode: shot.generation?.mode || "text_to_video",
+        assets: {},
+      });
+      prompt = composed.prompt;
+    } catch (err) {
+      prompt = `(Could not preview prompt: ${err.message})`;
+    }
+    block.innerHTML = `
+      <details class="elx-prompt">
+        <summary class="elx-prompt__summary">▸ Preview the prompt that will be sent to Seedance (${prompt.length.toLocaleString()} chars)</summary>
+        <pre class="elx-prompt__pre">${esc(prompt)}</pre>
+        <div class="elx-prompt__note">This preview uses current shot spec + active model defaults. The actual prompt sent will be regenerated at roll time with any keyframe context.</div>
+      </details>
     `;
   }
 
