@@ -3823,6 +3823,36 @@ a { color: inherit; text-decoration: none; }
   padding: 2px 7px; border-radius: 10px; letter-spacing: 0.06em;
   text-transform: uppercase; backdrop-filter: blur(2px);
 }
+.cast-card__hero-label {
+  position: absolute; bottom: 6px; left: 6px;
+  font-size: 9px; font-family: 'JetBrains Mono', monospace;
+  padding: 2px 7px; border-radius: 10px; letter-spacing: 0.06em;
+  text-transform: uppercase; background: rgba(0,0,0,0.6); color: #e8e8ee;
+  backdrop-filter: blur(2px);
+}
+.cast-card__portrait { cursor: zoom-in; }
+.cast-card__filmstrip {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 3px; padding: 3px;
+  background: #0a0a0c;
+}
+.cast-card__filmstrip--loc { grid-template-columns: repeat(2, 1fr); }
+.cast-card__thumb {
+  aspect-ratio: 1 / 1;
+  background-color: #1d1d26;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: border-color .12s, transform .12s;
+}
+.cast-card__thumb--loc { aspect-ratio: 16 / 9; }
+.cast-card__thumb:hover { border-color: rgba(201,162,90,0.5); transform: scale(1.02); }
+.cast-card__thumb.is-active { border-color: #c9a25a; }
+.cast-card__thumb--empty {
+  display: flex; align-items: center; justify-content: center;
+  color: #404050; font-size: 14px; cursor: default;
+  border: 1px dashed #2a2a35; background: transparent;
+}
+.cast-card__thumb--empty:hover { border-color: #2a2a35; transform: none; }
 .cast-card--seedream .cast-card__portrait { border-bottom: 2px solid rgba(201,162,90,0.4); }
 .cast-card--gpt      .cast-card__portrait { border-bottom: 2px solid rgba(16,163,127,0.4); }
 .s2 { padding: 16px 24px; }
@@ -7311,19 +7341,31 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   function buildCastCard(c, modelKey, modelMeta) {
     const refsForModel = c.refs?.[modelKey] || {};
     const angleKeys = ["head_on", "three_quarter", "full_body"];
+    const angleLabels = { head_on: "Head", three_quarter: "3/4", full_body: "Full" };
     const refCount = angleKeys.filter(k => refsForModel[k]?.dataUrl).length;
-    const portrait = refsForModel.head_on?.dataUrl
-                  || refsForModel.three_quarter?.dataUrl
-                  || refsForModel.full_body?.dataUrl;
+    // Hero: prefer head_on, fall back through angles in order
+    const heroAngle = angleKeys.find(k => refsForModel[k]?.dataUrl) || null;
+    const heroUrl = heroAngle ? refsForModel[heroAngle].dataUrl : null;
     const card = document.createElement("div");
     card.className = `cast-card cast-card--${modelKey}`;
     card.dataset.id = c.id;
     card.dataset.model = modelKey;
+    // Build the filmstrip: one tile per angle, click swaps the hero
+    const filmstrip = angleKeys.map(k => {
+      const url = refsForModel[k]?.dataUrl;
+      const active = (k === heroAngle) ? " is-active" : "";
+      const inner = url
+        ? `<div class="cast-card__thumb${active}" data-angle="${k}" data-char-id="${esc(c.id)}" data-model="${esc(modelKey)}" style="background-image:url('${url}'); background-size:cover; background-position:top center;" title="${esc(angleLabels[k])}"></div>`
+        : `<div class="cast-card__thumb cast-card__thumb--empty" title="${esc(angleLabels[k])} — not generated yet">·</div>`;
+      return inner;
+    }).join("");
     card.innerHTML = `
-      <div class="cast-card__portrait" style="${portrait ? `background-image:url('${portrait}'); background-size:cover; background-position:top center;` : ''}">
-        ${portrait ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(c.id).toUpperCase()}</div>`}
+      <div class="cast-card__portrait" data-hero-host style="${heroUrl ? `background-image:url('${heroUrl}'); background-size:cover; background-position:top center;` : ''}">
+        ${heroUrl ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(c.id).toUpperCase()}</div>`}
         <span class="cast-card__model-badge" style="background:${modelMeta.badge_color}22; color:${modelMeta.badge_color}; border:1px solid ${modelMeta.badge_color}55;">${esc(modelMeta.shortLabel)}</span>
+        ${heroAngle ? `<span class="cast-card__hero-label">${esc(angleLabels[heroAngle])}</span>` : ""}
       </div>
+      <div class="cast-card__filmstrip">${filmstrip}</div>
       <div class="cast-card__name">${esc(c.display_name)}</div>
       <div class="cast-card__role">${esc(c.identity?.age || "")} · ${esc(c.identity?.nationality || "")} · ${esc(c.identity?.archetype || "")}</div>
       <div class="cast-card__palette">${(c.wardrobe?.color_palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
@@ -7351,17 +7393,28 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   function buildLocationCard(e, modelKey, modelMeta) {
     const refsForModel = e.refs?.[modelKey] || {};
     const kindKeys = ["wide", "detail"];
+    const kindLabels = { wide: "Wide", detail: "Detail" };
     const refCount = kindKeys.filter(k => refsForModel[k]?.dataUrl).length;
-    const portrait = refsForModel.wide?.dataUrl || refsForModel.detail?.dataUrl;
+    const heroKind = kindKeys.find(k => refsForModel[k]?.dataUrl) || null;
+    const heroUrl = heroKind ? refsForModel[heroKind].dataUrl : null;
     const card = document.createElement("div");
     card.className = `cast-card cast-card--loc cast-card--${modelKey}`;
     card.dataset.id = e.id;
     card.dataset.model = modelKey;
+    const filmstrip = kindKeys.map(k => {
+      const url = refsForModel[k]?.dataUrl;
+      const active = (k === heroKind) ? " is-active" : "";
+      return url
+        ? `<div class="cast-card__thumb cast-card__thumb--loc${active}" data-loc-kind="${k}" data-loc-id="${esc(e.id)}" data-model="${esc(modelKey)}" style="background-image:url('${url}'); background-size:cover; background-position:center;" title="${esc(kindLabels[k])}"></div>`
+        : `<div class="cast-card__thumb cast-card__thumb--loc cast-card__thumb--empty" title="${esc(kindLabels[k])} — not generated yet">·</div>`;
+    }).join("");
     card.innerHTML = `
-      <div class="cast-card__portrait" style="${portrait ? `background-image:url('${portrait}'); background-size:cover; background-position:center;` : ''}">
-        ${portrait ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px;">${esc(e.id).toUpperCase()}</div>`}
+      <div class="cast-card__portrait" data-hero-host style="${heroUrl ? `background-image:url('${heroUrl}'); background-size:cover; background-position:center;` : ''}">
+        ${heroUrl ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px;">${esc(e.id).toUpperCase()}</div>`}
         <span class="cast-card__model-badge" style="background:${modelMeta.badge_color}22; color:${modelMeta.badge_color}; border:1px solid ${modelMeta.badge_color}55;">${esc(modelMeta.shortLabel)}</span>
+        ${heroKind ? `<span class="cast-card__hero-label">${esc(kindLabels[heroKind])}</span>` : ""}
       </div>
+      <div class="cast-card__filmstrip cast-card__filmstrip--loc">${filmstrip}</div>
       <div class="cast-card__name">${esc(e.display_name)}</div>
       <div class="cast-card__role">${esc(e.architecture?.type || "")}</div>
       <div class="cast-card__palette">${(e.palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
@@ -7773,8 +7826,79 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     });
   }
 
+  // ─── Lightbox: tap a thumb in a cast card to view it full-size ─────
+  function openLightbox(srcDataUrl, title) {
+    const lb = document.createElement("div");
+    lb.style.cssText = `
+      position: fixed; inset: 0; z-index: 9500;
+      background: rgba(0,0,0,0.92); backdrop-filter: blur(6px);
+      display: flex; align-items: center; justify-content: center;
+      padding: 32px; cursor: zoom-out;
+    `;
+    lb.innerHTML = `
+      <div style="max-width: 95%; max-height: 95%; display: flex; flex-direction: column; align-items: center; gap: 12px;">
+        <img src="${srcDataUrl}" style="max-width: 100%; max-height: 88vh; border-radius: 8px; box-shadow: 0 20px 80px rgba(0,0,0,0.8);">
+        <div style="color: #c9a25a; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;">${esc(title || "")}</div>
+        <div style="color: #5a5a6e; font-size: 11px;">click anywhere or press Esc to close</div>
+      </div>
+    `;
+    lb.addEventListener("click", () => lb.remove());
+    const onKey = (ev) => { if (ev.key === "Escape") { lb.remove(); document.removeEventListener("keydown", onKey); } };
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(lb);
+  }
+
+  // ─── Hero swap: clicking a thumb in a cast/loc card promotes it to hero
+  function swapHero(card, thumbEl) {
+    const heroHost = card.querySelector("[data-hero-host]");
+    if (!heroHost || !thumbEl) return;
+    const bg = thumbEl.style.backgroundImage;
+    if (!bg) return;
+    heroHost.style.backgroundImage = bg;
+    heroHost.style.backgroundSize = "cover";
+    heroHost.style.backgroundPosition = thumbEl.classList.contains("cast-card__thumb--loc") ? "center" : "top center";
+    // Update label
+    const heroLabel = card.querySelector(".cast-card__hero-label");
+    const label = thumbEl.getAttribute("title") || "";
+    if (heroLabel) heroLabel.textContent = label;
+    // Toggle is-active
+    card.querySelectorAll(".cast-card__thumb").forEach(t => t.classList.remove("is-active"));
+    thumbEl.classList.add("is-active");
+    // Remove placeholder text if any
+    const placeholder = heroHost.querySelector("div");
+    if (placeholder && !placeholder.classList.contains("cast-card__model-badge")) {
+      placeholder.style.display = "none";
+    }
+  }
+
   // ─── Event delegation ───────────────────────────────────────────────
   document.addEventListener("click", (e) => {
+    // Thumb click — handle hero-swap (single click) and lightbox (already-active)
+    const thumb = e.target.closest(".cast-card__thumb:not(.cast-card__thumb--empty)");
+    if (thumb) {
+      const card = thumb.closest(".cast-card");
+      const url = thumb.style.backgroundImage.match(/url\((['"]?)(.+?)\1\)/)?.[2];
+      if (thumb.classList.contains("is-active") && url) {
+        // Second click on the already-hero thumb → open lightbox
+        const title = `${card.querySelector(".cast-card__name")?.textContent || ""} · ${thumb.getAttribute("title") || ""} · ${card.dataset.model || ""}`;
+        openLightbox(url, title);
+      } else {
+        swapHero(card, thumb);
+      }
+      return;
+    }
+    // Hero portrait click → lightbox of current hero
+    const heroPortrait = e.target.closest(".cast-card__portrait[data-hero-host]");
+    if (heroPortrait && !e.target.closest("button")) {
+      const url = heroPortrait.style.backgroundImage.match(/url\((['"]?)(.+?)\1\)/)?.[2];
+      if (url) {
+        const card = heroPortrait.closest(".cast-card");
+        const title = `${card?.querySelector(".cast-card__name")?.textContent || ""} · ${card?.querySelector(".cast-card__hero-label")?.textContent || ""} · ${card?.dataset.model || ""}`;
+        openLightbox(url, title);
+        return;
+      }
+    }
+
     const target = e.target.closest("[data-action]");
     if (!target) {
       // Shot card click → open editor
