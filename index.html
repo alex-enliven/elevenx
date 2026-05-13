@@ -7529,6 +7529,42 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     return "seedream";
   }
 
+  // Re-sync YAML-driven fields from SEED_DATA into IDB.
+  // Used to roll forward spec changes (renames, new fields, edited prompts)
+  // without nuking user-generated state (takes, refs, etc.).
+  //
+  // For each item in seedItems:
+  //   - if it doesn't exist in IDB → skip (Storage.seed handles initial insert)
+  //   - if it does exist → write { ...seed, ...preservedFromExisting }
+  //     so seed fields overwrite, preserveKeys keep their IDB value.
+  //
+  // Special case for `keyframes`: if the user has actual image data in
+  // keyframes.startDataUrl, we preserve it. If keyframes is just spec
+  // (empty paths from YAML), we let seed overwrite.
+  async function resyncFromSeed(storeName, seedItems, preserveKeys = []) {
+    if (!seedItems || seedItems.length === 0) return;
+    for (const seed of seedItems) {
+      const id = seed.id || seed.character_id || seed.location_id;
+      if (!id) continue;
+      const existing = await Storage.get(storeName, id);
+      if (!existing) continue;
+      const preserved = {};
+      for (const k of preserveKeys) {
+        if (existing[k] !== undefined) preserved[k] = existing[k];
+      }
+      // Keyframes special case: only preserve user-rolled data URLs
+      if (storeName === "shots" && existing.keyframes) {
+        const userKeyframes = {};
+        if (existing.keyframes.startDataUrl) userKeyframes.startDataUrl = existing.keyframes.startDataUrl;
+        if (existing.keyframes.endDataUrl)   userKeyframes.endDataUrl   = existing.keyframes.endDataUrl;
+        if (Object.keys(userKeyframes).length > 0) {
+          preserved.keyframes = { ...(seed.keyframes || {}), ...userKeyframes };
+        }
+      }
+      await Storage.put(storeName, { ...seed, ...preserved });
+    }
+  }
+
   // Resolve a single ref URL for a character or environment given an
   // angle/kind. Defaults to ACTIVE_IMAGE_MODEL with fallback to the
   // other model if the active one doesn't have that angle.
@@ -8638,6 +8674,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       await Storage.seed("characters",   SEED_DATA.characters);
       await Storage.seed("environments", SEED_DATA.environments);
       await Storage.seed("shots",        SEED_DATA.shots);
+      // After initial seed, RE-SYNC spec fields from the current seed so that
+      // YAML edits (renames, prompt tweaks, new fields) flow into the running
+      // IDB without forcing the user to wipe their data. User-generated fields
+      // (takes, refs, chosenModel, etc.) are preserved on a per-store allowlist.
+      await resyncFromSeed("shots",        SEED_DATA.shots,        ["takes", "cost_usd"]);
+      await resyncFromSeed("characters",   SEED_DATA.characters,   ["refs", "chosenModel", "consent_record_id"]);
+      await resyncFromSeed("environments", SEED_DATA.environments, ["refs", "chosenModel"]);
     }
 
     // Restore settings
