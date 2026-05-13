@@ -3855,6 +3855,50 @@ a { color: inherit; text-decoration: none; }
 .cast-card__thumb--empty:hover { border-color: #2a2a35; transform: none; }
 .cast-card--seedream .cast-card__portrait { border-bottom: 2px solid rgba(201,162,90,0.4); }
 .cast-card--gpt      .cast-card__portrait { border-bottom: 2px solid rgba(16,163,127,0.4); }
+
+/* CANONICAL chosen state — the user's verdict on which model wins for this asset */
+.cast-card.is-chosen {
+  border: 1px solid #c9a25a;
+  box-shadow: 0 0 0 1px rgba(201,162,90,0.6), 0 8px 30px rgba(201,162,90,0.15);
+  position: relative;
+}
+.cast-card__canonical-badge {
+  position: absolute;
+  top: -8px; left: 50%; transform: translateX(-50%);
+  background: #c9a25a; color: #0a0a0c;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.12em;
+  padding: 3px 10px; border-radius: 10px;
+  z-index: 4;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+/* When the OTHER model has refs and this one isn't chosen, dim slightly to
+   reduce noise — but stay legible so user can still inspect or re-choose. */
+.cast-card.is-dimmed { opacity: 0.65; }
+.cast-card.is-dimmed:hover { opacity: 1; }
+
+/* Dual-button bottom row */
+.cast-card__bottom--dual { display: flex; gap: 6px; }
+.cast-card__bottom--dual .btn { flex: 1; font-size: 11px; padding: 5px 6px; min-width: 0; }
+.cast-card__choose {
+  background: transparent !important;
+  color: #9a9aab !important;
+  border: 1px solid #2a2a35 !important;
+}
+.cast-card__choose:hover:not(:disabled) {
+  border-color: #c9a25a !important;
+  color: #c9a25a !important;
+}
+.cast-card__choose--active {
+  background: rgba(201,162,90,0.18) !important;
+  color: #c9a25a !important;
+  border: 1px solid #c9a25a !important;
+  font-weight: 600 !important;
+}
+.cast-card__choose:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
 .s2 { padding: 16px 24px; }
 .s2__toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .s2__spacer { flex: 1; }
@@ -7135,6 +7179,34 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // ─── Utilities ──────────────────────────────────────────────────────
   const $  = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+  // Given a refs-by-model bag and the angle/kind keys, infer which model
+  // should be canonical: pick whichever has more complete refs; tie → null
+  // if both empty, otherwise tie → seedream as the historic default.
+  function inferChosenModel(refsBag, keys) {
+    if (!refsBag) return null;
+    const score = (modelKey) => {
+      const b = refsBag[modelKey] || {};
+      return keys.reduce((n, k) => n + (b[k]?.dataUrl ? 1 : 0), 0);
+    };
+    const s = score("seedream");
+    const g = score("gpt");
+    if (s === 0 && g === 0) return null;
+    if (g > s) return "gpt";
+    return "seedream";
+  }
+
+  // Resolve a single ref URL for a character or environment given an
+  // angle/kind, using its chosenModel (with fallback to the other model
+  // if the chosen model is missing that angle).
+  function refUrlFor(asset, angleKey) {
+    if (!asset?.refs) return null;
+    const chosen = asset.chosenModel || "seedream";
+    const other  = chosen === "seedream" ? "gpt" : "seedream";
+    return asset.refs[chosen]?.[angleKey]?.dataUrl
+        || asset.refs[other]?.[angleKey]?.dataUrl
+        || null;
+  }
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const fmtUsd = (n) => `$${(Number(n) || 0).toFixed(2)}`;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -7343,11 +7415,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const angleKeys = ["head_on", "three_quarter", "full_body"];
     const angleLabels = { head_on: "Head", three_quarter: "3/4", full_body: "Full" };
     const refCount = angleKeys.filter(k => refsForModel[k]?.dataUrl).length;
+    const isChosen = c.chosenModel === modelKey;
+    const otherModelKey = modelKey === "seedream" ? "gpt" : "seedream";
+    const otherHasAny = angleKeys.some(k => c.refs?.[otherModelKey]?.[k]?.dataUrl);
     // Hero: prefer head_on, fall back through angles in order
     const heroAngle = angleKeys.find(k => refsForModel[k]?.dataUrl) || null;
     const heroUrl = heroAngle ? refsForModel[heroAngle].dataUrl : null;
     const card = document.createElement("div");
-    card.className = `cast-card cast-card--${modelKey}`;
+    card.className = `cast-card cast-card--${modelKey}${isChosen ? " is-chosen" : ""}${refCount > 0 && !isChosen && otherHasAny ? " is-dimmed" : ""}`;
     card.dataset.id = c.id;
     card.dataset.model = modelKey;
     // Build the filmstrip: one tile per angle, click swaps the hero
@@ -7360,6 +7435,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       return inner;
     }).join("");
     card.innerHTML = `
+      ${isChosen ? `<div class="cast-card__canonical-badge">★ CANONICAL</div>` : ""}
       <div class="cast-card__portrait" data-hero-host style="${heroUrl ? `background-image:url('${heroUrl}'); background-size:cover; background-position:top center;` : ''}">
         ${heroUrl ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(c.id).toUpperCase()}</div>`}
         <span class="cast-card__model-badge" style="background:${modelMeta.badge_color}22; color:${modelMeta.badge_color}; border:1px solid ${modelMeta.badge_color}55;">${esc(modelMeta.shortLabel)}</span>
@@ -7370,8 +7446,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       <div class="cast-card__role">${esc(c.identity?.age || "")} · ${esc(c.identity?.nationality || "")} · ${esc(c.identity?.archetype || "")}</div>
       <div class="cast-card__palette">${(c.wardrobe?.color_palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
       <div class="cast-card__meta">${refCount}/3 refs · ${refCount === 3 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'} · <span style="color:#9a9aab">${esc(modelMeta.shortLabel)}</span></div>
-      <div class="cast-card__bottom">
-        <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}" data-model="${esc(modelKey)}">${refCount === 3 ? `Re-roll (${esc(modelMeta.shortLabel)})` : `Generate ${3 - refCount} angle${3-refCount===1?"":"s"}`}</button>
+      <div class="cast-card__bottom cast-card__bottom--dual">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}" data-model="${esc(modelKey)}">${refCount === 3 ? `Re-roll` : `Generate ${3 - refCount}`}</button>
+        <button class="btn btn--sm ${isChosen ? "cast-card__choose cast-card__choose--active" : "cast-card__choose"}" data-action="choose-canonical" data-asset-kind="character" data-asset-id="${esc(c.id)}" data-model="${esc(modelKey)}" ${refCount === 0 ? "disabled" : ""}>${isChosen ? "★ Chosen" : "Use these"}</button>
       </div>
     `;
     return card;
@@ -7395,10 +7472,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const kindKeys = ["wide", "detail"];
     const kindLabels = { wide: "Wide", detail: "Detail" };
     const refCount = kindKeys.filter(k => refsForModel[k]?.dataUrl).length;
+    const isChosen = e.chosenModel === modelKey;
+    const otherModelKey = modelKey === "seedream" ? "gpt" : "seedream";
+    const otherHasAny = kindKeys.some(k => e.refs?.[otherModelKey]?.[k]?.dataUrl);
     const heroKind = kindKeys.find(k => refsForModel[k]?.dataUrl) || null;
     const heroUrl = heroKind ? refsForModel[heroKind].dataUrl : null;
     const card = document.createElement("div");
-    card.className = `cast-card cast-card--loc cast-card--${modelKey}`;
+    card.className = `cast-card cast-card--loc cast-card--${modelKey}${isChosen ? " is-chosen" : ""}${refCount > 0 && !isChosen && otherHasAny ? " is-dimmed" : ""}`;
     card.dataset.id = e.id;
     card.dataset.model = modelKey;
     const filmstrip = kindKeys.map(k => {
@@ -7409,6 +7489,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         : `<div class="cast-card__thumb cast-card__thumb--loc cast-card__thumb--empty" title="${esc(kindLabels[k])} — not generated yet">·</div>`;
     }).join("");
     card.innerHTML = `
+      ${isChosen ? `<div class="cast-card__canonical-badge">★ CANONICAL</div>` : ""}
       <div class="cast-card__portrait" data-hero-host style="${heroUrl ? `background-image:url('${heroUrl}'); background-size:cover; background-position:center;` : ''}">
         ${heroUrl ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px;">${esc(e.id).toUpperCase()}</div>`}
         <span class="cast-card__model-badge" style="background:${modelMeta.badge_color}22; color:${modelMeta.badge_color}; border:1px solid ${modelMeta.badge_color}55;">${esc(modelMeta.shortLabel)}</span>
@@ -7419,8 +7500,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       <div class="cast-card__role">${esc(e.architecture?.type || "")}</div>
       <div class="cast-card__palette">${(e.palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
       <div class="cast-card__meta">${refCount}/2 refs · ${refCount === 2 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'} · <span style="color:#9a9aab">${esc(modelMeta.shortLabel)}</span></div>
-      <div class="cast-card__bottom">
-        <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}" data-model="${esc(modelKey)}">${refCount === 2 ? `Re-roll (${esc(modelMeta.shortLabel)})` : `Generate ${2 - refCount} ref${2-refCount===1?"":"s"}`}</button>
+      <div class="cast-card__bottom cast-card__bottom--dual">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}" data-model="${esc(modelKey)}">${refCount === 2 ? `Re-roll` : `Generate ${2 - refCount}`}</button>
+        <button class="btn btn--sm ${isChosen ? "cast-card__choose cast-card__choose--active" : "cast-card__choose"}" data-action="choose-canonical" data-asset-kind="environment" data-asset-id="${esc(e.id)}" data-model="${esc(modelKey)}" ${refCount === 0 ? "disabled" : ""}>${isChosen ? "★ Chosen" : "Use these"}</button>
       </div>
     `;
     return card;
@@ -7697,6 +7779,27 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (failCount > 0)                  toast(`${m}: all ${failCount} env ref${failCount===1?"":"s"} failed.`, { tone: "err", duration: 8000 });
   }
 
+  // ─── Mark a character/location's chosen model (which one to use canonically)
+  async function handleChooseCanonical(assetKind, assetId, modelKey) {
+    if (!assetKind || !assetId || !modelKey) return;
+    const storeName = assetKind === "character" ? "characters" : "environments";
+    const asset = await Storage.get(storeName, assetId);
+    if (!asset) return;
+    const already = asset.chosenModel === modelKey;
+    if (already) {
+      // Toggle off — unset. The composer falls back to inferChosenModel.
+      asset.chosenModel = null;
+    } else {
+      asset.chosenModel = modelKey;
+    }
+    await Storage.put(storeName, asset);
+    toast(already
+      ? `${asset.display_name}: canonical cleared`
+      : `${asset.display_name}: ${IMAGE_MODELS[modelKey].shortLabel} is now canonical`);
+    if (assetKind === "character") renderCastTab();
+    else renderLocationTab();
+  }
+
   async function handleRollShot(shotId) {
     if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
     const shot = await Storage.get("shots", shotId);
@@ -7715,13 +7818,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       currentShotHasKeyframe: !!shot.keyframes?.startDataUrl,
     });
 
-    // For MVP, if image_to_video and we don't have a keyframe but we DO have cast refs,
-    // use the speaking character's three-quarter portrait as start frame.
+    // MVP: image_to_video without an explicit keyframe falls back to the
+    // speaking character's three-quarter portrait. refUrlFor() consults
+    // c.chosenModel and falls through to the other model on miss.
     let assets = { referenceImageUrls: [] };
     if (resolved.mode === "image_to_video") {
       assets.startImageUrl = shot.keyframes?.startDataUrl
-        || castInFrame[0]?.refs?.three_quarter?.dataUrl
-        || castInFrame[0]?.refs?.head_on?.dataUrl;
+        || refUrlFor(castInFrame[0], "three_quarter")
+        || refUrlFor(castInFrame[0], "head_on");
       if (!assets.startImageUrl) {
         toast("This shot needs a keyframe or cast ref before image-to-video. Generate cast refs first.", { tone: "warn" });
         return;
@@ -7730,7 +7834,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       assets.referenceImageUrls = [];
       for (const c of castInFrame) {
         for (const a of ["head_on", "three_quarter", "full_body"]) {
-          if (c.refs?.[a]?.dataUrl) assets.referenceImageUrls.push(c.refs[a].dataUrl);
+          const url = refUrlFor(c, a);
+          if (url) assets.referenceImageUrls.push(url);
           if (assets.referenceImageUrls.length >= 9) break;
         }
         if (assets.referenceImageUrls.length >= 9) break;
@@ -7915,6 +8020,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     e.preventDefault();
     if (action === "gen-cast")          handleGenerateCastRefs(target.dataset.charId, target.dataset.model || "seedream");
     else if (action === "gen-env")      handleGenerateEnvRefs(target.dataset.locId, target.dataset.model || "seedream");
+    else if (action === "choose-canonical") handleChooseCanonical(target.dataset.assetKind, target.dataset.assetId, target.dataset.model);
     else if (action === "roll-shot")    handleRollShot(target.dataset.shotId);
     else if (action === "open-shot-editor") {
       document.querySelectorAll(".proto-tab").forEach(t => t.classList.toggle("is-active", t.dataset.screen === "s4"));
@@ -8016,7 +8122,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // The schema gained a per-model bucket so we can A/B Seedream vs GPT.
     // Any character with the OLD flat shape (c.refs.head_on directly) gets
     // its angles moved under c.refs.seedream — that's the historic default.
+    // Also seeds c.chosenModel so downstream code knows which refs to use.
     for (const c of await Storage.getAll("characters")) {
+      let dirty = false;
       const r = c.refs || {};
       const hasOldShape = r.head_on || r.three_quarter || r.full_body;
       const hasNewShape = r.seedream || r.gpt;
@@ -8025,25 +8133,36 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           seedream: { head_on: r.head_on, three_quarter: r.three_quarter, full_body: r.full_body },
           gpt: {},
         };
-        await Storage.put("characters", c);
+        dirty = true;
       } else if (!hasNewShape) {
         c.refs = { seedream: {}, gpt: {} };
-        await Storage.put("characters", c);
+        dirty = true;
       }
+      if (c.chosenModel === undefined) {
+        c.chosenModel = inferChosenModel(c.refs, ["head_on", "three_quarter", "full_body"]);
+        dirty = true;
+      }
+      if (dirty) await Storage.put("characters", c);
     }
 
     // Same migration for environments: e.refs[kind] → e.refs[modelKey][kind]
     for (const env of await Storage.getAll("environments")) {
+      let dirty = false;
       const r = env.refs || {};
       const hasOldShape = r.wide || r.detail;
       const hasNewShape = r.seedream || r.gpt;
       if (hasOldShape && !hasNewShape) {
         env.refs = { seedream: { wide: r.wide, detail: r.detail }, gpt: {} };
-        await Storage.put("environments", env);
+        dirty = true;
       } else if (!hasNewShape) {
         env.refs = { seedream: {}, gpt: {} };
-        await Storage.put("environments", env);
+        dirty = true;
       }
+      if (env.chosenModel === undefined) {
+        env.chosenModel = inferChosenModel(env.refs, ["wide", "detail"]);
+        dirty = true;
+      }
+      if (dirty) await Storage.put("environments", env);
     }
 
     // Adapt each screen's DOM (replace static mockup content with live containers)
