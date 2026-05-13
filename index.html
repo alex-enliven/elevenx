@@ -3815,8 +3815,16 @@ a { color: inherit; text-decoration: none; }
 <style>
 /* === ElevenX MVP overrides === */
 .cast-card { position: relative; }
-.cast-card__portrait { aspect-ratio: 1 / 1; background: #1d1d26; border-radius: 6px 6px 0 0; overflow: hidden; }
+.cast-card__portrait { position: relative; aspect-ratio: 1 / 1; background: #1d1d26; border-radius: 6px 6px 0 0; overflow: hidden; }
 .cast-card--loc .cast-card__portrait { aspect-ratio: 16 / 9; }
+.cast-card__model-badge {
+  position: absolute; top: 6px; right: 6px;
+  font-size: 9px; font-family: 'JetBrains Mono', monospace;
+  padding: 2px 7px; border-radius: 10px; letter-spacing: 0.06em;
+  text-transform: uppercase; backdrop-filter: blur(2px);
+}
+.cast-card--seedream .cast-card__portrait { border-bottom: 2px solid rgba(201,162,90,0.4); }
+.cast-card--gpt      .cast-card__portrait { border-bottom: 2px solid rgba(16,163,127,0.4); }
 .s2 { padding: 16px 24px; }
 .s2__toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .s2__spacer { flex: 1; }
@@ -6801,6 +6809,127 @@ function blobToDataUrl(blob) {
 </script>
 
 <script>
+/* === elevenx/lib/openaiClient.js === */
+(window.ElevenX = window.ElevenX || {});
+(() => {
+/**
+ * elevenx/lib/openaiClient.js
+ * ────────────────────────────────────────────────────────────────────────
+ * OpenAI Image generation via the shared Cloudflare Worker proxy.
+ * Used for A/B comparison with Seedream during the cast bible build.
+ *
+ * Endpoint:
+ *   POST {workerUrl}/openai/v1/images/generations
+ *   Body: { model, prompt, size, quality, n }
+ *   Response: { data: [{ b64_json, revised_prompt? }] }
+ *
+ * Model defaults to "gpt-image-2" (same as book-beta.html). The worker
+ * injects OPENAI_API_KEY server-side; client never sees it.
+ *
+ * Pricing (verify at https://openai.com/api/pricing/):
+ *   - low quality:     ~$0.011 per 1024px image
+ *   - medium quality:  ~$0.042 per 1024px image
+ *   - high quality:    ~$0.167 per 1024px image
+ *
+ * We default to "medium" for cast bible generation — comparable cost
+ * to Seedream ($0.05/img) for a fair A/B test.
+ */
+
+(() => {
+  const NS = (window.ElevenX = window.ElevenX || {});
+
+  class OpenAIClient {
+    /**
+     * @param {object} opts
+     * @param {string} opts.workerUrl
+     * @param {boolean} [opts.dryRun]
+     * @param {function} [opts.onLog]
+     * @param {function} [opts.fetch]
+     */
+    constructor(opts = {}) {
+      this.dryRun = !!opts.dryRun;
+      if (!opts.workerUrl && !this.dryRun) {
+        throw new Error("OpenAIClient requires opts.workerUrl");
+      }
+      this.workerUrl = (opts.workerUrl || "").replace(/\/+$/, "");
+      this.onLog = opts.onLog || (() => {});
+      const fetchImpl = opts.fetch || globalThis.fetch;
+      this.fetch = fetchImpl ? fetchImpl.bind(globalThis) : null;
+    }
+
+    /**
+     * Generate an image with gpt-image-2.
+     * @param {object} body
+     * @param {string} body.prompt
+     * @param {string} [body.model="gpt-image-2"]
+     * @param {"1024x1024"|"1024x1536"|"1536x1024"|"auto"} [body.size="1024x1024"]
+     * @param {"low"|"medium"|"high"|"auto"} [body.quality="medium"]
+     * @param {number} [body.n=1]
+     * @returns {Promise<{ images: [{ b64_json: string, dataUrl: string }], cost_usd_estimated: number }>}
+     */
+    async imageGenerate(body, opts = {}) {
+      if (!body.prompt) throw new Error("imageGenerate: body.prompt is required");
+      const model = body.model || "gpt-image-2";
+      const size = body.size || "1024x1024";
+      const quality = body.quality || "medium";
+      const n = body.n || 1;
+
+      const requestBody = { model, prompt: body.prompt, size, quality, n };
+
+      if (this.dryRun) {
+        this.onLog(`[dry-run] OpenAI image generate: ${model} · ${size} · ${quality}`);
+        return { dryRun: true, request: requestBody };
+      }
+
+      const url = `${this.workerUrl}/openai/v1/images/generations`;
+      this.onLog(`→ POST /openai/v1/images/generations (${model}, ${size}, ${quality})`);
+
+      const res = await this.fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`openai images failed: ${res.status} ${res.statusText} — ${text.slice(0, 400)}`);
+      }
+
+      const json = await res.json();
+      // OpenAI gpt-image-2 returns `{ data: [{ b64_json, revised_prompt }] }`.
+      // Convert to a uniform shape that mirrors FalClient.seedreamTextToImage
+      // so the same handler can swap between them.
+      const images = (json.data || []).map(d => ({
+        b64_json: d.b64_json,
+        dataUrl: d.b64_json ? `data:image/png;base64,${d.b64_json}` : null,
+        revised_prompt: d.revised_prompt || null,
+      }));
+
+      return {
+        images,
+        cost_usd_estimated: estimateOpenAIImageCost(size, quality) * n,
+        raw: json,
+      };
+    }
+  }
+
+  function estimateOpenAIImageCost(size = "1024x1024", quality = "medium") {
+    // Approximations — verify at openai.com/api/pricing/.
+    // For gpt-image-2:
+    const tier = ({ low: 0.011, medium: 0.042, high: 0.167, auto: 0.042 })[quality] || 0.042;
+    // Larger sizes scale roughly linearly. 1024x1536 ≈ 1.5x, 1536x1024 ≈ 1.5x.
+    const sizeMult = ({ "1024x1024": 1.0, "1024x1536": 1.5, "1536x1024": 1.5, "auto": 1.0 })[size] || 1.0;
+    return tier * sizeMult;
+  }
+
+  NS.OpenAIClient = OpenAIClient;
+  NS.estimateOpenAIImageCost = estimateOpenAIImageCost;
+})();
+
+})();
+</script>
+
+<script>
 /* === namespace shortcuts === */
 (() => {
   const NS = window.ElevenX;
@@ -6936,15 +7065,35 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   const NS = window.ElevenX;
   if (!NS) { console.error("[ElevenX] missing namespace"); return; }
 
-  const { Storage, SEED_DATA, FalClient, composer, modeResolver } = NS;
+  const { Storage, SEED_DATA, FalClient, OpenAIClient, composer, modeResolver } = NS;
 
   // ─── State ──────────────────────────────────────────────────────────
   const State = {
     workerUrl: null,
     fal: null,                  // FalClient instance, lazily constructed
+    openai: null,               // OpenAIClient instance, lazily constructed
     costSpentUsd: 0,
     activeJobs: 0,
     activeShotId: null,         // currently open in Shot Editor
+  };
+
+  // Image-generation models we A/B compare on the cast bible.
+  // Adding new models = add an entry here + a case in handleGenerateCastRefs.
+  const IMAGE_MODELS = {
+    seedream: {
+      label: "Seedream v4.5",
+      shortLabel: "Seedream",
+      provider: "fal.ai",
+      cost_per_image_usd: 0.05,
+      badge_color: "#c9a25a",
+    },
+    gpt: {
+      label: "GPT Image 2",
+      shortLabel: "GPT",
+      provider: "OpenAI",
+      cost_per_image_usd: 0.042,    // medium quality 1024x1024
+      badge_color: "#10a37f",
+    },
   };
 
   // ─── Utilities ──────────────────────────────────────────────────────
@@ -7075,16 +7224,16 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       try {
         const r = await fetch(`${url.replace(/\/+$/, "")}/health`);
         const j = await r.json();
-        if (j.ok && j.fal?.hasSecret) {
-          status.innerHTML = `<span style="color:#4ade80">✓ Worker live · fal.ai key present</span>`;
-          return true;
-        } else if (j.ok && !j.fal?.hasSecret) {
-          status.innerHTML = `<span style="color:#f87171">✗ Worker live, but FAL_API_KEY secret is missing — add it in Cloudflare → Variables.</span>`;
-          return false;
-        } else {
+        if (!j.ok) {
           status.innerHTML = `<span style="color:#f87171">✗ Worker returned: ${esc(JSON.stringify(j).slice(0, 80))}</span>`;
           return false;
         }
+        const checks = [];
+        checks.push(j.fal?.hasSecret    ? `<span style="color:#4ade80">✓ fal.ai</span>`    : `<span style="color:#fbbf24">○ fal.ai (FAL_API_KEY missing)</span>`);
+        checks.push(j.openai?.hasSecret ? `<span style="color:#4ade80">✓ OpenAI</span>`    : `<span style="color:#fbbf24">○ OpenAI (OPENAI_API_KEY missing — GPT Image disabled)</span>`);
+        status.innerHTML = checks.join(" · ");
+        // We allow save even if only one is present (Seedream-only is fine).
+        return !!j.fal?.hasSecret;
       } catch (err) {
         status.innerHTML = `<span style="color:#f87171">✗ ${esc(err.message)}</span>`;
         return false;
@@ -7100,7 +7249,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       if (!ok && !confirm("Connection test did not pass. Save anyway?")) return;
       State.workerUrl = url;
       await Storage.setSetting("worker_url", url);
-      State.fal = new FalClient({ workerUrl: url, onLog: m => console.log("[fal]", m) });
+      State.fal    = new FalClient({ workerUrl: url, onLog: m => console.log("[fal]", m) });
+      State.openai = new OpenAIClient({ workerUrl: url, onLog: m => console.log("[openai]", m) });
       panel.remove();
       toast("Worker URL saved.");
       renderConnectionBadge();
@@ -7143,30 +7293,40 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const grid = $("#elx-cast-grid");
     if (!grid) return;
     grid.innerHTML = "";
-    const addCard = null; // we don't carry over the mockup's add card; user creates via chat or future button
 
+    // For each character, render ONE card per IMAGE_MODEL → side-by-side A/B comparison
     for (const c of characters) {
-      const card = document.createElement("div");
-      card.className = "cast-card";
-      card.dataset.id = c.id;
-      const refs = c.refs || {};
-      const refCount = Object.keys(refs).filter(k => refs[k]?.dataUrl).length;
-      const portrait = refs.head_on?.dataUrl || refs.three_quarter?.dataUrl || refs.full_body?.dataUrl;
-      card.innerHTML = `
-        <div class="cast-card__portrait" style="${portrait ? `background-image:url('${portrait}'); background-size:cover; background-position:top center;` : ''}">
-          ${portrait ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(c.id).toUpperCase()}</div>`}
-        </div>
-        <div class="cast-card__name">${esc(c.display_name)}</div>
-        <div class="cast-card__role">${esc(c.identity?.age || "")} · ${esc(c.identity?.nationality || "")} · ${esc(c.identity?.archetype || "")}</div>
-        <div class="cast-card__palette">${(c.wardrobe?.color_palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
-        <div class="cast-card__meta">${refCount}/3 refs · ${refCount === 3 ? '<span style="color:#4ade80">approved</span>' : '<span style="color:#fbbf24">pending</span>'}</div>
-        <div class="cast-card__bottom">
-          <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}">${refCount === 3 ? "Re-roll refs" : `Generate ${3 - refCount} angle${3-refCount===1?"":"s"}`}</button>
-        </div>
-      `;
-      grid.appendChild(card);
+      for (const [modelKey, modelMeta] of Object.entries(IMAGE_MODELS)) {
+        grid.appendChild(buildCastCard(c, modelKey, modelMeta));
+      }
     }
-    if (addCard) grid.appendChild(addCard);
+  }
+
+  function buildCastCard(c, modelKey, modelMeta) {
+    const refsForModel = c.refs?.[modelKey] || {};
+    const angleKeys = ["head_on", "three_quarter", "full_body"];
+    const refCount = angleKeys.filter(k => refsForModel[k]?.dataUrl).length;
+    const portrait = refsForModel.head_on?.dataUrl
+                  || refsForModel.three_quarter?.dataUrl
+                  || refsForModel.full_body?.dataUrl;
+    const card = document.createElement("div");
+    card.className = `cast-card cast-card--${modelKey}`;
+    card.dataset.id = c.id;
+    card.dataset.model = modelKey;
+    card.innerHTML = `
+      <div class="cast-card__portrait" style="${portrait ? `background-image:url('${portrait}'); background-size:cover; background-position:top center;` : ''}">
+        ${portrait ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(c.id).toUpperCase()}</div>`}
+        <span class="cast-card__model-badge" style="background:${modelMeta.badge_color}22; color:${modelMeta.badge_color}; border:1px solid ${modelMeta.badge_color}55;">${esc(modelMeta.shortLabel)}</span>
+      </div>
+      <div class="cast-card__name">${esc(c.display_name)}</div>
+      <div class="cast-card__role">${esc(c.identity?.age || "")} · ${esc(c.identity?.nationality || "")} · ${esc(c.identity?.archetype || "")}</div>
+      <div class="cast-card__palette">${(c.wardrobe?.color_palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
+      <div class="cast-card__meta">${refCount}/3 refs · ${refCount === 3 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'} · <span style="color:#9a9aab">${esc(modelMeta.shortLabel)}</span></div>
+      <div class="cast-card__bottom">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}" data-model="${esc(modelKey)}">${refCount === 3 ? `Re-roll (${esc(modelMeta.shortLabel)})` : `Generate ${3 - refCount} angle${3-refCount===1?"":"s"}`}</button>
+      </div>
+    `;
+    return card;
   }
 
   async function renderLocationTab() {
@@ -7316,42 +7476,85 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   // ─── Actions ────────────────────────────────────────────────────────
-  async function handleGenerateCastRefs(charId) {
-    if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
+  async function handleGenerateCastRefs(charId, modelKey = "seedream") {
+    const modelMeta = IMAGE_MODELS[modelKey];
+    if (!modelMeta) { toast(`Unknown model: ${modelKey}`, { tone: "err" }); return; }
+
+    // Lazy-construct the right client
+    const client = (modelKey === "seedream") ? State.fal : State.openai;
+    if (!client) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
+
     const c = await Storage.get("characters", charId);
     if (!c) return;
+
+    // Ensure the per-model bucket exists
+    c.refs = c.refs || {};
+    c.refs[modelKey] = c.refs[modelKey] || {};
 
     State.activeJobs++;
     const angles = ["head_on", "three_quarter", "full_body"];
     let okCount = 0, failCount = 0;
     for (const angle of angles) {
-      if (c.refs?.[angle]?.dataUrl) continue; // skip approved
-      setGPS(true, `Generating <span class="mono">${esc(charId)} · ${angle}</span>`, "seedream-v4.5", 20);
+      if (c.refs[modelKey][angle]?.dataUrl) continue; // skip already approved
+      setGPS(true,
+        `Generating <span class="mono">${esc(charId)} · ${angle}</span>`,
+        `${modelMeta.label}`,
+        20);
       try {
-        const prompt = composer.composeCastReferencePrompt(c, angle);
-        const result = await State.fal.seedreamTextToImage(prompt);
-        const imgUrl = result?.images?.[0]?.url;
-        if (!imgUrl) { toast(`Failed for ${charId}/${angle}: no image in response`, { tone: "err" }); failCount++; continue; }
-        // Download image as data URL for offline persistence
-        const blob = await fetch(imgUrl).then(r => r.blob());
-        const dataUrl = await blobToDataUrl(blob);
-        c.refs = c.refs || {};
-        c.refs[angle] = { dataUrl, seed: result.seed, generated_at: Date.now() };
+        const promptSpec = composer.composeCastReferencePrompt(c, angle);
+        let dataUrl, seed, costUsd;
+
+        if (modelKey === "seedream") {
+          const result = await State.fal.seedreamTextToImage(promptSpec);
+          const imgUrl = result?.images?.[0]?.url;
+          if (!imgUrl) { toast(`Failed: ${charId}/${angle} (no image)`, { tone: "err" }); failCount++; continue; }
+          const blob = await fetch(imgUrl).then(r => r.blob());
+          dataUrl = await blobToDataUrl(blob);
+          seed = result.seed;
+          costUsd = modelMeta.cost_per_image_usd;
+        } else if (modelKey === "gpt") {
+          // gpt-image returns b64_json directly — no separate fetch needed
+          const sizeForAngle = ({
+            head_on:       "1024x1024",
+            three_quarter: "1024x1536",
+            full_body:     "1024x1536",
+          })[angle] || "1024x1024";
+          const result = await State.openai.imageGenerate({
+            prompt: promptSpec.prompt,
+            size: sizeForAngle,
+            quality: "medium",
+            n: 1,
+          });
+          dataUrl = result?.images?.[0]?.dataUrl;
+          if (!dataUrl) { toast(`Failed: ${charId}/${angle} (no image)`, { tone: "err" }); failCount++; continue; }
+          seed = null; // gpt-image doesn't expose a seed
+          costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
+        }
+
+        c.refs[modelKey][angle] = {
+          dataUrl,
+          seed,
+          generated_at: Date.now(),
+          cost_usd: costUsd,
+          model: modelMeta.label,
+        };
         await Storage.put("characters", c);
-        await trackCost(0.05, `seedream cast ${charId}/${angle}`);
+        await trackCost(costUsd, `${modelKey} cast ${charId}/${angle}`);
         renderCastTab();
         okCount++;
       } catch (err) {
-        console.error(err);
-        toast(`Error: ${err.message}`, { tone: "err" });
+        console.error(`[${modelKey}]`, err);
+        toast(`${modelMeta.shortLabel} error: ${err.message}`, { tone: "err" });
         failCount++;
       }
     }
     setGPS(false);
     State.activeJobs--;
-    if (okCount > 0 && failCount === 0)      toast(`Cast bible for ${c.display_name}: ${okCount} angle${okCount===1?"":"s"} added.`);
-    else if (okCount > 0 && failCount > 0)   toast(`Partial: ${okCount} succeeded, ${failCount} failed. Retry to fill in the gaps.`, { tone: "warn", duration: 7000 });
-    else if (failCount > 0)                  toast(`All ${failCount} angle${failCount===1?"":"s"} failed. See errors above; check console.`, { tone: "err", duration: 8000 });
+
+    const m = modelMeta.shortLabel;
+    if (okCount > 0 && failCount === 0)      toast(`${c.display_name} · ${m}: ${okCount} angle${okCount===1?"":"s"} added.`);
+    else if (okCount > 0 && failCount > 0)   toast(`${m} partial: ${okCount} ok, ${failCount} failed. Retry to fill gaps.`, { tone: "warn", duration: 7000 });
+    else if (failCount > 0)                  toast(`${m}: all ${failCount} angle${failCount===1?"":"s"} failed. Check console.`, { tone: "err", duration: 8000 });
   }
 
   async function handleGenerateEnvRefs(locId) {
@@ -7535,8 +7738,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
     const action = target.dataset.action;
     e.preventDefault();
-    if (action === "gen-cast")          handleGenerateCastRefs(target.dataset.charId);
-    else if (action === "gen-env")      handleGenerateEnvRefs(target.dataset.locId);
+    if (action === "gen-cast")          handleGenerateCastRefs(target.dataset.charId, target.dataset.model || "seedream");
+    else if (action === "gen-env")      handleGenerateEnvRefs(target.dataset.locId, target.dataset.model || "seedream");
     else if (action === "roll-shot")    handleRollShot(target.dataset.shotId);
     else if (action === "open-shot-editor") {
       document.querySelectorAll(".proto-tab").forEach(t => t.classList.toggle("is-active", t.dataset.screen === "s4"));
@@ -7630,7 +7833,28 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     State.workerUrl    = await Storage.getSetting("worker_url", null);
     State.costSpentUsd = (await Storage.getSetting("cost_total", 0)) || 0;
     if (State.workerUrl) {
-      State.fal = new FalClient({ workerUrl: State.workerUrl, onLog: m => console.log("[fal]", m) });
+      State.fal    = new FalClient({ workerUrl: State.workerUrl, onLog: m => console.log("[fal]", m) });
+      State.openai = new OpenAIClient({ workerUrl: State.workerUrl, onLog: m => console.log("[openai]", m) });
+    }
+
+    // ── Migration: c.refs[angle] → c.refs[modelKey][angle] ────────────────
+    // The schema gained a per-model bucket so we can A/B Seedream vs GPT.
+    // Any character with the OLD flat shape (c.refs.head_on directly) gets
+    // its angles moved under c.refs.seedream — that's the historic default.
+    for (const c of await Storage.getAll("characters")) {
+      const r = c.refs || {};
+      const hasOldShape = r.head_on || r.three_quarter || r.full_body;
+      const hasNewShape = r.seedream || r.gpt;
+      if (hasOldShape && !hasNewShape) {
+        c.refs = {
+          seedream: { head_on: r.head_on, three_quarter: r.three_quarter, full_body: r.full_body },
+          gpt: {},
+        };
+        await Storage.put("characters", c);
+      } else if (!hasNewShape) {
+        c.refs = { seedream: {}, gpt: {} };
+        await Storage.put("characters", c);
+      }
     }
 
     // Adapt each screen's DOM (replace static mockup content with live containers)
