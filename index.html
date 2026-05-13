@@ -7202,10 +7202,12 @@ function blobToDataUrl(blob) {
 (() => {
   const NS = window.ElevenX;
   NS.composer = {
-    composeSeedance:                NS.composeSeedance,
-    composeCastReferencePrompt:     NS.composeCastReferencePrompt,
-    composeEnvironmentReferencePrompt: NS.composeEnvironmentReferencePrompt,
-    clampDuration:                  NS.clampDuration,
+    composeSeedance:                       NS.composeSeedance,
+    composeCastReferencePrompt:            NS.composeCastReferencePrompt,
+    composeCastReferenceEditPrompt:        NS.composeCastReferenceEditPrompt,
+    composeEnvironmentReferencePrompt:     NS.composeEnvironmentReferencePrompt,
+    composeEnvironmentReferenceEditPrompt: NS.composeEnvironmentReferenceEditPrompt,
+    clampDuration:                         NS.clampDuration,
   };
   NS.modeResolver = {
     resolveMode:    NS.resolveMode,
