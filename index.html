@@ -4099,6 +4099,33 @@ a { color: inherit; text-decoration: none; }
 .elx-finish-tile__num--dim, .elx-finish-tile__name--dim { color: #5a5a6e; }
 .elx-finish-tile__name { flex: 1; color: #e8e8ee; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .elx-finish-tile__dur { font-family: 'JetBrains Mono', monospace; color: #9a9aab; }
+
+/* Score upload + export blocks on Finish */
+.elx-finish__label { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.10em; text-transform: uppercase; color: #9a9aab; }
+.elx-finish__score, .elx-finish__export {
+  background: #14141a; border: 1px solid #2a2a35; border-radius: 8px;
+  padding: 12px 16px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.elx-finish__score-head { display: flex; align-items: baseline; gap: 12px; }
+.elx-finish__score-state { font-size: 11px; color: #9a9aab; font-family: 'JetBrains Mono', monospace; }
+.elx-finish__score-row, .elx-finish__export-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.elx-finish__score-hint, .elx-finish__export-hint { color: #9a9aab; font-size: 11px; flex: 1 1 100%; line-height: 1.4; }
+
+/* Take overlay badge */
+.take__overlay-badge {
+  font-size: 9px; color: #c9a25a; font-family: 'JetBrains Mono', monospace;
+  background: rgba(201,162,90,0.12); padding: 2px 6px; border-radius: 3px;
+  margin-top: 4px; letter-spacing: 0.04em;
+}
+.take__rating { color: #c9a25a; font-family: monospace; letter-spacing: 0.5px; }
+.take__note { font-size: 10px; color: #9a9aab; margin-top: 2px; font-style: italic; line-height: 1.3; }
+.take__btn--overlay:hover { border-color: #c9a25a; color: #c9a25a; }
+
+/* Status text inside take card */
+.take__status-text { color: #9a9aab; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
+.take.is-approved .take__status-text { color: #4ade80; }
+.take.is-rejected .take__status-text { color: #f87171; }
 </style>
 
 </head>
@@ -7628,6 +7655,165 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
 </script>
 
 <script>
+/* === elevenx/lib/elevenLabsClient.js === */
+(window.ElevenX = window.ElevenX || {});
+(() => {
+/**
+ * elevenx/lib/elevenLabsClient.js
+ * ────────────────────────────────────────────────────────────────────────
+ * Direct browser client for ElevenLabs v3 (eleven_v3) TTS.
+ *
+ * Why direct (not through the Cloudflare Worker)?
+ *   - ElevenLabs serves CORS-allowed responses for xi-api-key authenticated
+ *     requests, so the browser can call api.elevenlabs.io directly without
+ *     the worker layer.
+ *   - The user's existing Codex Studio book tool already uses this exact
+ *     pattern. We follow it here for consistency.
+ *   - Avoids forcing a worker redeploy for a single new service.
+ *
+ * What we use this for in ElevenX:
+ *   - "Voice overlay" — when Seedance's native audio drifts on a take
+ *     (wrong tone, accent, or pacing), the director can generate a
+ *     replacement audio track from ElevenLabs v3 using the per-character
+ *     voice ID + the shot's verbatim dialogue line.
+ *   - Per-shot dialogue regen in production.
+ *   - Future: emotion-tagged narration for non-dialogue shots.
+ *
+ * API surface used:
+ *   POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}
+ *     body: { text, model_id, voice_settings }
+ *     headers: { xi-api-key, accept: audio/mpeg, content-type: application/json }
+ *     returns: audio/mpeg blob
+ *
+ * Pricing (as of 2026-05): roughly $0.18/1k chars on the Starter tier with
+ * v3; the actual rate depends on the user's subscription.
+ */
+
+(() => {
+  const NS = (window.ElevenX = window.ElevenX || {});
+
+  // v3 is the May 2026 flagship model. Audio tags + 70+ languages + best
+  // expressiveness. We default to v3 across the board.
+  const ELEVEN_MODEL_V3 = "eleven_v3";
+
+  class ElevenLabsClient {
+    /**
+     * @param {object} opts
+     * @param {string} opts.apiKey   — user's xi-api-key (stored in IDB settings)
+     * @param {function} [opts.onLog]
+     * @param {function} [opts.fetch]
+     */
+    constructor(opts = {}) {
+      if (!opts.apiKey) throw new Error("ElevenLabsClient requires opts.apiKey");
+      this.apiKey = opts.apiKey;
+      this.onLog = opts.onLog || (() => {});
+      const fetchImpl = opts.fetch || globalThis.fetch;
+      this.fetch = fetchImpl ? fetchImpl.bind(globalThis) : null;
+    }
+
+    /**
+     * Generate TTS audio for a given voice + text.
+     *
+     * @param {object} body
+     * @param {string} body.voice_id       — ElevenLabs voice ID
+     * @param {string} body.text           — dialogue line (max ~5000 chars)
+     * @param {string} [body.model_id]     — defaults to "eleven_v3"
+     * @param {object} [body.voice_settings]
+     * @returns {Promise<{ audioBlob: Blob, dataUrl: string, byteSize: number }>}
+     */
+    async textToSpeech(body, opts = {}) {
+      if (!body.voice_id) throw new Error("textToSpeech: voice_id is required");
+      if (!body.text || !body.text.trim()) throw new Error("textToSpeech: text is required");
+      const model_id = body.model_id || ELEVEN_MODEL_V3;
+      const voice_settings = body.voice_settings || {
+        stability: 0.5,
+        similarity_boost: 0.75,
+        style: 0.5,
+        use_speaker_boost: true,
+      };
+
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(body.voice_id)}`;
+      this.onLog(`→ POST eleven_v3 TTS (${body.voice_id.slice(0, 8)}…, ${body.text.length} chars)`);
+
+      const res = await this._fetchWithRetry(url, {
+        method: "POST",
+        headers: {
+          "xi-api-key": this.apiKey,
+          "accept": "audio/mpeg",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ text: body.text, model_id, voice_settings }),
+      }, "elevenlabs tts");
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`elevenlabs tts ${res.status}: ${errText.slice(0, 300)}`);
+      }
+
+      const audioBlob = await res.blob();
+      const dataUrl = await this._blobToDataUrl(audioBlob);
+      return {
+        audioBlob,
+        dataUrl,
+        byteSize: audioBlob.size,
+        cost_usd_estimated: estimateElevenLabsCost(body.text.length),
+        model_id,
+      };
+    }
+
+    /** List the user's available voices. */
+    async listVoices() {
+      const res = await this.fetch("https://api.elevenlabs.io/v1/voices", {
+        headers: { "xi-api-key": this.apiKey },
+      });
+      if (!res.ok) throw new Error(`voices fetch ${res.status}`);
+      return res.json();
+    }
+
+    // ── Retry helper for transient 5xx / network errors ────────────────
+    async _fetchWithRetry(url, opts, label = "fetch") {
+      const max = 3;
+      let lastErr = null;
+      for (let attempt = 1; attempt <= max; attempt++) {
+        try {
+          const res = await this.fetch(url, opts);
+          if (res.ok || res.status < 500) return res;
+          lastErr = new Error(`${label} ${res.status}`);
+        } catch (err) {
+          lastErr = err;
+        }
+        if (attempt < max) {
+          const delay = 1500 * Math.pow(2, attempt - 1);
+          this.onLog(`  ⚠ ${label} transient failure, retry in ${delay/1000}s`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+      throw lastErr || new Error(`${label}: exhausted ${max} attempts`);
+    }
+
+    _blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload  = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+        r.readAsDataURL(blob);
+      });
+    }
+  }
+
+  // Roughly $0.18 per 1k chars on Starter tier with v3. Caller-tunable.
+  function estimateElevenLabsCost(charCount) {
+    return (charCount / 1000) * 0.18;
+  }
+
+  NS.ElevenLabsClient = ElevenLabsClient;
+  NS.estimateElevenLabsCost = estimateElevenLabsCost;
+})();
+
+})();
+</script>
+
+<script>
 /* === namespace shortcuts === */
 (() => {
   const NS = window.ElevenX;
@@ -7765,13 +7951,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   const NS = window.ElevenX;
   if (!NS) { console.error("[ElevenX] missing namespace"); return; }
 
-  const { Storage, SEED_DATA, FalClient, OpenAIClient, composer, modeResolver } = NS;
+  const { Storage, SEED_DATA, FalClient, OpenAIClient, ElevenLabsClient, composer, modeResolver } = NS;
 
   // ─── State ──────────────────────────────────────────────────────────
   const State = {
     workerUrl: null,
+    elevenKey: null,            // ElevenLabs xi-api-key (direct browser→EL)
     fal: null,                  // FalClient instance, lazily constructed
     openai: null,               // OpenAIClient instance, lazily constructed
+    eleven: null,               // ElevenLabsClient instance, lazily constructed
     costSpentUsd: 0,
     activeJobs: 0,
     activeShotId: null,         // currently open in Shot Editor
@@ -7959,20 +8147,28 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     `;
     panel.innerHTML = `
       <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
-                  padding:28px 32px; max-width:520px; width:90%;
+                  padding:28px 32px; max-width:560px; width:90%;
                   font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
                   box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
         <h2 style="margin:0 0 6px; font-size:18px; font-weight:600;">Connection</h2>
         <p style="margin:0 0 22px; font-size:13px; color:#9a9aab; line-height:1.5;">
-          Paste your Cloudflare Worker URL. The worker injects your fal.ai key
-          server-side — your key never reaches this page. Same worker your
-          Codex Studio uses.
+          Paste your Cloudflare Worker URL (for fal.ai + OpenAI) and ElevenLabs key
+          (used directly from the browser). Keys never leave your machine for the
+          Worker route; ElevenLabs is direct since their API allows CORS.
         </p>
         <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:6px; letter-spacing:0.04em; text-transform:uppercase;">Worker URL</label>
         <input id="elx-worker-input"
                type="url"
                placeholder="https://your-worker.workers.dev"
                value="${esc(State.workerUrl || "")}"
+               style="width:100%; padding:10px 12px; background:#0a0a0c; color:#e8e8ee;
+                      border:1px solid #2a2a35; border-radius:6px; font-size:13px;
+                      font-family: 'JetBrains Mono', monospace; box-sizing:border-box;">
+        <label style="display:block; font-size:11px; color:#9a9aab; margin:18px 0 6px; letter-spacing:0.04em; text-transform:uppercase;">ElevenLabs API key <span style="text-transform:none; color:#5a5a6e; letter-spacing:0; font-size:10px">(optional — only needed for voice overlay)</span></label>
+        <input id="elx-eleven-input"
+               type="password"
+               placeholder="xi-…"
+               value="${esc(State.elevenKey || "")}"
                style="width:100%; padding:10px 12px; background:#0a0a0c; color:#e8e8ee;
                       border:1px solid #2a2a35; border-radius:6px; font-size:13px;
                       font-family: 'JetBrains Mono', monospace; box-sizing:border-box;">
@@ -8016,15 +8212,28 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     $("#elx-conn-cancel").addEventListener("click", () => panel.remove());
     $("#elx-conn-save").addEventListener("click", async () => {
       const url = input.value.trim();
-      if (!url) return;
-      const ok = await testConn(url);
-      if (!ok && !confirm("Connection test did not pass. Save anyway?")) return;
-      State.workerUrl = url;
-      await Storage.setSetting("worker_url", url);
-      State.fal    = new FalClient({ workerUrl: url, onLog: m => console.log("[fal]", m) });
-      State.openai = new OpenAIClient({ workerUrl: url, onLog: m => console.log("[openai]", m) });
+      const elKey = $("#elx-eleven-input").value.trim();
+      if (!url && !elKey) return;
+      if (url) {
+        const ok = await testConn(url);
+        if (!ok && !confirm("Connection test did not pass. Save anyway?")) return;
+        State.workerUrl = url;
+        await Storage.setSetting("worker_url", url);
+        State.fal    = new FalClient({ workerUrl: url, onLog: m => console.log("[fal]", m) });
+        State.openai = new OpenAIClient({ workerUrl: url, onLog: m => console.log("[openai]", m) });
+      }
+      if (elKey) {
+        State.elevenKey = elKey;
+        await Storage.setSetting("eleven_key", elKey);
+        State.eleven = new ElevenLabsClient({ apiKey: elKey, onLog: m => console.log("[eleven]", m) });
+      } else if (!elKey && State.elevenKey) {
+        // User cleared the field — drop the client
+        State.elevenKey = null;
+        State.eleven = null;
+        await Storage.setSetting("eleven_key", "");
+      }
       panel.remove();
-      toast("Worker URL saved.");
+      toast("Connection settings saved.");
       renderConnectionBadge();
     });
   }
@@ -8297,6 +8506,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const preview = $(".elx-preview-wrap", root);
     if (preview) {
       let videoEl = preview.querySelector("video");
+      let audioOverlayEl = preview.querySelector("audio.elx-overlay-audio");
       if (!videoEl) {
         videoEl = document.createElement("video");
         videoEl.controls = true;
@@ -8305,10 +8515,48 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         frame.innerHTML = "";
         frame.appendChild(videoEl);
       }
+      if (!audioOverlayEl) {
+        audioOverlayEl = document.createElement("audio");
+        audioOverlayEl.className = "elx-overlay-audio";
+        preview.appendChild(audioOverlayEl);
+      }
+      // Reset previous overlay sync listeners
+      if (videoEl._overlayCleanup) videoEl._overlayCleanup();
       if (current?.videoDataUrl) {
         videoEl.src = current.videoDataUrl;
+        if (current.audioOverlay?.dataUrl) {
+          // Mute the video, play overlay audio synced. Show a "v3 overlay" badge.
+          audioOverlayEl.src = current.audioOverlay.dataUrl;
+          videoEl.muted = true;
+          const onPlay  = () => audioOverlayEl.play().catch(() => {});
+          const onPause = () => audioOverlayEl.pause();
+          const onSeek  = () => { audioOverlayEl.currentTime = videoEl.currentTime; };
+          videoEl.addEventListener("play",  onPlay);
+          videoEl.addEventListener("pause", onPause);
+          videoEl.addEventListener("seeked", onSeek);
+          videoEl._overlayCleanup = () => {
+            videoEl.removeEventListener("play",  onPlay);
+            videoEl.removeEventListener("pause", onPause);
+            videoEl.removeEventListener("seeked", onSeek);
+            audioOverlayEl.pause();
+          };
+          // Show a small badge over the video
+          let badge = preview.querySelector(".elx-overlay-badge");
+          if (!badge) {
+            badge = document.createElement("div");
+            badge.className = "elx-overlay-badge";
+            badge.style.cssText = "position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.75); color:#c9a25a; font-family:'JetBrains Mono', monospace; font-size:11px; padding:4px 10px; border-radius:4px;";
+            preview.appendChild(badge);
+          }
+          badge.textContent = "🎙 v3 overlay";
+        } else {
+          videoEl.muted = false;
+          audioOverlayEl.removeAttribute("src");
+          preview.querySelector(".elx-overlay-badge")?.remove();
+        }
       } else {
         videoEl.removeAttribute("src");
+        audioOverlayEl.removeAttribute("src");
         videoEl.style.background = "#0a0a0c";
         if (!preview.querySelector(".elx-preview-empty")) {
           const empty = document.createElement("div");
@@ -8336,33 +8584,68 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         const tEl = document.createElement("div");
         tEl.className = `take ${statusClass}`;
         tEl.dataset.takeId = t.id;
-        const statusLabel = t.status === "approved" ? "★ approved"
-                          : t.status === "rejected" ? "✗ rejected"
-                          : "pending";
+        const ratingStars = t.rating ? "★".repeat(t.rating) + "☆".repeat(5 - t.rating) : "";
+        const statusLabel = t.status === "approved"
+            ? `<span class="take__status-text">approved</span>${ratingStars ? ` <span class="take__rating">${ratingStars}</span>` : ""}`
+          : t.status === "rejected"
+            ? `<span class="take__status-text">rejected</span>`
+            : `<span class="take__status-text">pending</span>`;
+        const hasOverlay = !!t.audioOverlay?.dataUrl;
+        const shotHasDialogue = (shot.cast_in_frame || []).some(c => (c.dialogue?.en || c.dialogue));
         tEl.innerHTML = `
           ${t.thumbDataUrl ? `<div class="take__thumb" style="background-image:url('${t.thumbDataUrl}');"></div>` : ""}
           <div class="take__id">${esc(t.id.slice(0,8))}</div>
           <div class="take__cost">${fmtUsd(t.cost_usd)}</div>
           <div class="take__status">${statusLabel}</div>
+          ${hasOverlay ? `<div class="take__overlay-badge" title="ElevenLabs v3 overlay active">🎙 v3 overlay</div>` : ""}
+          ${t.rating_note ? `<div class="take__note" title="${esc(t.rating_note)}">${esc(t.rating_note.slice(0, 40))}${t.rating_note.length > 40 ? "…" : ""}</div>` : ""}
           ${t.rejection_reason ? `<div class="take__reason" title="${esc(t.rejection_reason)}">${esc(t.rejection_reason.slice(0, 30))}${t.rejection_reason.length > 30 ? "…" : ""}</div>` : ""}
           <div class="take__actions">
+            ${shotHasDialogue && !hasOverlay ? `<button class="take__btn take__btn--overlay" title="Generate ElevenLabs v3 voice overlay">🎙</button>` : ""}
             ${t.status !== "approved" ? `<button class="take__btn take__btn--approve" title="Approve this take">★</button>` : ""}
             ${t.status !== "rejected" ? `<button class="take__btn take__btn--reject" title="Reject this take">✗</button>` : ""}
           </div>
         `;
-        // Approve button
+        // Approve button — captures rating + optional reason at the moment
+        // of approval. The rating feeds the future AI Producer's learning
+        // loop: "what does the director actually like?"
         tEl.querySelector(".take__btn--approve")?.addEventListener("click", async (e) => {
           e.stopPropagation();
+          const ratingRaw = prompt(
+            "Rate this take 1-5 (★):\n\n" +
+            "5 = perfect, ship it\n" +
+            "4 = great, minor nits\n" +
+            "3 = usable but could improve\n" +
+            "2 = approved for now, plan to re-roll\n" +
+            "1 = bare minimum, definitely re-roll",
+            "5"
+          );
+          if (ratingRaw === null) return; // user cancelled
+          const rating = Math.max(1, Math.min(5, parseInt(ratingRaw, 10) || 3));
+          let note = "";
+          if (rating <= 3) {
+            note = (prompt("What's not perfect? (optional)") || "").trim();
+          }
           for (const x of (shot.takes || [])) {
-            if (x.id === t.id) { x.status = "approved"; x.rejection_reason = null; }
+            if (x.id === t.id) {
+              x.status = "approved";
+              x.rejection_reason = null;
+              x.rating = rating;
+              x.rating_note = note || null;
+              x.approved_at = Date.now();
+            }
             else if (x.status === "approved") x.status = "rejected";
           }
           await Storage.put("shots", shot);
-          // Chain to next shot when an approved take changes
           chainToNextShot(shot, t).catch(err => console.warn("[chain]", err));
           renderShotEditor(shotId);
           renderStoryboard();
-          toast(`Take approved · S${String(shot.shot_number).padStart(2,"0")}`);
+          toast(`Take approved · S${String(shot.shot_number).padStart(2,"0")} · ${"★".repeat(rating)}`);
+        });
+        // ElevenLabs v3 overlay button — generate audio replacement
+        tEl.querySelector(".take__btn--overlay")?.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          handleGenerateVoiceOverlay(shotId, t.id);
         });
         // Reject button — prompt for reason
         tEl.querySelector(".take__btn--reject")?.addEventListener("click", async (e) => {
@@ -8763,6 +9046,90 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     return dataUrl;
   }
 
+  // Generate an ElevenLabs v3 voice overlay for a single take.
+  // Pulls dialogue + voice_id from the shot + cast bible. The result is
+  // stored on the take as audioDataUrl + overlay metadata. Playback in the
+  // Shot Editor preview will use this overlay instead of the video's
+  // native audio if present.
+  async function handleGenerateVoiceOverlay(shotId, takeId) {
+    if (!State.eleven) {
+      toast("Add your ElevenLabs API key in Connection first.", { tone: "warn" });
+      showConnectionPanel();
+      return;
+    }
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) return;
+    const take = (shot.takes || []).find(t => t.id === takeId);
+    if (!take) return;
+    // Find the speaking character + their voice id
+    const dialogueLines = (shot.cast_in_frame || [])
+      .map(c => ({ id: c.character_id, line: c.dialogue?.en || (typeof c.dialogue === "string" ? c.dialogue : ""), deliveryNote: c.delivery_note }))
+      .filter(d => d.line && d.line.trim());
+    if (dialogueLines.length === 0) {
+      toast("This shot has no dialogue lines — nothing to overlay.", { tone: "warn" });
+      return;
+    }
+    // Single-speaker shot: use that character's voice id. Multi-speaker:
+    // generate one at a time (use the first for MVP; expand later).
+    const characters = await Storage.getAll("characters");
+    const firstLine  = dialogueLines[0];
+    const character  = characters.find(c => c.id === firstLine.id);
+    const voiceId    = character?.voice?.elevenlabs_fallback?.voice_id;
+    if (!voiceId || voiceId === "TBD" || voiceId === "") {
+      const enteredVoiceId = prompt(
+        `${character?.display_name || firstLine.id}'s voice ID isn't set in the cast bible (voice.elevenlabs_fallback.voice_id is "${voiceId || "missing"}").\n\nPaste an ElevenLabs voice ID to use for this take:`,
+        ""
+      );
+      if (!enteredVoiceId) return;
+      // Save it back to the character for future use
+      if (character) {
+        character.voice = character.voice || {};
+        character.voice.elevenlabs_fallback = character.voice.elevenlabs_fallback || {};
+        character.voice.elevenlabs_fallback.voice_id = enteredVoiceId.trim();
+        await Storage.put("characters", character);
+      }
+      return handleGenerateVoiceOverlay(shotId, takeId); // recurse with the now-saved id
+    }
+
+    State.activeJobs++;
+    setGPS(true, `Generating v3 overlay for <span class="mono">${esc(shotId)}</span>`, `${character.display_name} · ${firstLine.line.length} chars`, 30);
+    try {
+      const voice_settings = {
+        stability:        character.voice.elevenlabs_fallback.stability ?? 0.5,
+        similarity_boost: character.voice.elevenlabs_fallback.similarity ?? 0.75,
+        style:            character.voice.elevenlabs_fallback.style ?? 0.5,
+        use_speaker_boost: true,
+      };
+      const result = await State.eleven.textToSpeech({
+        voice_id: voiceId,
+        text: firstLine.line,
+        voice_settings,
+      });
+      // Persist on the take
+      take.audioOverlay = {
+        dataUrl: result.dataUrl,
+        characterId: firstLine.id,
+        voiceId,
+        modelId: result.model_id,
+        text: firstLine.line,
+        deliveryNote: firstLine.deliveryNote || null,
+        byteSize: result.byteSize,
+        cost_usd: result.cost_usd_estimated,
+        generated_at: Date.now(),
+      };
+      await Storage.put("shots", shot);
+      await trackCost(result.cost_usd_estimated || 0, `elevenlabs v3 ${shotId}/${character.display_name}`);
+      toast(`Voice overlay ready (${character.display_name})`);
+      if (State.activeShotId === shotId) renderShotEditor(shotId);
+    } catch (err) {
+      console.error("[eleven]", err);
+      toast(`ElevenLabs error: ${err.message}`, { tone: "err", duration: 8000 });
+    } finally {
+      setGPS(false);
+      State.activeJobs--;
+    }
+  }
+
   // Roll every shot that doesn't yet have an approved take, in timeline order.
   // For image_to_video shots, also handles keyframe generation. Sequential
   // execution so continuity chaining works (each shot's last frame seeds
@@ -9107,6 +9474,17 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "roll-all-pending")   handleRollAllPending();
     else if (action === "finish-play-all")    playSequenceFromIdx(0);
     else if (action === "finish-pause")       $("#elx-finish-video")?.pause();
+    else if (action === "finish-score-pick") {
+      const inp = $("#elx-finish-score-upload");
+      if (inp) {
+        inp.onchange = (ev) => handleScoreUpload(ev.target.files?.[0]);
+        inp.click();
+      }
+    }
+    else if (action === "finish-score-play")    handleScorePreview();
+    else if (action === "finish-score-remove")  handleScoreRemove();
+    else if (action === "finish-export-fcpxml") handleExportFcpxml();
+    else if (action === "finish-export-manifest") handleExportProvenance();
     else if (action === "open-shot-editor") navigateToShot(target.dataset.shotId);
     else if (action === "tree-nav-shot")    navigateToShot(target.dataset.shotId);
     else if (action === "open-connection") showConnectionPanel();
@@ -9334,6 +9712,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         </div>
         <div class="elx-finish__player">
           <video id="elx-finish-video" controls playsinline style="width:100%; aspect-ratio:16/9; background:#000; border-radius:8px;"></video>
+          <audio id="elx-finish-score-audio"></audio>
           <div class="elx-finish__nowplaying" id="elx-finish-now"></div>
         </div>
         <div class="elx-finish__playctl">
@@ -9342,6 +9721,29 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           <span class="elx-finish__hint">Auto-advances through approved takes only. Pending shots are skipped.</span>
         </div>
         <div class="elx-finish__strip" id="elx-finish-strip"></div>
+
+        <div class="elx-finish__score" id="elx-finish-score">
+          <div class="elx-finish__score-head">
+            <div class="elx-finish__label">Score (Suno cue)</div>
+            <div class="elx-finish__score-state" id="elx-finish-score-state">No score uploaded</div>
+          </div>
+          <div class="elx-finish__score-row">
+            <input type="file" id="elx-finish-score-upload" accept="audio/*" style="display:none">
+            <button class="btn btn--sm btn--ghost" data-action="finish-score-pick">Upload .mp3</button>
+            <button class="btn btn--sm btn--ghost" data-action="finish-score-play" id="elx-finish-score-play" disabled>▶ Preview</button>
+            <button class="btn btn--sm btn--ghost" data-action="finish-score-remove" id="elx-finish-score-remove" disabled>Remove</button>
+            <span class="elx-finish__score-hint">Enters at <span id="elx-finish-score-enters" class="mono">00:54</span> in the master · plays mixed with video audio</span>
+          </div>
+        </div>
+
+        <div class="elx-finish__export">
+          <div class="elx-finish__label">Export</div>
+          <div class="elx-finish__export-row">
+            <button class="btn btn--sm" data-action="finish-export-fcpxml">⬇ Download FCPXML (DaVinci / FCP)</button>
+            <button class="btn btn--sm btn--ghost" data-action="finish-export-manifest">⬇ Download provenance JSON</button>
+          </div>
+          <div class="elx-finish__export-hint">FCPXML imports into DaVinci Resolve as a timeline. Each clip references the approved take by URL. Provenance JSON includes every take's prompt, seed, model, and cost — for git provenance + reproducibility.</div>
+        </div>
       </div>
     `;
   }
@@ -9410,6 +9812,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // Save playlist for play-all
     State.finishPlaylist = playlist;
     State.finishPlaylistIdx = 0;
+
+    // Refresh score UI state
+    await refreshScoreUi();
   }
 
   function playOne(srcDataUrl, label) {
@@ -9421,18 +9826,298 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (now) now.textContent = `▶ ${label || ""}`;
   }
 
-  function playSequenceFromIdx(startIdx = 0) {
+  // ─── Suno score: upload, store, play ────────────────────────────────
+  // The score belongs to the episode, not the take. We store the file as
+  // a dataURL on the episode record (~1-5 MB for a 90s clip — fine in IDB).
+  async function handleScoreUpload(file) {
+    if (!file) return;
+    const dataUrl = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload  = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+    // Find or create the episode record. For MVP we only have one episode,
+    // so we just stash on the settings store.
+    await Storage.setSetting("episode_score", {
+      filename: file.name,
+      size: file.size,
+      mime: file.type,
+      dataUrl,
+      uploaded_at: Date.now(),
+      enters_at_timecode: "00:54", // from episode.yaml
+    });
+    toast(`Score uploaded · ${file.name} (${(file.size/1024).toFixed(0)} KB)`);
+    renderFinishScreen();
+  }
+
+  async function refreshScoreUi() {
+    const score = await Storage.getSetting("episode_score", null);
+    const state = $("#elx-finish-score-state");
+    const playBtn = $("#elx-finish-score-play");
+    const rmBtn   = $("#elx-finish-score-remove");
+    if (score?.dataUrl) {
+      if (state) state.innerHTML = `<span style="color:#4ade80">${esc(score.filename)} · ${(score.size/1024).toFixed(0)} KB · enters at ${esc(score.enters_at_timecode || "00:54")}</span>`;
+      if (playBtn) playBtn.disabled = false;
+      if (rmBtn)   rmBtn.disabled = false;
+    } else {
+      if (state) state.textContent = "No score uploaded";
+      if (playBtn) playBtn.disabled = true;
+      if (rmBtn)   rmBtn.disabled = true;
+    }
+  }
+
+  async function handleScorePreview() {
+    const score = await Storage.getSetting("episode_score", null);
+    if (!score?.dataUrl) return;
+    const audio = $("#elx-finish-score-audio");
+    if (!audio) return;
+    audio.src = score.dataUrl;
+    audio.play().catch(() => {});
+    toast("Previewing score (not synced to video — that happens during sequence play)");
+  }
+
+  async function handleScoreRemove() {
+    if (!confirm("Remove the score from this episode?")) return;
+    await Storage.setSetting("episode_score", null);
+    toast("Score removed.");
+    renderFinishScreen();
+  }
+
+  // ─── FCPXML export ──────────────────────────────────────────────────
+  // Generates a DaVinci-Resolve-compatible FCPXML 1.10 timeline containing
+  // every approved take as a clip on the V1/A1 tracks, in shot_number order.
+  // The score (if present) goes on A2 with its entry timecode.
+  //
+  // The clip "src" URLs are the dataUrls we have locally; for a real handoff
+  // you'd save those takes to disk and rewrite the URLs to file paths. We
+  // include the take metadata in <metadata> so the colorist can trace it.
+  async function handleExportFcpxml() {
+    const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
+    const approved = shots
+      .map(s => ({ shot: s, take: (s.takes || []).find(t => t.status === "approved") }))
+      .filter(p => p.take?.videoDataUrl);
+    if (approved.length === 0) {
+      toast("No approved takes to export.", { tone: "warn" });
+      return;
+    }
+    const score = await Storage.getSetting("episode_score", null);
+    const xml = buildFcpxml({ shots: approved, score, episodeTitle: "Episode 1 · The Standup" });
+    const blob = new Blob([xml], { type: "application/xml" });
+    triggerDownload(blob, `EP01_TheStandup_${new Date().toISOString().slice(0,10)}.fcpxml`);
+    toast(`FCPXML exported · ${approved.length} clip${approved.length===1?"":"s"}`);
+  }
+
+  function buildFcpxml({ shots, score, episodeTitle }) {
+    // FPS assumption: 30 (Seedance default). Use 30/1 timebase.
+    const fps = 30;
+    const tbStr = `${fps * 100}/${100}s`; // 3000/100s
+    let timelineOffset = 0;
+    const clips = shots.map(({ shot, take }) => {
+      const dur = shot.timecode?.duration_seconds || 8;
+      const durFrames = Math.round(dur * fps);
+      const start = `${Math.round(timelineOffset * fps * 100)}/${100}s`;
+      const duration = `${durFrames * 100}/${100}s`;
+      timelineOffset += dur;
+      // Take note: in a real DaVinci import the src would be a file path.
+      // Here we use the take ID — the colorist can match this to the take
+      // files (which they'd save separately).
+      return `
+        <asset-clip name="S${String(shot.shot_number).padStart(2,"0")} ${escapeXml(shot.display_name || shot.id)}"
+                    offset="${start}"
+                    duration="${duration}"
+                    start="0s"
+                    ref="r-${take.id}"
+                    audioRole="dialogue">
+          <metadata>
+            <md key="elevenx.shot.id" value="${escapeXml(shot.id)}"/>
+            <md key="elevenx.take.id" value="${escapeXml(take.id)}"/>
+            <md key="elevenx.take.mode" value="${escapeXml(take.mode || "")}"/>
+            <md key="elevenx.take.seed" value="${escapeXml(String(take.seed || ""))}"/>
+            <md key="elevenx.take.cost_usd" value="${take.cost_usd || 0}"/>
+            <md key="elevenx.take.rating" value="${take.rating || ""}"/>
+            <md key="elevenx.take.has_audio_overlay" value="${!!take.audioOverlay}"/>
+          </metadata>
+        </asset-clip>
+      `;
+    }).join("\n");
+    const totalDur = `${Math.round(timelineOffset * fps * 100)}/${100}s`;
+
+    // Resources block — one asset per approved take
+    const assets = shots.map(({ take, shot }) => {
+      const durSec = shot.timecode?.duration_seconds || 8;
+      const durFrames = Math.round(durSec * fps);
+      return `
+    <asset id="r-${take.id}"
+           name="${escapeXml(`take-${take.id.slice(0,8)}.mp4`)}"
+           src="${escapeXml(`takes/${take.id}.mp4`)}"
+           start="0s"
+           duration="${durFrames * 100}/${100}s"
+           hasVideo="1"
+           hasAudio="1"
+           format="r1"/>`;
+    }).join("");
+
+    const scoreClip = score?.dataUrl ? `
+        <asset-clip name="${escapeXml(score.filename)}"
+                    offset="${Math.round(timecodeToSeconds(score.enters_at_timecode || "00:54") * fps * 100)}/${100}s"
+                    duration="${Math.round(90 * fps * 100)}/${100}s"
+                    start="0s"
+                    ref="r-score"
+                    audioRole="music"/>` : "";
+    const scoreAsset = score?.dataUrl ? `
+    <asset id="r-score"
+           name="${escapeXml(score.filename)}"
+           src="audio/${escapeXml(score.filename)}"
+           start="0s"
+           duration="${Math.round(90 * fps * 100)}/${100}s"
+           hasAudio="1"
+           format="r-audio"/>` : "";
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" name="FFVideoFormat1080p${fps}" frameDuration="100/${fps * 100}s" width="1920" height="1080"/>${scoreAsset ? "\n    " + scoreAsset : ""}${assets}
+  </resources>
+  <library>
+    <event name="${escapeXml(episodeTitle)}">
+      <project name="${escapeXml(episodeTitle)} master">
+        <sequence format="r1" duration="${totalDur}" tcStart="0s" tcFormat="NDF">
+          <spine>${clips}${scoreClip}
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>`;
+  }
+
+  function timecodeToSeconds(tc) {
+    // "MM:SS" or "HH:MM:SS"
+    const parts = String(tc).split(":").map(Number);
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return 0;
+  }
+
+  function escapeXml(s) {
+    return String(s || "").replace(/[<>&'"]/g, c => ({ "<":"&lt;",">":"&gt;","&":"&amp;","'":"&apos;","\"":"&quot;" }[c]));
+  }
+
+  function triggerDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 250);
+  }
+
+  // ─── Provenance JSON export ─────────────────────────────────────────
+  // Walks every shot + take and emits the full reproducibility manifest:
+  // prompts, seeds, models, costs, ratings, rejection reasons, refs used.
+  async function handleExportProvenance() {
+    const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
+    const characters = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const score = await Storage.getSetting("episode_score", null);
+    const provenance = {
+      generated_at: new Date().toISOString(),
+      project: "ElevenX — Episode 1 · The Standup",
+      total_cost_usd: State.costSpentUsd,
+      cast: characters.map(c => ({
+        id: c.id, display_name: c.display_name,
+        refs_present: Object.keys(c.refs?.gpt || {}).filter(k => c.refs.gpt[k]?.dataUrl),
+        chosen_model: c.chosenModel,
+      })),
+      environments: environments.map(e => ({
+        id: e.id, display_name: e.display_name,
+        refs_present: Object.keys(e.refs?.gpt || {}).filter(k => e.refs.gpt[k]?.dataUrl),
+        chosen_model: e.chosenModel,
+      })),
+      shots: shots.map(s => ({
+        id: s.id,
+        shot_number: s.shot_number,
+        display_name: s.display_name,
+        timecode: s.timecode,
+        generation: s.generation,
+        takes: (s.takes || []).map(t => ({
+          id: t.id,
+          mode: t.mode,
+          status: t.status,
+          rating: t.rating,
+          rating_note: t.rating_note,
+          rejection_reason: t.rejection_reason,
+          cost_usd: t.cost_usd,
+          seed: t.seed,
+          model: t.model || null,
+          created_at: t.created_at,
+          approved_at: t.approved_at,
+          prompt_sha256_or_text: t.prompt || null,
+          has_audio_overlay: !!t.audioOverlay,
+          audio_overlay: t.audioOverlay ? {
+            voice_id: t.audioOverlay.voiceId,
+            model_id: t.audioOverlay.modelId,
+            text: t.audioOverlay.text,
+            cost_usd: t.audioOverlay.cost_usd,
+          } : null,
+        })),
+      })),
+      score: score ? { filename: score.filename, enters_at_timecode: score.enters_at_timecode } : null,
+    };
+    const blob = new Blob([JSON.stringify(provenance, null, 2)], { type: "application/json" });
+    triggerDownload(blob, `EP01_provenance_${new Date().toISOString().slice(0,10)}.json`);
+    toast(`Provenance JSON exported (${shots.length} shots)`);
+  }
+
+  async function playSequenceFromIdx(startIdx = 0) {
     const playlist = State.finishPlaylist || [];
     if (playlist.length === 0) { toast("No approved takes yet — Storyboard tab has the queue."); return; }
     State.finishPlaylistIdx = startIdx;
     const v = $("#elx-finish-video");
+    const scoreAudio = $("#elx-finish-score-audio");
     if (!v) return;
+
+    // Score: if the episode has one, queue it to start at its configured TC
+    const score = await Storage.getSetting("episode_score", null);
+    let scoreElapsedSec = 0;
+    let elapsedAtStart  = 0;
+    // Sum the durations of the items BEFORE the start index (so resuming mid-sequence still triggers the score correctly)
+    for (let i = 0; i < startIdx; i++) elapsedAtStart += playlist[i]?.shot?.timecode?.duration_seconds || 0;
+    if (score?.dataUrl && scoreAudio) {
+      scoreAudio.src = score.dataUrl;
+      scoreAudio.pause();
+      scoreAudio.currentTime = 0;
+    }
+
+    const scoreEntersAt = timecodeToSeconds(score?.enters_at_timecode || "00:54");
+
+    let cumulativeElapsed = elapsedAtStart;
     const playNext = () => {
       const i = State.finishPlaylistIdx;
       const item = playlist[i];
-      if (!item) { v.removeEventListener("ended", playNext); return; }
+      if (!item) { v.removeEventListener("ended", playNext); scoreAudio?.pause(); return; }
       const num = item.shot.shot_number != null ? `S${String(item.shot.shot_number).padStart(2,"0")}` : "S?";
       playOne(item.take.videoDataUrl, `${num} · ${item.shot.display_name || item.shot.id} (${i+1}/${playlist.length})`);
+      // Per-clip overlay sync (if this take has one)
+      const overlayBadge = document.querySelector(".elx-finish__player .elx-overlay-badge");
+      // (skip overlay sync for finish player — that's reserved for shot editor)
+      // Trigger the score if we've crossed the entry timecode during this clip
+      const clipStart = cumulativeElapsed;
+      const clipDur   = item.shot.timecode?.duration_seconds || 0;
+      if (score?.dataUrl && scoreAudio && scoreAudio.paused) {
+        if (clipStart + clipDur > scoreEntersAt && scoreEntersAt >= clipStart) {
+          // Score enters PARTWAY through this clip
+          const delaySec = scoreEntersAt - clipStart;
+          setTimeout(() => { scoreAudio.currentTime = 0; scoreAudio.play().catch(() => {}); }, delaySec * 1000);
+        } else if (clipStart >= scoreEntersAt) {
+          // Score should already be playing — start it now
+          scoreAudio.currentTime = clipStart - scoreEntersAt;
+          scoreAudio.play().catch(() => {});
+        }
+      }
+      cumulativeElapsed += clipDur;
       State.finishPlaylistIdx = i + 1;
     };
     v.removeEventListener("ended", playNext);
@@ -9500,10 +10185,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     // Restore settings
     State.workerUrl    = await Storage.getSetting("worker_url", null);
+    State.elevenKey    = await Storage.getSetting("eleven_key", null);
     State.costSpentUsd = (await Storage.getSetting("cost_total", 0)) || 0;
     if (State.workerUrl) {
       State.fal    = new FalClient({ workerUrl: State.workerUrl, onLog: m => console.log("[fal]", m) });
       State.openai = new OpenAIClient({ workerUrl: State.workerUrl, onLog: m => console.log("[openai]", m) });
+    }
+    if (State.elevenKey) {
+      State.eleven = new ElevenLabsClient({ apiKey: State.elevenKey, onLog: m => console.log("[eleven]", m) });
     }
 
     // ── Migration: c.refs[angle] → c.refs[modelKey][angle] ────────────────
