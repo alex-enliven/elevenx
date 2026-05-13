@@ -3928,8 +3928,10 @@ a { color: inherit; text-decoration: none; }
 .cast-card__bottom:not(.cast-card__bottom--dual) .cast-card__cta { width: 100%; }
 /* Dual-button bottom needs flex children, NOT 100% width on either */
 .cast-card__bottom--dual .cast-card__cta { width: auto !important; }
-.s3 { padding: 16px 24px; }
-.shot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; align-items: stretch; }
+.s3 { padding: 16px 24px; display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+.s3__toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.s3__spacer { flex: 1; }
+.shot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; align-items: stretch; }
 
 /* mode pill — used in cards AND inline in shot heads */
 .mode-pill { display: inline-block; font-size: 9px; padding: 2px 7px; border-radius: 10px; font-family: 'JetBrains Mono', monospace; letter-spacing: 0.06em; }
@@ -3937,76 +3939,69 @@ a { color: inherit; text-decoration: none; }
 .mode-pill--i2v { background: rgba(99,102,241,0.20);  color: #8487f5; border: 1px solid rgba(99,102,241,0.40); }
 .mode-pill--r2v { background: rgba(201,162,90,0.20);  color: #c9a25a; border: 1px solid rgba(201,162,90,0.40); }
 
-/* ── New storyboard card (renamed .elx-shot to escape v2 mockup .shot CSS) ── */
+/* ── Storyboard card v3: thumbnail-first, minimal overlay ── */
 .elx-shot {
+  position: relative;
   background: #14141a;
   border: 1px solid #2a2a35;
   border-radius: 8px;
-  padding: 14px;
   cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-height: 0;        /* override mockup */
-  overflow: visible;    /* override mockup overflow:hidden */
+  overflow: hidden;
   transition: border-color .15s, transform .12s;
+  aspect-ratio: 16/9;
 }
 .elx-shot:hover { border-color: #c9a25a; transform: translateY(-1px); }
 .elx-shot--approved  { border-left: 3px solid #c9a25a; }
 .elx-shot--has-takes { border-left: 3px solid #9a9aab; }
 .elx-shot--pending   { border-left: 3px solid #2a2a35; }
 
-.elx-shot__thumb {
-  position: relative; aspect-ratio: 16/9; border-radius: 6px; overflow: hidden;
-  background: #0a0a0c;
+.elx-shot__thumb-only {
+  position: absolute; inset: 0;
+  background-position: center; background-size: cover;
 }
-.elx-shot__thumb .mode-pill { position: absolute; top: 8px; right: 8px; backdrop-filter: blur(4px); }
+.elx-shot__mode-corner {
+  position: absolute; top: 8px; right: 8px;
+  backdrop-filter: blur(4px);
+  background: rgba(0,0,0,0.5) !important;
+}
 
-.elx-shot__head {
+/* Gradient backdrop for the title overlay so it reads on any thumbnail */
+.elx-shot__overlay {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 18px 14px 12px;
+  background: linear-gradient(to top, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.4) 60%, transparent 100%);
   display: flex; align-items: baseline; gap: 8px;
 }
 .elx-shot__num {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 13px; font-weight: 700; color: #c9a25a;
-  letter-spacing: 0.04em;
+  font-size: 12px; font-weight: 700; color: #c9a25a;
+  letter-spacing: 0.06em;
   flex-shrink: 0;
 }
 .elx-shot__name {
   font-family: Inter, system-ui, sans-serif;
-  font-size: 15px; font-weight: 600; color: #e8e8ee;
+  font-size: 14px; font-weight: 600; color: #e8e8ee;
   flex: 1; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.elx-shot__mode-inline { flex-shrink: 0; }
-
-.elx-shot__time {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 11px; color: #9a9aab; letter-spacing: 0.02em;
+.elx-shot__empty-hint {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  color: #5a5a6e; font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  pointer-events: none;
 }
-.elx-shot__focal {
-  font-size: 12px; line-height: 1.4; color: #c0c0ce;
-  font-family: 'EB Garamond', Georgia, serif; font-style: italic;
+.elx-shot__hover-cta {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  opacity: 0; transition: opacity .15s;
+  pointer-events: none;
+  background: rgba(201,162,90,0.95) !important;
+  color: #0a0a0c !important;
+  font-weight: 600;
+  white-space: nowrap;
+  z-index: 2;
 }
-.elx-shot__status-row {
-  display: flex; align-items: center; gap: 8px;
-  font-size: 11px;
-}
-.elx-shot__status {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 10px; letter-spacing: 0.06em;
-  padding: 2px 7px; border-radius: 10px;
-}
-.elx-shot__status--ok       { background: rgba(74,222,128,0.18); color: #4ade80; }
-.elx-shot__status--mid      { background: rgba(154,154,171,0.18); color: #9a9aab; }
-.elx-shot__status--pending  { background: rgba(154,154,171,0.10); color: #6c6c7c; }
-.elx-shot__takes-meta { color: #9a9aab; font-size: 10px; }
-
-.elx-shot__cta {
-  width: 100%;
-  font-family: Inter, sans-serif;
-  font-size: 12px; font-weight: 600;
-  padding: 8px 12px !important;
-  margin-top: auto;       /* push to bottom of card */
+.elx-shot:hover .elx-shot__hover-cta {
+  opacity: 1; pointer-events: auto;
 }
 .s4 { padding: 16px 24px; }
 
@@ -4057,15 +4052,53 @@ a { color: inherit; text-decoration: none; }
 .elx-prompt__pre { font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.5; color: #c0c0ce; white-space: pre-wrap; word-break: break-word; max-height: 60vh; overflow-y: auto; padding: 12px; background: #14141a; border-radius: 4px; margin: 10px 0 6px; }
 .elx-prompt__note { font-size: 10px; color: #5a5a6e; padding: 2px 0; }
 
-.take { background: #14141a; border: 1px solid #2a2a35; border-radius: 6px; padding: 8px; min-width: 110px; cursor: pointer; transition: border-color .15s; }
+/* ── Take card (in Shot Editor strip) ── */
+.take { position: relative; background: #14141a; border: 1px solid #2a2a35; border-radius: 6px; padding: 6px; min-width: 140px; cursor: pointer; transition: border-color .15s; }
 .take:hover { border-color: #c9a25a; }
 .take.is-approved { border-color: #c9a25a; border-width: 2px; }
+.take.is-rejected { opacity: 0.5; border-color: rgba(248,113,113,0.4); }
+.take.is-rejected:hover { opacity: 0.9; }
+.take__thumb { aspect-ratio: 16/9; background-color: #0a0a0c; background-size: cover; background-position: center; border-radius: 3px; margin-bottom: 6px; }
 .take__id { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #c9a25a; }
 .take__cost { font-size: 11px; color: #9a9aab; }
 .take__status { font-size: 10px; color: #9a9aab; }
+.take__reason { font-size: 10px; color: #f87171; margin-top: 2px; font-style: italic; line-height: 1.3; }
+.take__actions { position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; opacity: 0; transition: opacity .15s; }
+.take:hover .take__actions { opacity: 1; }
+.take__btn { background: rgba(0,0,0,0.7); border: 1px solid #2a2a35; color: #e8e8ee; width: 22px; height: 22px; border-radius: 3px; cursor: pointer; font-size: 12px; line-height: 1; padding: 0; }
+.take__btn--approve:hover { border-color: #4ade80; color: #4ade80; }
+.take__btn--reject:hover  { border-color: #f87171; color: #f87171; }
 .take--new { background: transparent; border: 1px dashed #404050; color: #9a9aab; padding: 8px 14px; cursor: pointer; }
 .take--new:hover { color: #c9a25a; border-color: #c9a25a; }
-.elx-finish-note + * { margin-top: 0; }
+
+/* ── Finish / Timeline (Screen 5) — functional sequence player ── */
+.elx-finish { padding: 16px 24px; display: flex; flex-direction: column; gap: 14px; }
+.elx-finish__head { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+.elx-finish__title { font-family: Inter, sans-serif; font-size: 18px; font-weight: 600; color: #e8e8ee; }
+.elx-finish__stats { display: flex; gap: 14px; font-size: 11px; color: #9a9aab; font-family: 'JetBrains Mono', monospace; }
+.elx-finish__stats strong { color: #c9a25a; font-weight: 700; }
+.elx-finish__player { position: relative; }
+.elx-finish__nowplaying {
+  position: absolute; top: 12px; left: 12px;
+  background: rgba(0,0,0,0.75); color: #c9a25a;
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  padding: 4px 10px; border-radius: 4px;
+  pointer-events: none;
+}
+.elx-finish__playctl { display: flex; align-items: center; gap: 8px; }
+.elx-finish__hint { color: #9a9aab; font-size: 11px; margin-left: 4px; }
+.elx-finish__strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.elx-finish-tile { background: #14141a; border: 1px solid #2a2a35; border-radius: 6px; overflow: hidden; cursor: pointer; transition: border-color .15s; }
+.elx-finish-tile:hover { border-color: #c9a25a; }
+.elx-finish-tile.is-approved { border-left: 3px solid #c9a25a; }
+.elx-finish-tile.is-pending  { border-left: 3px solid #2a2a35; opacity: 0.65; }
+.elx-finish-tile__thumb { aspect-ratio: 16/9; background-color: #0a0a0c; background-size: cover; background-position: center; }
+.elx-finish-tile__thumb--empty { display: flex; align-items: center; justify-content: center; color: #404050; font-size: 24px; }
+.elx-finish-tile__meta { display: flex; align-items: center; gap: 6px; padding: 6px 8px; font-size: 11px; }
+.elx-finish-tile__num { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #c9a25a; }
+.elx-finish-tile__num--dim, .elx-finish-tile__name--dim { color: #5a5a6e; }
+.elx-finish-tile__name { flex: 1; color: #e8e8ee; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.elx-finish-tile__dur { font-family: 'JetBrains Mono', monospace; color: #9a9aab; }
 </style>
 
 </head>
@@ -8132,61 +8165,89 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
   // ─── Rendering: Storyboard (Screen 3) ────────────────────────────────
   //
-  // Card design priorities (from May 2026 UX feedback):
-  //   1. Make the shot NAME + NUMBER instantly readable
-  //   2. Empty cards (the common state) shouldn't waste 16:9 on a placeholder
-  //   3. Single dominant CTA per card — Roll Seedance with cost preview
-  //   4. Card click anywhere → open Shot Editor (button is a separate shortcut)
-  //
-  // Renamed from .shot to .elx-shot to escape the v2 mockup's .shot CSS
-  // which set overflow:hidden + auto-fit height, clipping our content.
+  // Card design v3 (May 2026 — simplified to thumbnail-first):
+  //   - Thumbnail FILLS the card (or dark placeholder if no take)
+  //   - Tiny S0X · Name overlay at bottom-left with gradient backdrop for readability
+  //   - Mode pill top-right
+  //   - Left border = status (gold = approved, indigo = rolling, grey = pending)
+  //   - Hover reveals Roll/Re-roll button as a floating overlay
+  //   - Click anywhere → opens Shot Editor
   async function renderStoryboard() {
     const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
     const grid = $("#elx-shot-grid");
     if (!grid) return;
+    const filterBar = $("#elx-shot-filter");
+    const activeFilter = filterBar?.dataset.activeFilter || "all";
     grid.innerHTML = "";
+
+    let counts = { all: shots.length, pending: 0, rolling: 0, approved: 0 };
+    for (const s of shots) {
+      const takes = s.takes || [];
+      const approved = takes.find(t => t.status === "approved");
+      if (approved) counts.approved++;
+      else if (takes.length > 0) counts.rolling++;
+      else counts.pending++;
+    }
+
+    // Update filter chip counts if filter bar exists
+    if (filterBar) {
+      filterBar.querySelectorAll("[data-filter]").forEach(b => {
+        const f = b.dataset.filter;
+        const countEl = b.querySelector(".count");
+        if (countEl) countEl.textContent = counts[f] ?? "";
+        b.classList.toggle("is-active", f === activeFilter);
+      });
+    }
+
     for (const s of shots) {
       const takes = s.takes || [];
       const approved = takes.find(t => t.status === "approved");
       const status = approved ? "approved" : takes.length > 0 ? "has-takes" : "pending";
-      const modeKey   = s.generation?.mode || "image_to_video";
-      const modeShort = { text_to_video:"T2V", image_to_video:"I2V", reference_to_video:"R2V" }[modeKey] || "I2V";
-      const modeClass = { text_to_video:"mode-pill--t2v", image_to_video:"mode-pill--i2v", reference_to_video:"mode-pill--r2v" }[modeKey];
-      const duration = s.timecode?.duration_seconds || 0;
-      // Estimate Seedance cost: $0.30/s standard 720p
-      const estCost = (duration * 0.30).toFixed(2);
-      const statusBadge = ({
-        approved:  '<span class="elx-shot__status elx-shot__status--ok">★ approved</span>',
-        "has-takes": '<span class="elx-shot__status elx-shot__status--mid">⚙ has takes</span>',
-        pending:   '<span class="elx-shot__status elx-shot__status--pending">○ pending</span>',
-      })[status];
+
+      // Apply filter
+      if (activeFilter !== "all") {
+        if (activeFilter === "pending"  && status !== "pending")   continue;
+        if (activeFilter === "rolling"  && status !== "has-takes") continue;
+        if (activeFilter === "approved" && status !== "approved")  continue;
+      }
+
+      const modeKey = s.generation?.mode || "image_to_video";
+      const modeShort = { text_to_video:"T2V", image_to_video:"I2V", reference_to_video:"R2V", built_in_resolve:"DAVINCI" }[modeKey] || "I2V";
+      const modeClass = { text_to_video:"mode-pill--t2v", image_to_video:"mode-pill--i2v", reference_to_video:"mode-pill--r2v", built_in_resolve:"mode-pill--t2v" }[modeKey];
+      const duration  = s.timecode?.duration_seconds || 0;
+      const estCost   = (duration * 0.30).toFixed(2);
+      const shotNum   = s.shot_number != null ? `S${String(s.shot_number).padStart(2,"0")}` : "S?";
+
+      // Thumbnail source priority:
+      //   1. Approved take's thumbnail
+      //   2. Latest take's thumbnail (yellow border to signal not-yet-approved)
+      //   3. Shot's keyframe.startDataUrl (pre-rolled keyframe for image_to_video)
+      //   4. nothing — dark placeholder
+      const latestTake = takes[takes.length - 1];
+      const thumbUrl =
+        approved?.thumbDataUrl
+        || latestTake?.thumbDataUrl
+        || s.keyframes?.startDataUrl
+        || null;
+      const thumbStyle = thumbUrl
+        ? `background-image:url('${thumbUrl}'); background-size:cover; background-position:center;`
+        : `background: linear-gradient(135deg, #1d1d26 0%, #0a0a0c 100%);`;
+
       const card = document.createElement("div");
       card.className = `elx-shot elx-shot--${status}`;
       card.dataset.shotId = s.id;
-      const shotNum = s.shot_number != null ? `S${String(s.shot_number).padStart(2,"0")}` : "S?";
-      const focalPoint = s.the_moment?.focal_point || "";
-      // Approved cards prioritise the thumbnail; empty cards skip the placeholder
-      const thumbBlock = approved?.thumbDataUrl
-        ? `<div class="elx-shot__thumb" style="background-image:url('${approved.thumbDataUrl}'); background-size:cover; background-position:center;">
-             <span class="mode-pill ${modeClass}">${modeShort}</span>
-           </div>`
-        : "";
       card.innerHTML = `
-        ${thumbBlock}
-        <div class="elx-shot__head">
-          <span class="elx-shot__num">${esc(shotNum)}</span>
-          <span class="elx-shot__name">${esc(s.display_name || s.id)}</span>
-          ${approved ? "" : `<span class="mode-pill ${modeClass} elx-shot__mode-inline">${modeShort}</span>`}
+        <div class="elx-shot__thumb-only" style="${thumbStyle}">
+          <span class="mode-pill ${modeClass} elx-shot__mode-corner">${modeShort}</span>
+          <div class="elx-shot__overlay">
+            <span class="elx-shot__num">${esc(shotNum)}</span>
+            <span class="elx-shot__name">${esc(s.display_name || s.id)}</span>
+          </div>
+          ${!thumbUrl ? `<div class="elx-shot__empty-hint">no take yet</div>` : ""}
+          <button class="btn elx-shot__hover-cta" data-action="roll-shot" data-shot-id="${esc(s.id)}">
+            ${approved ? `↻ Re-roll · $${estCost}` : `▶ Roll Seedance · $${estCost}`}
+          </button>
         </div>
-        <div class="elx-shot__time">${esc(s.timecode?.in || "?")} → ${esc(s.timecode?.out || "?")} · ${duration}s</div>
-        ${focalPoint ? `<div class="elx-shot__focal">${esc(focalPoint.slice(0, 90))}${focalPoint.length > 90 ? "…" : ""}</div>` : ""}
-        <div class="elx-shot__status-row">
-          ${statusBadge}
-          ${takes.length > 0 ? `<span class="elx-shot__takes-meta">${takes.length} take${takes.length===1?"":"s"}</span>` : ""}
-        </div>
-        <button class="btn btn--sm elx-shot__cta" data-action="roll-shot" data-shot-id="${esc(s.id)}">
-          ${approved ? `↻ Re-roll · est $${estCost}` : `▶ Roll Seedance · est $${estCost}`}
-        </button>
       `;
       grid.appendChild(card);
     }
@@ -8269,19 +8330,63 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (takeStrip) {
       takeStrip.innerHTML = "";
       for (const t of takes) {
+        const statusClass = t.status === "approved" ? "is-approved"
+                          : t.status === "rejected" ? "is-rejected"
+                          : "";
         const tEl = document.createElement("div");
-        tEl.className = `take ${t.status === "approved" ? "is-approved" : ""}`;
+        tEl.className = `take ${statusClass}`;
         tEl.dataset.takeId = t.id;
+        const statusLabel = t.status === "approved" ? "★ approved"
+                          : t.status === "rejected" ? "✗ rejected"
+                          : "pending";
         tEl.innerHTML = `
+          ${t.thumbDataUrl ? `<div class="take__thumb" style="background-image:url('${t.thumbDataUrl}');"></div>` : ""}
           <div class="take__id">${esc(t.id.slice(0,8))}</div>
           <div class="take__cost">${fmtUsd(t.cost_usd)}</div>
-          <div class="take__status">${t.status === "approved" ? "★ approved" : "pending"}</div>
+          <div class="take__status">${statusLabel}</div>
+          ${t.rejection_reason ? `<div class="take__reason" title="${esc(t.rejection_reason)}">${esc(t.rejection_reason.slice(0, 30))}${t.rejection_reason.length > 30 ? "…" : ""}</div>` : ""}
+          <div class="take__actions">
+            ${t.status !== "approved" ? `<button class="take__btn take__btn--approve" title="Approve this take">★</button>` : ""}
+            ${t.status !== "rejected" ? `<button class="take__btn take__btn--reject" title="Reject this take">✗</button>` : ""}
+          </div>
         `;
-        tEl.addEventListener("click", async () => {
-          for (const x of (shot.takes || [])) x.status = (x.id === t.id) ? "approved" : "rejected";
+        // Approve button
+        tEl.querySelector(".take__btn--approve")?.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          for (const x of (shot.takes || [])) {
+            if (x.id === t.id) { x.status = "approved"; x.rejection_reason = null; }
+            else if (x.status === "approved") x.status = "rejected";
+          }
+          await Storage.put("shots", shot);
+          // Chain to next shot when an approved take changes
+          chainToNextShot(shot, t).catch(err => console.warn("[chain]", err));
+          renderShotEditor(shotId);
+          renderStoryboard();
+          toast(`Take approved · S${String(shot.shot_number).padStart(2,"0")}`);
+        });
+        // Reject button — prompt for reason
+        tEl.querySelector(".take__btn--reject")?.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          const reason = prompt(
+            "Why is this take rejected?\n\nCommon reasons: identity drift, wrong action, audio issue, framing off, motion glitch, prop missing",
+            t.rejection_reason || ""
+          );
+          if (reason === null) return;
+          const target = shot.takes.find(x => x.id === t.id);
+          if (target) {
+            target.status = "rejected";
+            target.rejection_reason = (reason || "").trim() || "(no reason given)";
+          }
           await Storage.put("shots", shot);
           renderShotEditor(shotId);
           renderStoryboard();
+          toast(`Take rejected · reason captured`, { tone: "warn" });
+        });
+        // Click anywhere else on the take → preview it in the player
+        tEl.addEventListener("click", async () => {
+          // Set this take's video as the active preview (without changing approval)
+          const videoEl = root.querySelector("video");
+          if (videoEl && t.videoDataUrl) videoEl.src = t.videoDataUrl;
         });
         takeStrip.appendChild(tEl);
       }
@@ -8606,6 +8711,108 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else renderLocationTab();
   }
 
+  // Generate a still keyframe for a shot via Seedream — uses cast bible refs
+  // + scene-aware prompt so the keyframe matches the YAML spec. This is the
+  // first step for image_to_video shots; Seedance then animates from it.
+  async function generateKeyframeForShot(shot, castInFrame, environment) {
+    if (!State.fal) throw new Error("No fal client (set worker URL first)");
+    // For now use the speaking character's three-quarter portrait as the
+    // identity anchor + an edit prompt that describes the scene framing.
+    // This is the simplest cross-bible composition pattern that works
+    // reliably with Seedream v4.5/edit.
+    const speakingChar = castInFrame.find(c => {
+      const inShot = (shot.cast_in_frame || []).find(x => x.character_id === c.id);
+      return inShot?.role_in_shot === "speaking";
+    }) || castInFrame[0];
+    if (!speakingChar) throw new Error("No cast in frame — can't anchor keyframe");
+    const charRef = refUrlFor(speakingChar, "three_quarter")
+                 || refUrlFor(speakingChar, "head_on")
+                 || refUrlFor(speakingChar, "full_body");
+    if (!charRef) throw new Error(`No reference image for ${speakingChar.display_name} — generate cast refs first`);
+
+    const moment = shot.the_moment || {};
+    const camera = shot.camera || {};
+    const envName = environment?.display_name || "the location";
+    const promptText = [
+      `Place this person in a scene: ${camera.framing || "medium shot"} of ${speakingChar.display_name} ${moment.focal_point ? "— " + moment.focal_point : ""}`,
+      `Location: ${envName}.`,
+      environment?.architecture?.type ? `${environment.architecture.type}.` : "",
+      environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}, ${environment.lighting.quality || ""}.` : "",
+      `Lens: ${camera.lens || "35mm equivalent"}. Depth: ${camera.depth || "shallow"}.`,
+      "Photographic still, documentary-cinematic, natural skin texture, subtle film grain.",
+      "The person's face must remain identical to the reference. Identity-locked.",
+      "Negative: AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare.",
+    ].filter(s => s && s.length > 2).join(" ");
+
+    const result = await State.fal.seedreamEdit({
+      prompt: promptText,
+      image_urls: [charRef],
+      num_images: 1,
+    });
+    const imgUrl = result?.images?.[0]?.url;
+    if (!imgUrl) throw new Error("Seedream returned no keyframe");
+    const blob = await fetch(imgUrl).then(r => r.blob());
+    const dataUrl = await blobToDataUrl(blob);
+    // Persist on the shot
+    shot.keyframes = shot.keyframes || {};
+    shot.keyframes.startDataUrl = dataUrl;
+    shot.keyframes.start_generated_at = Date.now();
+    shot.keyframes.start_referenced_char = speakingChar.id;
+    await Storage.put("shots", shot);
+    await trackCost(0.05, `seedream keyframe ${shot.id}`);
+    return dataUrl;
+  }
+
+  // Roll every shot that doesn't yet have an approved take, in timeline order.
+  // For image_to_video shots, also handles keyframe generation. Sequential
+  // execution so continuity chaining works (each shot's last frame seeds
+  // the next shot's start before its roll begins).
+  async function handleRollAllPending() {
+    if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
+    const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
+    const pending = shots.filter(s => {
+      // Skip title cards / built-in-resolve shots that have no API call
+      if (s.generation?.mode === "built_in_resolve") return false;
+      return !(s.takes || []).some(t => t.status === "approved");
+    });
+    if (pending.length === 0) { toast("Every shot already has an approved take."); return; }
+
+    // Cost preview
+    const totalCost = pending.reduce((sum, s) => sum + ((s.timecode?.duration_seconds || 0) * 0.30), 0);
+    // Plus keyframe gen for image_to_video shots that lack one (~$0.05 each)
+    const keyframesNeeded = pending.filter(s =>
+      s.generation?.mode === "image_to_video" && !s.keyframes?.startDataUrl
+    ).length;
+    const keyframeCost = keyframesNeeded * 0.05;
+    const grandTotal = totalCost + keyframeCost;
+    if (!confirm(
+      `Roll all ${pending.length} pending shot${pending.length===1?"":"s"} sequentially.\n\n` +
+      `Estimated Seedance cost: $${totalCost.toFixed(2)}\n` +
+      `Estimated keyframe cost: $${keyframeCost.toFixed(2)} (${keyframesNeeded} keyframes)\n` +
+      `Total: $${grandTotal.toFixed(2)}\n\n` +
+      `Continuity chaining is automatic between consecutive shots.\n\nProceed?`
+    )) return;
+
+    State.batchActive = true;
+    let completed = 0;
+    for (const s of pending) {
+      if (!State.batchActive) { toast("Batch cancelled."); break; }
+      setGPS(true,
+        `Rolling <span class="mono">${esc(s.display_name || s.id)}</span>`,
+        `${completed+1}/${pending.length} · est $${((s.timecode?.duration_seconds||0)*0.30).toFixed(2)}`,
+        (completed / pending.length) * 100);
+      try {
+        await handleRollShot(s.id);
+      } catch (err) {
+        console.error(`[batch-roll] ${s.id} failed:`, err);
+      }
+      completed++;
+    }
+    State.batchActive = false;
+    setGPS(false);
+    toast(`Batch complete · ${completed}/${pending.length} shots rolled.`);
+  }
+
   async function handleRollShot(shotId) {
     if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
     const shot = await Storage.get("shots", shotId);
@@ -8624,17 +8831,32 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       currentShotHasKeyframe: !!shot.keyframes?.startDataUrl,
     });
 
-    // MVP: image_to_video without an explicit keyframe falls back to the
-    // speaking character's three-quarter portrait. refUrlFor() consults
-    // c.chosenModel and falls through to the other model on miss.
+    // MVP: image_to_video AUTO-GENERATES a keyframe via Seedream if one
+    // isn't already on the shot. This composes the scene from cast bible
+    // refs so the start image is identity- + location-locked before the
+    // (much more expensive) Seedance roll fires.
     let assets = { referenceImageUrls: [] };
     if (resolved.mode === "image_to_video") {
-      assets.startImageUrl = shot.keyframes?.startDataUrl
-        || refUrlFor(castInFrame[0], "three_quarter")
-        || refUrlFor(castInFrame[0], "head_on");
+      let startImage = shot.keyframes?.startDataUrl;
+      if (!startImage) {
+        setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, "seedream-v4.5 · cast-anchored", 30);
+        try {
+          startImage = await generateKeyframeForShot(shot, castInFrame, environment);
+          toast(`Keyframe ready for ${shot.display_name || shotId}`);
+          if (State.activeShotId === shotId) renderShotEditor(shotId);
+          renderStoryboard();
+        } catch (err) {
+          // Don't bail entirely — fall back to a cast portrait
+          console.warn("[keyframe] auto-gen failed, falling back to cast portrait:", err);
+          toast(`Keyframe gen failed (${err.message}); using cast portrait as fallback`, { tone: "warn" });
+          startImage = refUrlFor(castInFrame[0], "three_quarter") || refUrlFor(castInFrame[0], "head_on");
+        }
+      }
+      assets.startImageUrl = startImage;
       if (!assets.startImageUrl) {
         toast("This shot needs a keyframe or cast ref before image-to-video. Generate cast refs first.", { tone: "warn" });
-        return;
+        setGPS(false);
+        return; // activeJobs not yet incremented
       }
     } else if (resolved.mode === "reference_to_video") {
       assets.referenceImageUrls = [];
@@ -8699,6 +8921,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       await Storage.put("shots", shot);
       await trackCost(estCost, `seedance ${resolved.mode} ${shotId}`);
       toast(`Take rolled · ${fmtUsd(estCost)} · ${resolved.mode}`);
+      // CONTINUITY CHAIN — extract last frame, seed next shot's start image
+      // if its continuity strategy is "inherit_end_of_previous".
+      chainToNextShot(shot, take).catch(err => console.warn("[chain]", err));
       renderStoryboard();
       if (State.activeShotId === shotId) renderShotEditor(shotId);
     } catch (err) {
@@ -8721,20 +8946,61 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   async function extractFirstFrameDataUrl(videoSrc) {
+    return extractFrameAt(videoSrc, "start");
+  }
+
+  // Extract a frame at start (~5%) or end (~95%) of the video.
+  // Used for: thumbnail generation (start), continuity chaining (end).
+  async function extractFrameAt(videoSrc, where = "start") {
     return new Promise((resolve, reject) => {
       const v = document.createElement("video");
       v.muted = true; v.playsInline = true; v.preload = "auto"; v.src = videoSrc;
       v.addEventListener("loadeddata", () => {
-        v.currentTime = Math.min(0.2, (v.duration || 1) * 0.05);
+        if (where === "end") {
+          // back off ~80ms from duration to avoid black tail frames
+          v.currentTime = Math.max(0, (v.duration || 1) - 0.08);
+        } else {
+          v.currentTime = Math.min(0.2, (v.duration || 1) * 0.05);
+        }
       });
       v.addEventListener("seeked", () => {
         const c = document.createElement("canvas");
         c.width = v.videoWidth; c.height = v.videoHeight;
         c.getContext("2d").drawImage(v, 0, 0);
-        resolve(c.toDataURL("image/jpeg", 0.7));
+        resolve(c.toDataURL("image/jpeg", 0.85));
       });
       v.addEventListener("error", reject);
     });
+  }
+
+  // After a take is approved, extract its last frame and seed the NEXT shot's
+  // start image — if that shot has continuity.start_frame_strategy === "inherit_end_of_previous"
+  // and doesn't already have its own keyframe.
+  async function chainToNextShot(approvedShot, approvedTake) {
+    if (!approvedTake?.videoDataUrl) return;
+    const allShots = await Storage.getAll("shots");
+    const nextShot = allShots.find(s => (s.shot_number || 0) === (approvedShot.shot_number || 0) + 1);
+    if (!nextShot) return;
+    const inherits = nextShot.continuity?.start_frame_strategy === "inherit_end_of_previous";
+    const alreadyHasKeyframe = !!nextShot.keyframes?.startDataUrl;
+    if (!inherits || alreadyHasKeyframe) return;
+    try {
+      const endFrame = await extractFrameAt(approvedTake.videoDataUrl, "end");
+      nextShot.keyframes = nextShot.keyframes || {};
+      nextShot.keyframes.startDataUrl = endFrame;
+      nextShot.keyframes.start_generated_at = Date.now();
+      nextShot.keyframes.start_referenced_shot = approvedShot.id;
+      nextShot.keyframes.start_referenced_take = approvedTake.id;
+      // Also stash on the approved shot as its endDataUrl for the record
+      approvedShot.keyframes = approvedShot.keyframes || {};
+      approvedShot.keyframes.endDataUrl = endFrame;
+      await Storage.put("shots", nextShot);
+      await Storage.put("shots", approvedShot);
+      toast(`Chained S${String(approvedShot.shot_number).padStart(2,"0")}.end → S${String(nextShot.shot_number).padStart(2,"0")}.start`);
+      renderStoryboard();
+    } catch (err) {
+      console.warn("[chain] last-frame extraction failed:", err);
+    }
   }
 
   // Switch to Shot Editor for a given shot id. Used by card click + tree click.
@@ -8837,7 +9103,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "gen-env")      handleGenerateEnvRefs(target.dataset.locId, target.dataset.model || ACTIVE_IMAGE_MODEL);
     else if (action === "choose-canonical") handleChooseCanonical(target.dataset.assetKind, target.dataset.assetId, target.dataset.model);
     else if (action === "batch-gen" || action === "batch-reroll") handleBatch(action, target.dataset.batchTab || "cast", target.dataset.batchModel || ACTIVE_IMAGE_MODEL);
-    else if (action === "roll-shot")    handleRollShot(target.dataset.shotId);
+    else if (action === "roll-shot")          handleRollShot(target.dataset.shotId);
+    else if (action === "roll-all-pending")   handleRollAllPending();
+    else if (action === "finish-play-all")    playSequenceFromIdx(0);
+    else if (action === "finish-pause")       $("#elx-finish-video")?.pause();
     else if (action === "open-shot-editor") navigateToShot(target.dataset.shotId);
     else if (action === "tree-nav-shot")    navigateToShot(target.dataset.shotId);
     else if (action === "open-connection") showConnectionPanel();
@@ -8886,7 +9155,29 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const s3 = $("#screen-s3");
     if (!s3) return;
     if ($("#elx-shot-grid", s3)) return;
-    s3.innerHTML = `<div class="s3"><div class="shot-grid" id="elx-shot-grid"></div></div>`;
+    s3.innerHTML = `
+      <div class="s3">
+        <div class="s3__toolbar">
+          <div class="seg seg--filter" id="elx-shot-filter" data-active-filter="all">
+            <button class="seg__btn is-active" data-filter="all">All <span class="count"></span></button>
+            <button class="seg__btn" data-filter="pending">Pending <span class="count"></span></button>
+            <button class="seg__btn" data-filter="rolling">Rolling <span class="count"></span></button>
+            <button class="seg__btn" data-filter="approved">Approved <span class="count"></span></button>
+          </div>
+          <div class="s3__spacer"></div>
+          <button class="btn btn--sm" data-action="roll-all-pending">▶ Roll all pending</button>
+        </div>
+        <div class="shot-grid" id="elx-shot-grid"></div>
+      </div>
+    `;
+    // Filter clicks → re-render
+    s3.querySelectorAll("[data-filter]").forEach(b => {
+      b.addEventListener("click", () => {
+        const filterBar = $("#elx-shot-filter");
+        if (filterBar) filterBar.dataset.activeFilter = b.dataset.filter;
+        renderStoryboard();
+      });
+    });
   }
 
   function adaptScreenFour() {
@@ -9034,13 +9325,119 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   function adaptScreenFive() {
     const s5 = $("#screen-s5");
     if (!s5) return;
-    // Keep the existing timeline mockup; just add an info banner that finish is read-only for now.
-    if (s5.querySelector(".elx-finish-note")) return;
-    const note = document.createElement("div");
-    note.className = "elx-finish-note";
-    note.style.cssText = "background:#14141a; border:1px solid #c9a25a; border-radius:6px; padding:10px 14px; margin-bottom:14px; font-size:12px; color:#c9a25a; font-family:Inter,sans-serif;";
-    note.textContent = "Preview-only for MVP. Approved takes render as a static timeline; export pipeline lands next sprint.";
-    s5.insertBefore(note, s5.firstChild);
+    if ($("#elx-finish", s5)) return;
+    s5.innerHTML = `
+      <div class="s5 elx-finish" id="elx-finish">
+        <div class="elx-finish__head">
+          <div class="elx-finish__title">Episode 1 · The Standup · Master cut</div>
+          <div class="elx-finish__stats" id="elx-finish-stats"></div>
+        </div>
+        <div class="elx-finish__player">
+          <video id="elx-finish-video" controls playsinline style="width:100%; aspect-ratio:16/9; background:#000; border-radius:8px;"></video>
+          <div class="elx-finish__nowplaying" id="elx-finish-now"></div>
+        </div>
+        <div class="elx-finish__playctl">
+          <button class="btn btn--sm" data-action="finish-play-all">▶ Play sequence</button>
+          <button class="btn btn--sm btn--ghost" data-action="finish-pause">❚❚ Pause</button>
+          <span class="elx-finish__hint">Auto-advances through approved takes only. Pending shots are skipped.</span>
+        </div>
+        <div class="elx-finish__strip" id="elx-finish-strip"></div>
+      </div>
+    `;
+  }
+
+  // Populate the Finish/Timeline view with the current state of approved takes.
+  // Builds a "playlist" of takes ordered by shot_number; the player auto-advances.
+  async function renderFinishScreen() {
+    const finishRoot = $("#elx-finish");
+    if (!finishRoot) return;
+    const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
+    const playlist = [];
+    for (const s of shots) {
+      const approved = (s.takes || []).find(t => t.status === "approved");
+      if (approved?.videoDataUrl) {
+        playlist.push({ shot: s, take: approved });
+      }
+    }
+    // Stats
+    const totalDur = playlist.reduce((sum, p) => sum + (p.shot.timecode?.duration_seconds || 0), 0);
+    const totalCost = shots.reduce((sum, s) => sum + ((s.takes || []).reduce((a, t) => a + (t.cost_usd || 0), 0)), 0);
+    const targetDur = 75; // Episode 1 target
+    const statsEl = $("#elx-finish-stats");
+    if (statsEl) {
+      statsEl.innerHTML = `
+        <span><strong>${playlist.length}</strong> / ${shots.length} approved</span>
+        <span><strong>${totalDur}</strong>s / ${targetDur}s target</span>
+        <span class="mono">Spent ${fmtUsd(totalCost)}</span>
+      `;
+    }
+
+    // Strip: one tile per APPROVED take in order, plus placeholders for pending
+    const strip = $("#elx-finish-strip");
+    if (strip) {
+      strip.innerHTML = "";
+      for (const s of shots) {
+        const approved = (s.takes || []).find(t => t.status === "approved");
+        const tile = document.createElement("div");
+        tile.className = `elx-finish-tile ${approved ? "is-approved" : "is-pending"}`;
+        tile.dataset.shotId = s.id;
+        const num = s.shot_number != null ? `S${String(s.shot_number).padStart(2,"0")}` : "S?";
+        if (approved) {
+          tile.innerHTML = `
+            <div class="elx-finish-tile__thumb" style="background-image:url('${approved.thumbDataUrl || ""}'); background-size:cover; background-position:center;"></div>
+            <div class="elx-finish-tile__meta">
+              <span class="elx-finish-tile__num">${esc(num)}</span>
+              <span class="elx-finish-tile__name">${esc(s.display_name || s.id)}</span>
+              <span class="elx-finish-tile__dur">${s.timecode?.duration_seconds || "?"}s</span>
+            </div>
+          `;
+          tile.addEventListener("click", () => playOne(approved.videoDataUrl, `${num} · ${s.display_name || s.id}`));
+        } else {
+          tile.innerHTML = `
+            <div class="elx-finish-tile__thumb elx-finish-tile__thumb--empty">○</div>
+            <div class="elx-finish-tile__meta">
+              <span class="elx-finish-tile__num elx-finish-tile__num--dim">${esc(num)}</span>
+              <span class="elx-finish-tile__name elx-finish-tile__name--dim">${esc(s.display_name || s.id)} <em>pending</em></span>
+              <span class="elx-finish-tile__dur">${s.timecode?.duration_seconds || "?"}s</span>
+            </div>
+          `;
+          tile.addEventListener("click", () => navigateToShot(s.id));
+        }
+        strip.appendChild(tile);
+      }
+    }
+
+    // Save playlist for play-all
+    State.finishPlaylist = playlist;
+    State.finishPlaylistIdx = 0;
+  }
+
+  function playOne(srcDataUrl, label) {
+    const v = $("#elx-finish-video");
+    const now = $("#elx-finish-now");
+    if (!v) return;
+    v.src = srcDataUrl;
+    v.play().catch(() => {});
+    if (now) now.textContent = `▶ ${label || ""}`;
+  }
+
+  function playSequenceFromIdx(startIdx = 0) {
+    const playlist = State.finishPlaylist || [];
+    if (playlist.length === 0) { toast("No approved takes yet — Storyboard tab has the queue."); return; }
+    State.finishPlaylistIdx = startIdx;
+    const v = $("#elx-finish-video");
+    if (!v) return;
+    const playNext = () => {
+      const i = State.finishPlaylistIdx;
+      const item = playlist[i];
+      if (!item) { v.removeEventListener("ended", playNext); return; }
+      const num = item.shot.shot_number != null ? `S${String(item.shot.shot_number).padStart(2,"0")}` : "S?";
+      playOne(item.take.videoDataUrl, `${num} · ${item.shot.display_name || item.shot.id} (${i+1}/${playlist.length})`);
+      State.finishPlaylistIdx = i + 1;
+    };
+    v.removeEventListener("ended", playNext);
+    v.addEventListener("ended", playNext);
+    playNext();
   }
 
   // Replace the v2 mockup's hardcoded shot rows in the left tree with
@@ -9180,6 +9577,17 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (!State.workerUrl) {
       setTimeout(showConnectionPanel, 400);
     }
+
+    // Hook into the proto-nav so we can re-render screens when they become
+    // active. Storyboard re-renders on every nav so filter state is fresh;
+    // Finish builds its playlist lazily.
+    document.querySelectorAll(".proto-tab").forEach(t => {
+      t.addEventListener("click", () => {
+        const sid = t.dataset.screen;
+        if (sid === "s3") renderStoryboard();
+        else if (sid === "s5") renderFinishScreen();
+      });
+    });
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
