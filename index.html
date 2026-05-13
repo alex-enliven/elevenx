@@ -6645,6 +6645,109 @@ window.ElevenX.composeCastReferencePrompt = function(character, angle = "head_on
 }
 
 /**
+ * Compose an EDIT-mode prompt for cast bible angle chaining.
+ *
+ * Used when we have a `head_on` reference image and want to generate a
+ * different angle (three_quarter or full_body) of the SAME person.
+ *
+ * Pure text-to-image yields a different-looking person each call — the
+ * model has no anchor for identity. Edit mode passes head_on as the input
+ * reference and asks the model to transform pose/angle while preserving
+ * face, hair, wardrobe, etc.
+ *
+ * Both Seedream v4.5/edit and OpenAI /v1/images/edits accept reference
+ * images. Same prompt body works for both; the call shape differs at
+ * the API layer.
+ *
+ * @param {object} character — cast bible entry
+ * @param {"three_quarter"|"full_body"} angle — target angle
+ */
+window.ElevenX.composeCastReferenceEditPrompt = function(character, angle) {
+  const id   = character.identity || {};
+  const phys = character.physical || {};
+  const wrd  = character.wardrobe?.episode_default || {};
+  const hair = phys.hair || {};
+  const distinctive = (phys.distinctive_features || []).join(", ");
+
+  const transform = {
+    three_quarter:
+      "Transform the input portrait to show the EXACT SAME PERSON from a three-quarter angle, " +
+      "head slightly turned toward camera right, neutral closed-mouth expression, looking off camera right. " +
+      "Same face structure, same hair, same wardrobe, same lighting, same background.",
+    full_body:
+      "Transform the input portrait to show the EXACT SAME PERSON in a full-body standing pose, " +
+      "relaxed posture, hands at sides or one holding a relevant prop. Camera pulls back to show " +
+      "the full figure head to toe. Same face, same hair, same wardrobe palette, " +
+      "same lighting, same background. The face must be unmistakably the same person from the input.",
+  }[angle];
+
+  if (!transform) throw new Error(`composeCastReferenceEditPrompt: unknown angle '${angle}'`);
+
+  const continuity = [
+    "Identity preservation is critical — the face must be visually identical to the input.",
+    `Subject: ${id.age || "?"}-year-old ${id.nationality || ""} ${character.display_name?.split(" ")[0] || "person"}.`,
+    `Hair: ${hair.color || ""} ${hair.length || ""} hair${hair.style ? ", " + hair.style : ""} — match exactly.`,
+    distinctive ? `Distinctive features (must persist): ${distinctive}.` : "",
+    `Wardrobe (must persist): ${wrd.top || ""}${wrd.bottom ? ", " + wrd.bottom : ""}${wrd.footwear && angle === "full_body" ? ", " + wrd.footwear : ""}.`,
+    "Studio quality, soft north-facing daylight from camera right, 35mm lens feel, natural skin texture.",
+    "Negative: different person, identity drift, plastic skin, AI sheen, stock photo, makeup-heavy, exaggerated features.",
+  ].filter(s => s && s.trim().length > 1).join(" ");
+
+  const prompt = `${transform} ${continuity}`;
+  const aspectMap = { three_quarter: "portrait_4_3", full_body: "portrait_16_9" };
+  const openaiSizeMap = { three_quarter: "1024x1536", full_body: "1024x1536" };
+
+  return {
+    prompt,
+    image_size: aspectMap[angle] || "portrait_4_3",   // Seedream key
+    openai_size: openaiSizeMap[angle] || "1024x1536", // OpenAI key
+    num_images: 1,
+  };
+}
+
+/**
+ * Compose an EDIT-mode prompt for environment kind chaining.
+ *
+ * `wide` is generated first (text-to-image, establishing the space).
+ * `detail` is then generated as an edit using the wide as reference —
+ * same physical room, closer / different framing.
+ */
+window.ElevenX.composeEnvironmentReferenceEditPrompt = function(environment, kind = "detail") {
+  const a = environment.architecture || {};
+  const l = environment.lighting || {};
+
+  const transform = {
+    wide:
+      "Transform the input frame to a wider establishing view of the SAME PHYSICAL SPACE. " +
+      "Pull camera back, show more of the room from the same vantage. " +
+      "Same materials, same lighting, same time of day, same palette.",
+    detail:
+      "Transform the input frame to a closer detail view of the SAME PHYSICAL SPACE. " +
+      "Camera moves in to show texture and props at mid-distance. " +
+      "Same materials, same lighting, same palette — only the framing changes.",
+  }[kind];
+
+  if (!transform) throw new Error(`composeEnvironmentReferenceEditPrompt: unknown kind '${kind}'`);
+
+  const continuity = [
+    "Spatial consistency is critical — this must be unmistakably the same physical space as the input.",
+    `Space: ${a.type || environment.display_name || "interior"}.`,
+    a.materials?.length ? `Materials (must persist): ${a.materials.join(", ")}.` : "",
+    l.primary_source ? `Lighting (must persist): ${l.primary_source}, ${l.quality || ""}, ${l.time_of_day || ""}.` : "",
+    environment.palette?.length ? `Palette (must persist): ${environment.palette.join(", ")}.` : "",
+    "Documentary realism. 35mm lens feel.",
+    "Negative: different room, different lighting, fisheye, dramatic lighting, neon, sci-fi, fake plants.",
+  ].filter(s => s && s.trim().length > 1).join(" ");
+
+  return {
+    prompt: `${transform} ${continuity}`,
+    image_size: "landscape_16_9",
+    openai_size: "1536x1024",
+    num_images: 1,
+  };
+}
+
+/**
  * Compose a Seedream prompt for an environment wide reference.
  */
 window.ElevenX.composeEnvironmentReferencePrompt = function(environment, kind = "wide") {
@@ -6979,6 +7082,78 @@ function blobToDataUrl(blob) {
       // OpenAI gpt-image-2 returns `{ data: [{ b64_json, revised_prompt }] }`.
       // Convert to a uniform shape that mirrors FalClient.seedreamTextToImage
       // so the same handler can swap between them.
+      const images = (json.data || []).map(d => ({
+        b64_json: d.b64_json,
+        dataUrl: d.b64_json ? `data:image/png;base64,${d.b64_json}` : null,
+        revised_prompt: d.revised_prompt || null,
+      }));
+
+      return {
+        images,
+        cost_usd_estimated: estimateOpenAIImageCost(size, quality) * n,
+        raw: json,
+      };
+    }
+
+    /**
+     * Generate an image using a REFERENCE input image (gpt-image-2 edit mode).
+     *
+     * This is how we chain angles for identity consistency: head_on is
+     * generated as text-to-image, then three_quarter / full_body are
+     * generated as edits using head_on as the reference. The output
+     * preserves face/hair/wardrobe and changes only what the prompt asks.
+     *
+     * Uses POST multipart/form-data on /v1/images/edits.
+     *
+     * @param {object} body
+     * @param {string} body.imageDataUrl — data: URL of the reference image
+     * @param {string} body.prompt
+     * @param {string} [body.model="gpt-image-2"]
+     * @param {string} [body.size="1024x1024"]
+     * @param {"low"|"medium"|"high"|"auto"} [body.quality="medium"]
+     * @param {number} [body.n=1]
+     */
+    async imageEdit(body, opts = {}) {
+      if (!body.prompt) throw new Error("imageEdit: body.prompt is required");
+      if (!body.imageDataUrl) throw new Error("imageEdit: body.imageDataUrl is required (reference image)");
+      const model = body.model || "gpt-image-2";
+      const size = body.size || "1024x1024";
+      const quality = body.quality || "medium";
+      const n = body.n || 1;
+
+      if (this.dryRun) {
+        this.onLog(`[dry-run] OpenAI image edit: ${model} · ${size} · ${quality} (with reference)`);
+        return { dryRun: true, request: { model, prompt: body.prompt, size, quality, n } };
+      }
+
+      // dataUrl → Blob (so we can send as multipart file)
+      const refBlob = await (await this.fetch(body.imageDataUrl)).blob();
+
+      const formData = new FormData();
+      formData.append("model", model);
+      formData.append("prompt", body.prompt);
+      formData.append("size", size);
+      formData.append("quality", quality);
+      formData.append("n", String(n));
+      // The OpenAI edits endpoint expects the image field named "image" (or
+      // "image[]" for multiple). Single reference is enough for our use.
+      formData.append("image", refBlob, "reference.png");
+
+      const url = `${this.workerUrl}/openai/v1/images/edits`;
+      this.onLog(`→ POST /openai/v1/images/edits (${model}, ${size}, with reference)`);
+
+      const res = await this.fetch(url, {
+        method: "POST",
+        body: formData,
+        // NOTE: do NOT set Content-Type — the browser sets multipart boundary automatically.
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`openai edits failed: ${res.status} ${res.statusText} — ${text.slice(0, 400)}`);
+      }
+
+      const json = await res.json();
       const images = (json.data || []).map(d => ({
         b64_json: d.b64_json,
         dataUrl: d.b64_json ? `data:image/png;base64,${d.b64_json}` : null,
@@ -7631,81 +7806,122 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const modelMeta = IMAGE_MODELS[modelKey];
     if (!modelMeta) { toast(`Unknown model: ${modelKey}`, { tone: "err" }); return; }
 
-    // Lazy-construct the right client
     const client = (modelKey === "seedream") ? State.fal : State.openai;
     if (!client) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
 
     const c = await Storage.get("characters", charId);
     if (!c) return;
-
-    // Ensure the per-model bucket exists
     c.refs = c.refs || {};
     c.refs[modelKey] = c.refs[modelKey] || {};
 
-    State.activeJobs++;
+    // If user clicked "Re-roll" (all 3 present), CLEAR and re-do with chaining.
+    // This is the fix for cross-angle identity drift — previous text-to-image
+    // approach gave us 3 different people per character.
     const angles = ["head_on", "three_quarter", "full_body"];
-    let okCount = 0, failCount = 0;
-    for (const angle of angles) {
-      if (c.refs[modelKey][angle]?.dataUrl) continue; // skip already approved
-      setGPS(true,
-        `Generating <span class="mono">${esc(charId)} · ${angle}</span>`,
-        `${modelMeta.label}`,
-        20);
-      try {
-        const promptSpec = composer.composeCastReferencePrompt(c, angle);
-        let dataUrl, seed, costUsd;
-
-        if (modelKey === "seedream") {
-          const result = await State.fal.seedreamTextToImage(promptSpec);
-          const imgUrl = result?.images?.[0]?.url;
-          if (!imgUrl) { toast(`Failed: ${charId}/${angle} (no image)`, { tone: "err" }); failCount++; continue; }
-          const blob = await fetch(imgUrl).then(r => r.blob());
-          dataUrl = await blobToDataUrl(blob);
-          seed = result.seed;
-          costUsd = modelMeta.cost_per_image_usd;
-        } else if (modelKey === "gpt") {
-          // gpt-image returns b64_json directly — no separate fetch needed
-          const sizeForAngle = ({
-            head_on:       "1024x1024",
-            three_quarter: "1024x1536",
-            full_body:     "1024x1536",
-          })[angle] || "1024x1024";
-          const result = await State.openai.imageGenerate({
-            prompt: promptSpec.prompt,
-            size: sizeForAngle,
-            quality: "medium",
-            n: 1,
-          });
-          dataUrl = result?.images?.[0]?.dataUrl;
-          if (!dataUrl) { toast(`Failed: ${charId}/${angle} (no image)`, { tone: "err" }); failCount++; continue; }
-          seed = null; // gpt-image doesn't expose a seed
-          costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
-        }
-
-        c.refs[modelKey][angle] = {
-          dataUrl,
-          seed,
-          generated_at: Date.now(),
-          cost_usd: costUsd,
-          model: modelMeta.label,
-        };
-        await Storage.put("characters", c);
-        await trackCost(costUsd, `${modelKey} cast ${charId}/${angle}`);
-        renderCastTab();
-        okCount++;
-      } catch (err) {
-        console.error(`[${modelKey}]`, err);
-        toast(`${modelMeta.shortLabel} error: ${err.message}`, { tone: "err" });
-        failCount++;
-      }
+    const allPresent = angles.every(k => c.refs[modelKey][k]?.dataUrl);
+    if (allPresent) {
+      c.refs[modelKey] = {};
+      await Storage.put("characters", c);
     }
-    setGPS(false);
-    State.activeJobs--;
+
+    State.activeJobs++;
+    let okCount = 0, failCount = 0;
+
+    try {
+      // ── STEP 1: head_on via text-to-image (no reference) ────────────────
+      let headOnDataUrl = c.refs[modelKey].head_on?.dataUrl || null;
+      if (!headOnDataUrl) {
+        setGPS(true, `Generating <span class="mono">${esc(charId)} · head_on</span>`, `${modelMeta.label} · base portrait`, 15);
+        try {
+          const promptSpec = composer.composeCastReferencePrompt(c, "head_on");
+          let dataUrl, seed, costUsd;
+          if (modelKey === "seedream") {
+            const result = await State.fal.seedreamTextToImage(promptSpec);
+            const imgUrl = result?.images?.[0]?.url;
+            if (!imgUrl) throw new Error("no image in Seedream response");
+            const blob = await fetch(imgUrl).then(r => r.blob());
+            dataUrl = await blobToDataUrl(blob);
+            seed = result.seed;
+            costUsd = modelMeta.cost_per_image_usd;
+          } else {
+            const result = await State.openai.imageGenerate({
+              prompt: promptSpec.prompt,
+              size: "1024x1024",
+              quality: "medium",
+              n: 1,
+            });
+            dataUrl = result?.images?.[0]?.dataUrl;
+            if (!dataUrl) throw new Error("no image in OpenAI response");
+            seed = null;
+            costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
+          }
+          c.refs[modelKey].head_on = { dataUrl, seed, generated_at: Date.now(), cost_usd: costUsd, model: modelMeta.label };
+          await Storage.put("characters", c);
+          await trackCost(costUsd, `${modelKey} cast ${charId}/head_on`);
+          renderCastTab();
+          headOnDataUrl = dataUrl;
+          okCount++;
+        } catch (err) {
+          console.error(`[${modelKey}] head_on failed:`, err);
+          toast(`${modelMeta.shortLabel} head_on failed: ${err.message}`, { tone: "err", duration: 8000 });
+          failCount++;
+          return; // cannot chain other angles without head_on
+        }
+      }
+
+      // ── STEP 2 + 3: three_quarter & full_body as EDITS using head_on as reference ──
+      for (const angle of ["three_quarter", "full_body"]) {
+        if (c.refs[modelKey][angle]?.dataUrl) continue;
+        setGPS(true, `Generating <span class="mono">${esc(charId)} · ${angle}</span>`,
+          `${modelMeta.label} · identity-locked from head_on`, 40);
+        try {
+          const editSpec = composer.composeCastReferenceEditPrompt(c, angle);
+          let dataUrl, seed, costUsd;
+          if (modelKey === "seedream") {
+            const result = await State.fal.seedreamEdit({
+              prompt: editSpec.prompt,
+              image_urls: [headOnDataUrl],
+              num_images: 1,
+            });
+            const imgUrl = result?.images?.[0]?.url;
+            if (!imgUrl) throw new Error("no image in Seedream edit response");
+            const blob = await fetch(imgUrl).then(r => r.blob());
+            dataUrl = await blobToDataUrl(blob);
+            seed = result.seed;
+            costUsd = modelMeta.cost_per_image_usd;
+          } else {
+            const result = await State.openai.imageEdit({
+              prompt: editSpec.prompt,
+              imageDataUrl: headOnDataUrl,
+              size: editSpec.openai_size,
+              quality: "medium",
+              n: 1,
+            });
+            dataUrl = result?.images?.[0]?.dataUrl;
+            if (!dataUrl) throw new Error("no image in OpenAI edit response");
+            seed = null;
+            costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
+          }
+          c.refs[modelKey][angle] = { dataUrl, seed, generated_at: Date.now(), cost_usd: costUsd, model: modelMeta.label, referenced: "head_on" };
+          await Storage.put("characters", c);
+          await trackCost(costUsd, `${modelKey} cast ${charId}/${angle} (edit)`);
+          renderCastTab();
+          okCount++;
+        } catch (err) {
+          console.error(`[${modelKey}] ${angle} failed:`, err);
+          toast(`${modelMeta.shortLabel} ${angle} failed: ${err.message}`, { tone: "err", duration: 7000 });
+          failCount++;
+        }
+      }
+    } finally {
+      setGPS(false);
+      State.activeJobs--;
+    }
 
     const m = modelMeta.shortLabel;
-    if (okCount > 0 && failCount === 0)      toast(`${c.display_name} · ${m}: ${okCount} angle${okCount===1?"":"s"} added.`);
-    else if (okCount > 0 && failCount > 0)   toast(`${m} partial: ${okCount} ok, ${failCount} failed. Retry to fill gaps.`, { tone: "warn", duration: 7000 });
-    else if (failCount > 0)                  toast(`${m}: all ${failCount} angle${failCount===1?"":"s"} failed. Check console.`, { tone: "err", duration: 8000 });
+    if (okCount > 0 && failCount === 0)      toast(`${c.display_name} · ${m}: ${okCount} angle${okCount===1?"":"s"} (identity chained from head_on).`);
+    else if (okCount > 0 && failCount > 0)   toast(`${m} partial: ${okCount} ok, ${failCount} failed. Re-roll to retry.`, { tone: "warn", duration: 7000 });
+    else if (failCount > 0)                  toast(`${m}: all angles failed. Check console.`, { tone: "err", duration: 8000 });
   }
 
   async function handleGenerateEnvRefs(locId, modelKey = "seedream") {
@@ -7717,66 +7933,106 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     const e = await Storage.get("environments", locId);
     if (!e) return;
-
     e.refs = e.refs || {};
     e.refs[modelKey] = e.refs[modelKey] || {};
 
+    // Same chained pattern as cast — wide first (base), then detail as edit
+    // using the wide as reference. Solves spatial consistency the same way
+    // the cast chaining solves identity consistency.
+    const kinds = ["wide", "detail"];
+    const allPresent = kinds.every(k => e.refs[modelKey][k]?.dataUrl);
+    if (allPresent) {
+      e.refs[modelKey] = {};
+      await Storage.put("environments", e);
+    }
+
     State.activeJobs++;
     let okCount = 0, failCount = 0;
-    for (const kind of ["wide", "detail"]) {
-      if (e.refs[modelKey][kind]?.dataUrl) continue;
-      setGPS(true,
-        `Generating <span class="mono">${esc(locId)} · ${kind}</span>`,
-        `${modelMeta.label}`,
-        30);
-      try {
-        const promptSpec = composer.composeEnvironmentReferencePrompt(e, kind);
-        let dataUrl, seed, costUsd;
 
-        if (modelKey === "seedream") {
-          const result = await State.fal.seedreamTextToImage(promptSpec);
-          const imgUrl = result?.images?.[0]?.url;
-          if (!imgUrl) { toast(`Failed: ${locId}/${kind} (no image)`, { tone: "err" }); failCount++; continue; }
-          const blob = await fetch(imgUrl).then(r => r.blob());
-          dataUrl = await blobToDataUrl(blob);
-          seed = result.seed;
-          costUsd = modelMeta.cost_per_image_usd;
-        } else if (modelKey === "gpt") {
-          // Environments are 16:9-ish — use 1536x1024 landscape for both kinds
-          const result = await State.openai.imageGenerate({
-            prompt: promptSpec.prompt,
-            size: "1536x1024",
-            quality: "medium",
-            n: 1,
-          });
-          dataUrl = result?.images?.[0]?.dataUrl;
-          if (!dataUrl) { toast(`Failed: ${locId}/${kind} (no image)`, { tone: "err" }); failCount++; continue; }
-          seed = null;
-          costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
+    try {
+      // ── STEP 1: wide via text-to-image ──────────────────────────────────
+      let wideDataUrl = e.refs[modelKey].wide?.dataUrl || null;
+      if (!wideDataUrl) {
+        setGPS(true, `Generating <span class="mono">${esc(locId)} · wide</span>`, `${modelMeta.label} · base frame`, 20);
+        try {
+          const promptSpec = composer.composeEnvironmentReferencePrompt(e, "wide");
+          let dataUrl, seed, costUsd;
+          if (modelKey === "seedream") {
+            const result = await State.fal.seedreamTextToImage(promptSpec);
+            const imgUrl = result?.images?.[0]?.url;
+            if (!imgUrl) throw new Error("no image in Seedream response");
+            const blob = await fetch(imgUrl).then(r => r.blob());
+            dataUrl = await blobToDataUrl(blob);
+            seed = result.seed;
+            costUsd = modelMeta.cost_per_image_usd;
+          } else {
+            const result = await State.openai.imageGenerate({
+              prompt: promptSpec.prompt, size: "1536x1024", quality: "medium", n: 1,
+            });
+            dataUrl = result?.images?.[0]?.dataUrl;
+            if (!dataUrl) throw new Error("no image in OpenAI response");
+            seed = null;
+            costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
+          }
+          e.refs[modelKey].wide = { dataUrl, seed, generated_at: Date.now(), cost_usd: costUsd, model: modelMeta.label };
+          await Storage.put("environments", e);
+          await trackCost(costUsd, `${modelKey} env ${locId}/wide`);
+          renderLocationTab();
+          wideDataUrl = dataUrl;
+          okCount++;
+        } catch (err) {
+          console.error(`[${modelKey}] wide failed:`, err);
+          toast(`${modelMeta.shortLabel} wide failed: ${err.message}`, { tone: "err", duration: 8000 });
+          failCount++;
+          return;
         }
-
-        e.refs[modelKey][kind] = {
-          dataUrl, seed,
-          generated_at: Date.now(),
-          cost_usd: costUsd,
-          model: modelMeta.label,
-        };
-        await Storage.put("environments", e);
-        await trackCost(costUsd, `${modelKey} env ${locId}/${kind}`);
-        renderLocationTab();
-        okCount++;
-      } catch (err) {
-        console.error(`[${modelKey}]`, err);
-        toast(`${modelMeta.shortLabel} error: ${err.message}`, { tone: "err" });
-        failCount++;
       }
+
+      // ── STEP 2: detail as edit using wide as reference ───────────────────
+      if (!e.refs[modelKey].detail?.dataUrl) {
+        setGPS(true, `Generating <span class="mono">${esc(locId)} · detail</span>`, `${modelMeta.label} · space-locked from wide`, 60);
+        try {
+          const editSpec = composer.composeEnvironmentReferenceEditPrompt(e, "detail");
+          let dataUrl, seed, costUsd;
+          if (modelKey === "seedream") {
+            const result = await State.fal.seedreamEdit({
+              prompt: editSpec.prompt, image_urls: [wideDataUrl], num_images: 1,
+            });
+            const imgUrl = result?.images?.[0]?.url;
+            if (!imgUrl) throw new Error("no image in Seedream edit response");
+            const blob = await fetch(imgUrl).then(r => r.blob());
+            dataUrl = await blobToDataUrl(blob);
+            seed = result.seed;
+            costUsd = modelMeta.cost_per_image_usd;
+          } else {
+            const result = await State.openai.imageEdit({
+              prompt: editSpec.prompt, imageDataUrl: wideDataUrl, size: editSpec.openai_size, quality: "medium", n: 1,
+            });
+            dataUrl = result?.images?.[0]?.dataUrl;
+            if (!dataUrl) throw new Error("no image in OpenAI edit response");
+            seed = null;
+            costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
+          }
+          e.refs[modelKey].detail = { dataUrl, seed, generated_at: Date.now(), cost_usd: costUsd, model: modelMeta.label, referenced: "wide" };
+          await Storage.put("environments", e);
+          await trackCost(costUsd, `${modelKey} env ${locId}/detail (edit)`);
+          renderLocationTab();
+          okCount++;
+        } catch (err) {
+          console.error(`[${modelKey}] detail failed:`, err);
+          toast(`${modelMeta.shortLabel} detail failed: ${err.message}`, { tone: "err", duration: 7000 });
+          failCount++;
+        }
+      }
+    } finally {
+      setGPS(false);
+      State.activeJobs--;
     }
-    setGPS(false);
-    State.activeJobs--;
+
     const m = modelMeta.shortLabel;
-    if (okCount > 0 && failCount === 0)      toast(`${e.display_name} · ${m}: ${okCount} ref${okCount===1?"":"s"} added.`);
+    if (okCount > 0 && failCount === 0)      toast(`${e.display_name} · ${m}: ${okCount} ref${okCount===1?"":"s"} (detail chained from wide).`);
     else if (okCount > 0 && failCount > 0)   toast(`${m} partial: ${okCount} ok, ${failCount} failed.`, { tone: "warn", duration: 7000 });
-    else if (failCount > 0)                  toast(`${m}: all ${failCount} env ref${failCount===1?"":"s"} failed.`, { tone: "err", duration: 8000 });
+    else if (failCount > 0)                  toast(`${m}: all env refs failed.`, { tone: "err", duration: 8000 });
   }
 
   // ─── Mark a character/location's chosen model (which one to use canonically)
