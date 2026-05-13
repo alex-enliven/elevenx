@@ -3912,13 +3912,10 @@ a { color: inherit; text-decoration: none; }
   color: #9a9aab; letter-spacing: 0.08em; text-transform: uppercase;
   margin-right: 4px;
 }
-/* Force 4 columns at desktop so each character's Seedream/GPT pair stays
-   adjacent on the same row (8 cards = 4 chars × 2 models). Falls back to
-   2 columns on narrower viewports — still keeps the pair together. */
-.s2__grid { display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 12px; }
-@media (max-width: 1100px) {
-  .s2__grid { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
-}
+/* Single-model UI: 4 cast cards or 2 location cards. Use auto-fill so the
+   grid breathes at different viewport widths. ~240px min lets the filmstrip
+   thumbnails stay legible. */
+.s2__grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
 #elx-cast-grid .cast-card, #elx-loc-grid .cast-card { background: #14141a; border: 1px solid #2a2a35; border-radius: 8px; padding: 10px; cursor: pointer; transition: border-color .15s; }
 #elx-cast-grid .cast-card:hover, #elx-loc-grid .cast-card:hover { border-color: #c9a25a; }
 .cast-card__name { font-family: Inter, sans-serif; font-size: 14px; font-weight: 600; color: #e8e8ee; margin-top: 8px; }
@@ -7423,8 +7420,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     activeShotId: null,         // currently open in Shot Editor
   };
 
-  // Image-generation models we A/B compare on the cast bible.
-  // Adding new models = add an entry here + a case in handleGenerateCastRefs.
+  // Image-generation models registry. Both stay wired in the backend so we
+  // can swap or A/B test later. The UI currently shows one model only —
+  // ACTIVE_IMAGE_MODEL — which the user picked after the May 2026 A/B test.
+  // To restore A/B comparison, render two cards per asset again (see git
+  // history) — the backend handlers already accept a modelKey arg.
   const IMAGE_MODELS = {
     seedream: {
       label: "Seedream v4.5",
@@ -7441,6 +7441,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       badge_color: "#10a37f",
     },
   };
+
+  // Single active model — change this constant (or wire it to a Settings
+  // panel in the future) to swap providers. All renders + handlers default
+  // to this. Existing data in other models' buckets stays in IDB untouched.
+  const ACTIVE_IMAGE_MODEL = "gpt";
 
   // ─── Utilities ──────────────────────────────────────────────────────
   const $  = (sel, root = document) => root.querySelector(sel);
@@ -7463,13 +7468,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   // Resolve a single ref URL for a character or environment given an
-  // angle/kind, using its chosenModel (with fallback to the other model
-  // if the chosen model is missing that angle).
+  // angle/kind. Defaults to ACTIVE_IMAGE_MODEL with fallback to the
+  // other model if the active one doesn't have that angle.
   function refUrlFor(asset, angleKey) {
     if (!asset?.refs) return null;
-    const chosen = asset.chosenModel || "seedream";
-    const other  = chosen === "seedream" ? "gpt" : "seedream";
-    return asset.refs[chosen]?.[angleKey]?.dataUrl
+    const primary = asset.chosenModel || ACTIVE_IMAGE_MODEL;
+    const other   = primary === "seedream" ? "gpt" : "seedream";
+    return asset.refs[primary]?.[angleKey]?.dataUrl
         || asset.refs[other]?.[angleKey]?.dataUrl
         || null;
   }
@@ -7667,54 +7672,43 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const grid = $("#elx-cast-grid");
     if (!grid) return;
     grid.innerHTML = "";
-
-    // For each character, render ONE card per IMAGE_MODEL → side-by-side A/B comparison
+    // ONE card per character using the active model's refs
     for (const c of characters) {
-      for (const [modelKey, modelMeta] of Object.entries(IMAGE_MODELS)) {
-        grid.appendChild(buildCastCard(c, modelKey, modelMeta));
-      }
+      grid.appendChild(buildCastCard(c));
     }
   }
 
-  function buildCastCard(c, modelKey, modelMeta) {
+  function buildCastCard(c) {
+    const modelKey  = ACTIVE_IMAGE_MODEL;
+    const modelMeta = IMAGE_MODELS[modelKey];
     const refsForModel = c.refs?.[modelKey] || {};
-    const angleKeys = ["head_on", "three_quarter", "full_body"];
-    const angleLabels = { head_on: "Head", three_quarter: "3/4", full_body: "Full" };
+    const angleKeys    = ["head_on", "three_quarter", "full_body"];
+    const angleLabels  = { head_on: "Head", three_quarter: "3/4", full_body: "Full" };
     const refCount = angleKeys.filter(k => refsForModel[k]?.dataUrl).length;
-    const isChosen = c.chosenModel === modelKey;
-    const otherModelKey = modelKey === "seedream" ? "gpt" : "seedream";
-    const otherHasAny = angleKeys.some(k => c.refs?.[otherModelKey]?.[k]?.dataUrl);
-    // Hero: prefer head_on, fall back through angles in order
     const heroAngle = angleKeys.find(k => refsForModel[k]?.dataUrl) || null;
-    const heroUrl = heroAngle ? refsForModel[heroAngle].dataUrl : null;
+    const heroUrl   = heroAngle ? refsForModel[heroAngle].dataUrl : null;
     const card = document.createElement("div");
-    card.className = `cast-card cast-card--${modelKey}${isChosen ? " is-chosen" : ""}${refCount > 0 && !isChosen && otherHasAny ? " is-dimmed" : ""}`;
+    card.className = `cast-card cast-card--${modelKey}`;
     card.dataset.id = c.id;
-    card.dataset.model = modelKey;
-    // Build the filmstrip: one tile per angle, click swaps the hero
     const filmstrip = angleKeys.map(k => {
       const url = refsForModel[k]?.dataUrl;
       const active = (k === heroAngle) ? " is-active" : "";
-      const inner = url
-        ? `<div class="cast-card__thumb${active}" data-angle="${k}" data-char-id="${esc(c.id)}" data-model="${esc(modelKey)}" style="background-image:url('${url}'); background-size:cover; background-position:top center;" title="${esc(angleLabels[k])}"></div>`
+      return url
+        ? `<div class="cast-card__thumb${active}" data-angle="${k}" data-char-id="${esc(c.id)}" style="background-image:url('${url}'); background-size:cover; background-position:top center;" title="${esc(angleLabels[k])}"></div>`
         : `<div class="cast-card__thumb cast-card__thumb--empty" title="${esc(angleLabels[k])} — not generated yet">·</div>`;
-      return inner;
     }).join("");
     card.innerHTML = `
-      ${isChosen ? `<div class="cast-card__canonical-badge">★ CANONICAL</div>` : ""}
       <div class="cast-card__portrait" data-hero-host style="${heroUrl ? `background-image:url('${heroUrl}'); background-size:cover; background-position:top center;` : ''}">
         ${heroUrl ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(c.id).toUpperCase()}</div>`}
-        <span class="cast-card__model-badge" style="background:${modelMeta.badge_color}22; color:${modelMeta.badge_color}; border:1px solid ${modelMeta.badge_color}55;">${esc(modelMeta.shortLabel)}</span>
         ${heroAngle ? `<span class="cast-card__hero-label">${esc(angleLabels[heroAngle])}</span>` : ""}
       </div>
       <div class="cast-card__filmstrip">${filmstrip}</div>
       <div class="cast-card__name">${esc(c.display_name)}</div>
       <div class="cast-card__role">${esc(c.identity?.age || "")} · ${esc(c.identity?.nationality || "")} · ${esc(c.identity?.archetype || "")}</div>
       <div class="cast-card__palette">${(c.wardrobe?.color_palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
-      <div class="cast-card__meta">${refCount}/3 refs · ${refCount === 3 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'} · <span style="color:#9a9aab">${esc(modelMeta.shortLabel)}</span></div>
-      <div class="cast-card__bottom cast-card__bottom--dual">
-        <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}" data-model="${esc(modelKey)}">${refCount === 3 ? `Re-roll` : `Generate ${3 - refCount}`}</button>
-        <button class="btn btn--sm ${isChosen ? "cast-card__choose cast-card__choose--active" : "cast-card__choose"}" data-action="choose-canonical" data-asset-kind="character" data-asset-id="${esc(c.id)}" data-model="${esc(modelKey)}" ${refCount === 0 ? "disabled" : ""}>${isChosen ? "★ Chosen" : "Use these"}</button>
+      <div class="cast-card__meta">${refCount}/3 refs · ${refCount === 3 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'}</div>
+      <div class="cast-card__bottom">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}">${refCount === 3 ? `Re-roll` : `Generate ${3 - refCount} angle${3-refCount===1?"":"s"}`}</button>
       </div>
     `;
     return card;
@@ -7725,50 +7719,41 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const grid = $("#elx-loc-grid");
     if (!grid) return;
     grid.innerHTML = "";
-    // Same A/B pattern as the cast tab — one card per (location × model).
     for (const e of envs) {
-      for (const [modelKey, modelMeta] of Object.entries(IMAGE_MODELS)) {
-        grid.appendChild(buildLocationCard(e, modelKey, modelMeta));
-      }
+      grid.appendChild(buildLocationCard(e));
     }
   }
 
-  function buildLocationCard(e, modelKey, modelMeta) {
+  function buildLocationCard(e) {
+    const modelKey  = ACTIVE_IMAGE_MODEL;
     const refsForModel = e.refs?.[modelKey] || {};
     const kindKeys = ["wide", "detail"];
     const kindLabels = { wide: "Wide", detail: "Detail" };
     const refCount = kindKeys.filter(k => refsForModel[k]?.dataUrl).length;
-    const isChosen = e.chosenModel === modelKey;
-    const otherModelKey = modelKey === "seedream" ? "gpt" : "seedream";
-    const otherHasAny = kindKeys.some(k => e.refs?.[otherModelKey]?.[k]?.dataUrl);
     const heroKind = kindKeys.find(k => refsForModel[k]?.dataUrl) || null;
-    const heroUrl = heroKind ? refsForModel[heroKind].dataUrl : null;
+    const heroUrl  = heroKind ? refsForModel[heroKind].dataUrl : null;
     const card = document.createElement("div");
-    card.className = `cast-card cast-card--loc cast-card--${modelKey}${isChosen ? " is-chosen" : ""}${refCount > 0 && !isChosen && otherHasAny ? " is-dimmed" : ""}`;
+    card.className = `cast-card cast-card--loc cast-card--${modelKey}`;
     card.dataset.id = e.id;
-    card.dataset.model = modelKey;
     const filmstrip = kindKeys.map(k => {
       const url = refsForModel[k]?.dataUrl;
       const active = (k === heroKind) ? " is-active" : "";
       return url
-        ? `<div class="cast-card__thumb cast-card__thumb--loc${active}" data-loc-kind="${k}" data-loc-id="${esc(e.id)}" data-model="${esc(modelKey)}" style="background-image:url('${url}'); background-size:cover; background-position:center;" title="${esc(kindLabels[k])}"></div>`
+        ? `<div class="cast-card__thumb cast-card__thumb--loc${active}" data-loc-kind="${k}" data-loc-id="${esc(e.id)}" style="background-image:url('${url}'); background-size:cover; background-position:center;" title="${esc(kindLabels[k])}"></div>`
         : `<div class="cast-card__thumb cast-card__thumb--loc cast-card__thumb--empty" title="${esc(kindLabels[k])} — not generated yet">·</div>`;
     }).join("");
     card.innerHTML = `
-      ${isChosen ? `<div class="cast-card__canonical-badge">★ CANONICAL</div>` : ""}
       <div class="cast-card__portrait" data-hero-host style="${heroUrl ? `background-image:url('${heroUrl}'); background-size:cover; background-position:center;` : ''}">
         ${heroUrl ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px;">${esc(e.id).toUpperCase()}</div>`}
-        <span class="cast-card__model-badge" style="background:${modelMeta.badge_color}22; color:${modelMeta.badge_color}; border:1px solid ${modelMeta.badge_color}55;">${esc(modelMeta.shortLabel)}</span>
         ${heroKind ? `<span class="cast-card__hero-label">${esc(kindLabels[heroKind])}</span>` : ""}
       </div>
       <div class="cast-card__filmstrip cast-card__filmstrip--loc">${filmstrip}</div>
       <div class="cast-card__name">${esc(e.display_name)}</div>
       <div class="cast-card__role">${esc(e.architecture?.type || "")}</div>
       <div class="cast-card__palette">${(e.palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
-      <div class="cast-card__meta">${refCount}/2 refs · ${refCount === 2 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'} · <span style="color:#9a9aab">${esc(modelMeta.shortLabel)}</span></div>
-      <div class="cast-card__bottom cast-card__bottom--dual">
-        <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}" data-model="${esc(modelKey)}">${refCount === 2 ? `Re-roll` : `Generate ${2 - refCount}`}</button>
-        <button class="btn btn--sm ${isChosen ? "cast-card__choose cast-card__choose--active" : "cast-card__choose"}" data-action="choose-canonical" data-asset-kind="environment" data-asset-id="${esc(e.id)}" data-model="${esc(modelKey)}" ${refCount === 0 ? "disabled" : ""}>${isChosen ? "★ Chosen" : "Use these"}</button>
+      <div class="cast-card__meta">${refCount}/2 refs · ${refCount === 2 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'}</div>
+      <div class="cast-card__bottom">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}">${refCount === 2 ? `Re-roll` : `Generate ${2 - refCount} ref${2-refCount===1?"":"s"}`}</button>
       </div>
     `;
     return card;
@@ -8423,10 +8408,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
     const action = target.dataset.action;
     e.preventDefault();
-    if (action === "gen-cast")          handleGenerateCastRefs(target.dataset.charId, target.dataset.model || "seedream");
-    else if (action === "gen-env")      handleGenerateEnvRefs(target.dataset.locId, target.dataset.model || "seedream");
+    if (action === "gen-cast")          handleGenerateCastRefs(target.dataset.charId, target.dataset.model || ACTIVE_IMAGE_MODEL);
+    else if (action === "gen-env")      handleGenerateEnvRefs(target.dataset.locId, target.dataset.model || ACTIVE_IMAGE_MODEL);
     else if (action === "choose-canonical") handleChooseCanonical(target.dataset.assetKind, target.dataset.assetId, target.dataset.model);
-    else if (action === "batch-gen" || action === "batch-reroll") handleBatch(action, target.dataset.batchTab || "cast", target.dataset.batchModel || "seedream");
+    else if (action === "batch-gen" || action === "batch-reroll") handleBatch(action, target.dataset.batchTab || "cast", target.dataset.batchModel || ACTIVE_IMAGE_MODEL);
     else if (action === "roll-shot")    handleRollShot(target.dataset.shotId);
     else if (action === "open-shot-editor") {
       document.querySelectorAll(".proto-tab").forEach(t => t.classList.toggle("is-active", t.dataset.screen === "s4"));
@@ -8452,10 +8437,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           </div>
           <div class="s2__batch" id="elx-batch-bar">
             <span class="s2__batch-label">Batch:</span>
-            <button class="btn btn--sm btn--ghost" data-action="batch-gen"     data-batch-tab="cast" data-batch-model="seedream">Seedream all</button>
-            <button class="btn btn--sm btn--ghost" data-action="batch-gen"     data-batch-tab="cast" data-batch-model="gpt">GPT all</button>
-            <button class="btn btn--sm btn--ghost" data-action="batch-reroll"  data-batch-tab="cast" data-batch-model="seedream">Re-roll Seedream</button>
-            <button class="btn btn--sm btn--ghost" data-action="batch-reroll"  data-batch-tab="cast" data-batch-model="gpt">Re-roll GPT</button>
+            <button class="btn btn--sm btn--ghost" data-action="batch-gen"    data-batch-tab="cast">Generate all</button>
+            <button class="btn btn--sm btn--ghost" data-action="batch-reroll" data-batch-tab="cast">Re-roll all</button>
           </div>
           <div class="s2__spacer"></div>
           <button class="btn btn--ghost btn--sm" data-action="open-connection">Connection</button>
