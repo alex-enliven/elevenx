@@ -3900,8 +3900,18 @@ a { color: inherit; text-decoration: none; }
   cursor: not-allowed;
 }
 .s2 { padding: 16px 24px; }
-.s2__toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.s2__toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
 .s2__spacer { flex: 1; }
+.s2__batch {
+  display: flex; align-items: center; gap: 6px;
+  padding-left: 12px; margin-left: 8px;
+  border-left: 1px solid #2a2a35;
+}
+.s2__batch-label {
+  font-size: 11px; font-family: 'JetBrains Mono', monospace;
+  color: #9a9aab; letter-spacing: 0.08em; text-transform: uppercase;
+  margin-right: 4px;
+}
 /* Force 4 columns at desktop so each character's Seedream/GPT pair stays
    adjacent on the same row (8 cards = 4 chars × 2 models). Falls back to
    2 columns on narrower viewports — still keeps the pair together. */
@@ -3917,7 +3927,10 @@ a { color: inherit; text-decoration: none; }
 .cast-card__sw { display: inline-block; width: 14px; height: 14px; border-radius: 3px; }
 .cast-card__meta { font-size: 11px; color: #9a9aab; margin-top: 8px; font-family: 'JetBrains Mono', monospace; }
 .cast-card__bottom { margin-top: 10px; }
-.cast-card__cta { width: 100%; }
+/* Single-button bottom (legacy) */
+.cast-card__bottom:not(.cast-card__bottom--dual) .cast-card__cta { width: 100%; }
+/* Dual-button bottom needs flex children, NOT 100% width on either */
+.cast-card__bottom--dual .cast-card__cta { width: auto !important; }
 .s3 { padding: 16px 24px; }
 .shot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 .shot { background: #14141a; border: 1px solid #2a2a35; border-left: 1px solid #2a2a35; border-radius: 8px; padding: 10px; cursor: pointer; transition: border-color .15s; }
@@ -8035,6 +8048,64 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (failCount > 0)                  toast(`${m}: all env refs failed.`, { tone: "err", duration: 8000 });
   }
 
+  // ─── Batch: roll or re-roll all characters / all locations for one model
+  // Runs sequentially so the user sees progress per asset, and so we don't
+  // hammer the API in parallel (fal & OpenAI both have rate limits).
+  async function handleBatch(action, tab, modelKey) {
+    if (!IMAGE_MODELS[modelKey]) { toast(`Unknown model: ${modelKey}`, { tone: "err" }); return; }
+    const client = (modelKey === "seedream") ? State.fal : State.openai;
+    if (!client) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
+
+    const isCast = tab === "cast";
+    const items = await Storage.getAll(isCast ? "characters" : "environments");
+    if (items.length === 0) { toast(`No ${isCast ? "characters" : "locations"} to roll.`); return; }
+
+    const force = action === "batch-reroll";
+    const verb = force ? "Re-rolling" : "Generating";
+    const modelLabel = IMAGE_MODELS[modelKey].shortLabel;
+
+    // Estimate cost preview before firing
+    const angleCount = isCast ? 3 : 2;
+    const perImg = IMAGE_MODELS[modelKey].cost_per_image_usd;
+    const estItems = items.filter(it => {
+      if (force) return true;
+      const bucket = it.refs?.[modelKey] || {};
+      const keys = isCast ? ["head_on","three_quarter","full_body"] : ["wide","detail"];
+      return keys.some(k => !bucket[k]?.dataUrl);
+    });
+    const estCost = estItems.length * angleCount * perImg;
+    if (estItems.length === 0) {
+      toast(`All ${tab} already have ${modelLabel} refs. Use "Re-roll" to regenerate.`, { tone: "warn" });
+      return;
+    }
+    if (!confirm(`${verb} ${estItems.length} ${isCast ? "character" : "location"}${estItems.length===1?"":"s"} via ${modelLabel}.\nEstimated cost: $${estCost.toFixed(2)} (~${estItems.length * angleCount} images).\n\nProceed?`)) return;
+
+    State.batchActive = true;
+    let completed = 0;
+    for (const item of items) {
+      if (!State.batchActive) break;
+      const id = isCast ? item.id : item.id;
+      // If force re-roll, clear the bucket so chain restarts from scratch
+      if (force) {
+        item.refs = item.refs || {};
+        item.refs[modelKey] = {};
+        await Storage.put(isCast ? "characters" : "environments", item);
+        if (isCast) renderCastTab(); else renderLocationTab();
+      }
+      setGPS(true, `${verb} <span class="mono">${esc(id)}</span>`, `${IMAGE_MODELS[modelKey].label} · ${completed+1}/${items.length}`, ((completed)/items.length) * 100);
+      try {
+        if (isCast) await handleGenerateCastRefs(id, modelKey);
+        else        await handleGenerateEnvRefs(id, modelKey);
+      } catch (err) {
+        console.error("[batch]", err);
+      }
+      completed++;
+    }
+    State.batchActive = false;
+    setGPS(false);
+    toast(`Batch ${force ? "re-roll" : "generate"} complete · ${completed}/${items.length} ${tab} via ${modelLabel}.`);
+  }
+
   // ─── Mark a character/location's chosen model (which one to use canonically)
   async function handleChooseCanonical(assetKind, assetId, modelKey) {
     if (!assetKind || !assetId || !modelKey) return;
@@ -8277,6 +8348,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (action === "gen-cast")          handleGenerateCastRefs(target.dataset.charId, target.dataset.model || "seedream");
     else if (action === "gen-env")      handleGenerateEnvRefs(target.dataset.locId, target.dataset.model || "seedream");
     else if (action === "choose-canonical") handleChooseCanonical(target.dataset.assetKind, target.dataset.assetId, target.dataset.model);
+    else if (action === "batch-gen" || action === "batch-reroll") handleBatch(action, target.dataset.batchTab || "cast", target.dataset.batchModel || "seedream");
     else if (action === "roll-shot")    handleRollShot(target.dataset.shotId);
     else if (action === "open-shot-editor") {
       document.querySelectorAll(".proto-tab").forEach(t => t.classList.toggle("is-active", t.dataset.screen === "s4"));
@@ -8292,17 +8364,20 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   function adaptScreenTwo() {
     const s2 = $("#screen-s2");
     if (!s2) return;
-    // Use a unique elx-* sentinel — the v2 mockup already ships with
-    // a .cast-grid class on its static cards, so checking that class
-    // would always bail. Force-replace the mockup's static content.
-    if ($("#elx-cast-grid", s2)) return; // already adapted on a previous init
-    // Replace whatever was there with our two grids + toggle
+    if ($("#elx-cast-grid", s2)) return;
     s2.innerHTML = `
       <div class="s2">
         <div class="s2__toolbar">
           <div class="seg seg--filter" data-comment-anchor="s2-toggle">
             <button class="seg__btn is-active" data-s2-tab="cast">Cast <span class="count" id="elx-cast-count">0</span></button>
             <button class="seg__btn" data-s2-tab="loc">Locations <span class="count" id="elx-loc-count">0</span></button>
+          </div>
+          <div class="s2__batch" id="elx-batch-bar">
+            <span class="s2__batch-label">Batch:</span>
+            <button class="btn btn--sm btn--ghost" data-action="batch-gen"     data-batch-tab="cast" data-batch-model="seedream">Seedream all</button>
+            <button class="btn btn--sm btn--ghost" data-action="batch-gen"     data-batch-tab="cast" data-batch-model="gpt">GPT all</button>
+            <button class="btn btn--sm btn--ghost" data-action="batch-reroll"  data-batch-tab="cast" data-batch-model="seedream">Re-roll Seedream</button>
+            <button class="btn btn--sm btn--ghost" data-action="batch-reroll"  data-batch-tab="cast" data-batch-model="gpt">Re-roll GPT</button>
           </div>
           <div class="s2__spacer"></div>
           <button class="btn btn--ghost btn--sm" data-action="open-connection">Connection</button>
@@ -8311,13 +8386,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         <div class="loc-grid s2__grid"  id="elx-loc-grid"  style="display:none"></div>
       </div>
     `;
-    // Toggle
+    // Toggle — also retargets the batch buttons to cast or loc
     s2.querySelectorAll("[data-s2-tab]").forEach(b => {
       b.addEventListener("click", () => {
         const which = b.dataset.s2Tab;
         s2.querySelectorAll("[data-s2-tab]").forEach(x => x.classList.toggle("is-active", x === b));
         $("#elx-cast-grid").style.display = which === "cast" ? "" : "none";
         $("#elx-loc-grid").style.display  = which === "loc"  ? "" : "none";
+        // Retarget batch buttons
+        $$("#elx-batch-bar [data-batch-tab]").forEach(btn => btn.dataset.batchTab = which);
       });
     });
   }
