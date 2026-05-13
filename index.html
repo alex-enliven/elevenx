@@ -5813,7 +5813,12 @@ window.ElevenX.FalClient = class {
     }
     this.workerUrl = (opts.workerUrl || "").replace(/\/+$/, "");
     this.onLog = opts.onLog || (() => {});
-    this.fetch = opts.fetch || globalThis.fetch;
+    // Native fetch requires `this === Window` to run. Storing a reference
+    // via `this.fetch = globalThis.fetch` and calling `this.fetch(...)` rebinds
+    // `this` to the FalClient instance, which trips "Illegal invocation".
+    // Bind to globalThis (or accept an injected mock for tests).
+    const fetchImpl = opts.fetch || globalThis.fetch;
+    this.fetch = fetchImpl ? fetchImpl.bind(globalThis) : null;
     if (!this.fetch && !this.dryRun) {
       throw new Error("FalClient: no fetch implementation available");
     }
@@ -7313,6 +7318,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     State.activeJobs++;
     const angles = ["head_on", "three_quarter", "full_body"];
+    let okCount = 0, failCount = 0;
     for (const angle of angles) {
       if (c.refs?.[angle]?.dataUrl) continue; // skip approved
       setGPS(true, `Generating <span class="mono">${esc(charId)} · ${angle}</span>`, "seedream-v4.5", 20);
@@ -7320,7 +7326,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         const prompt = composer.composeCastReferencePrompt(c, angle);
         const result = await State.fal.seedreamTextToImage(prompt);
         const imgUrl = result?.images?.[0]?.url;
-        if (!imgUrl) { toast(`Failed for ${charId}/${angle}: no image in response`, { tone: "err" }); continue; }
+        if (!imgUrl) { toast(`Failed for ${charId}/${angle}: no image in response`, { tone: "err" }); failCount++; continue; }
         // Download image as data URL for offline persistence
         const blob = await fetch(imgUrl).then(r => r.blob());
         const dataUrl = await blobToDataUrl(blob);
@@ -7329,14 +7335,18 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         await Storage.put("characters", c);
         await trackCost(0.05, `seedream cast ${charId}/${angle}`);
         renderCastTab();
+        okCount++;
       } catch (err) {
         console.error(err);
         toast(`Error: ${err.message}`, { tone: "err" });
+        failCount++;
       }
     }
     setGPS(false);
     State.activeJobs--;
-    toast(`Cast bible for ${c.display_name} updated.`);
+    if (okCount > 0 && failCount === 0)      toast(`Cast bible for ${c.display_name}: ${okCount} angle${okCount===1?"":"s"} added.`);
+    else if (okCount > 0 && failCount > 0)   toast(`Partial: ${okCount} succeeded, ${failCount} failed. Retry to fill in the gaps.`, { tone: "warn", duration: 7000 });
+    else if (failCount > 0)                  toast(`All ${failCount} angle${failCount===1?"":"s"} failed. See errors above; check console.`, { tone: "err", duration: 8000 });
   }
 
   async function handleGenerateEnvRefs(locId) {
@@ -7345,6 +7355,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (!e) return;
 
     State.activeJobs++;
+    let okCount = 0, failCount = 0;
     for (const kind of ["wide", "detail"]) {
       if (e.refs?.[kind]?.dataUrl) continue;
       setGPS(true, `Generating <span class="mono">${esc(locId)} · ${kind}</span>`, "seedream-v4.5", 30);
@@ -7352,7 +7363,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         const prompt = composer.composeEnvironmentReferencePrompt(e, kind);
         const result = await State.fal.seedreamTextToImage(prompt);
         const imgUrl = result?.images?.[0]?.url;
-        if (!imgUrl) { toast(`Failed: ${locId}/${kind}`, { tone: "err" }); continue; }
+        if (!imgUrl) { toast(`Failed: ${locId}/${kind}`, { tone: "err" }); failCount++; continue; }
         const blob = await fetch(imgUrl).then(r => r.blob());
         const dataUrl = await blobToDataUrl(blob);
         e.refs = e.refs || {};
@@ -7360,14 +7371,18 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         await Storage.put("environments", e);
         await trackCost(0.05, `seedream env ${locId}/${kind}`);
         renderLocationTab();
+        okCount++;
       } catch (err) {
         console.error(err);
         toast(`Error: ${err.message}`, { tone: "err" });
+        failCount++;
       }
     }
     setGPS(false);
     State.activeJobs--;
-    toast(`Environment ${e.display_name} updated.`);
+    if (okCount > 0 && failCount === 0)      toast(`Environment ${e.display_name}: ${okCount} ref${okCount===1?"":"s"} added.`);
+    else if (okCount > 0 && failCount > 0)   toast(`Partial: ${okCount} succeeded, ${failCount} failed.`, { tone: "warn", duration: 7000 });
+    else if (failCount > 0)                  toast(`All ${failCount} env ref${failCount===1?"":"s"} failed. Check console.`, { tone: "err", duration: 8000 });
   }
 
   async function handleRollShot(shotId) {
