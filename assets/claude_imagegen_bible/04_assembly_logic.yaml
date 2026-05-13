@@ -1,0 +1,481 @@
+# ELDORATH — PROMPT ASSEMBLY LOGIC AND SYSTEM ARCHITECTURE
+# Implementation guidance for Claude Code building against the OpenAI Images API.
+
+version: "1.0"
+
+# ============================================================================
+# PROMPT ASSEMBLY ORDER
+# ============================================================================
+# Each prompt is assembled from these blocks IN THIS ORDER. Order matters —
+# the model weights early instructions more heavily than late ones.
+
+assembly_order:
+
+  block_1_format_directive:
+    description: "Single A4 portrait, full-bleed, no left-page elements"
+    template: |
+      Generate ONE single A4 portrait illustration (1:1.414 ratio), full-bleed,
+      perfectly rectangular canvas. This is the right-page artwork for a
+      children's fantasy book spread; it will be composed into a full A3
+      landscape spread in HTML post-production. Do NOT generate parchment,
+      decorative borders, or any left-page elements — only the right-page
+      scene illustration as a single A4 portrait image.
+    source: "static — same in every prompt"
+
+  block_2_reference_acknowledgment:
+    description: "Acknowledge attached references and require style match"
+    template: |
+      The {N} attached images are the locked visual references for this
+      Eldorath book project: {reference_list}. Match their exact visual
+      style, painterly rendering, character designs, costume colors, ages,
+      and proportions. Characters in this scene must look identical to
+      those references.
+    source: "computed from spread spec reference_attachments"
+
+  block_3_style_anchor:
+    description: "Locked style description"
+    template: |
+      Visual style: cinematic stylized animated fantasy, inspired by Arcane
+      and K-pop Demon Hunters. Premium children's fantasy film look. Soft
+      painterly rendering but sharp enough for print. Rich contrast,
+      expressive youthful faces, magical glow where appropriate, strong
+      cinematic lighting.
+    source: "static from composition rules"
+
+  block_4_format_invariants:
+    description: "The four hard format rules — restated in every prompt"
+    template: |
+      FORMAT INVARIANTS (must hold):
+      1. A4 portrait orientation (1:1.414, taller than wide)
+      2. Leftmost 6% atmospheric blend zone fading to warm parchment-cream — only soft mist, drifting motes, soft light
+      3. Leftmost 8% clear of characters, weapons, hard focal elements
+      4. Focal point at 60–70% across portrait width
+    source: "static — verbatim in every prompt"
+
+  block_5_location:
+    description: "Setting and phase color"
+    template: |
+      LOCATION: {location_name} — {atmospheric_details}. Phase color: {phase_color}.
+    source: "from spread spec location"
+
+  block_6_the_moment:
+    description: "THE LONGEST BLOCK — verb-driven action description"
+    template: |
+      THE MOMENT — verb: {VERB}.
+      {focal_description}
+
+      The viewer's eye lands first on {eye_path[0]}, second on {eye_path[1]},
+      third on {eye_path[2]}, fourth on {eye_path[3]}.
+    source: "from spread spec the_moment"
+    rule: "this block must be longer than any other block in the prompt"
+
+  block_7_cast_in_focus:
+    description: "1-3 in-focus characters with absolute identifiers"
+    template: |
+      CAST IN FOCUS:
+      {for each character in cast.in_focus:
+        - {CHARACTER_NAME_UPPERCASE} ({action}): {full canon description from character identity sheet, including age_descriptor, hair, eyes, skin, build, outfit, weapon, color_palette}. {arc_signature_expression if applicable}.
+      }
+    source: "from spread spec cast.in_focus + character identity sheet"
+    rule: "always inject ALL canon details from the character identity sheet, not just the spread-specific action"
+
+  block_8_background_presence:
+    description: "0-3 background characters with brief description only"
+    template: |
+      BACKGROUND PRESENCE:
+      {for each character in cast.background_presence:
+        - {CHARACTER_NAME_UPPERCASE} ({position}): {minimal canon identifiers — hair color, outfit signature, weapon. NO full description.}
+      }
+    source: "from spread spec cast.background_presence"
+    rule: "background characters get minimal description; over-detailing them causes the model to weight them as compositionally equivalent to focal characters"
+
+  block_9_off_frame:
+    description: "Explicit list of absent characters"
+    template: |
+      OFF-FRAME: {for each character in cast.off_frame: {character_name} ({reason})}.
+    source: "from spread spec cast.off_frame"
+    fynn_special_case: |
+      For spreads 9-27, always include an explicit Fynn absence directive:
+      "Fynn (taken in spread 8, absent — no green dragon anywhere in the image)."
+
+  block_10_emotional_focus:
+    description: "One sentence on emotional weight"
+    template: |
+      EMOTIONAL FOCUS: {emotional_focus}.
+    source: "from spread spec emotional_focus"
+
+  block_11_lighting:
+    description: "Lighting cue tied to phase color and moment mood"
+    template: |
+      LIGHTING: {primary_source} dominant. {secondary_source}. {contrast_mechanic}.
+    source: "from spread spec lighting"
+
+  block_12_map_status:
+    description: "Current state of the map if visible"
+    template: |
+      MAP STATUS: {map_status}.
+    source: "from spread spec map_status"
+    optional: "skip block if map is not in the scene"
+
+  block_13_age_hierarchy:
+    description: "Strict age hierarchy enforcement"
+    template: |
+      Strict age hierarchy: Lina is 7 and clearly the smallest/youngest with
+      soft childlike features. Damian is 11, broader stocky child build but
+      still a child, no adult facial features, no stubble. Lionn and Zaya
+      are 12 and clearly pre-teens. Alex is the only adult, significantly
+      taller than every child — at least one head and a half above the
+      12-year-olds, mature face with adult stubble, adult build.
+    source: "static — slight phrasing variation acceptable per spread"
+
+  block_14_cast_distinctiveness_rule:
+    description: "Anti-collapse rule for multi-character action scenes"
+    condition: "cast_lockdown_required == true OR (count(in_focus) + count(background_presence)) >= 4"
+    template: |
+      VISUAL DISTINCTIVENESS RULE: in this image, the four children must be
+      CLEARLY DISTINGUISHABLE from each other AND from Alex at a glance.
+      Three different hair colors among the boys (Lionn dark brown, Zaya
+      light blond, Damian warm honey-blond — NOT dark brown, NOT light blond,
+      a clearly distinct middle color). Four different outfit colors (Lionn
+      dark navy blue with golden lion emblem, Zaya ivory-white with light
+      blue accents, Damian dark forest-green with bronze ram-horn belt, Lina
+      soft purple with gold embroidery). Three different weapons among the
+      boys (Lionn narrow sword, Zaya twin short blades, Damian heavy hammer).
+      One adult: Alex, significantly taller, mature face with stubble, broad
+      adult build. No character should be visually confusable with another.
+    source: "static when triggered"
+
+  block_15_negative_prompt:
+    description: "Universal negative prompt + spread-specific anti-failure clauses"
+    template: |
+      Negative prompt: no readable text, no panels, no parchment, no
+      decorative border, no aspect ratio other than A4 portrait, no oil
+      painting, no watercolor, no flat children's-book cartoon, no sketch
+      style, no photorealism, no muddy faces, no modern objects, no
+      watermark, no deformed hands, no warped faces, no adult-looking
+      children, no characters facing the camera in a posed lineup, no
+      symmetrical hero-shot composition, no characters or focal elements
+      in the leftmost 8% of the portrait, no horror, no gore.
+      {spread_specific_negatives_from_watch_points}
+    source: "static base + spread spec watch_points failure descriptions"
+
+# ============================================================================
+# CHARACTER LOCKDOWN INJECTOR
+# ============================================================================
+# When a character is in cast.in_focus, the prompt assembler inserts the
+# FULL canon description from the character identity sheet. This is the
+# single most important reliability mechanism.
+
+character_lockdown_injector:
+  rule: |
+    For each character in cast.in_focus, inject EVERY field from the
+    character identity sheet:
+    - age_descriptor
+    - hair (color, length, texture)
+    - eyes
+    - skin
+    - build
+    - outfit (top, signature, bottom, footwear)
+    - weapon
+    - color_palette
+
+    For high-stability-risk characters (Damian, Alex), also inject:
+    - the 'never' list as anti-pattern statements
+    - the stability_note as guidance
+
+  damian_specific_injection: |
+    Damian is the highest-failure character in production. When Damian is
+    in cast.in_focus, always inject the following anti-comparison block:
+
+    "Damian has warm honey-blond hair — NOT dark brown like Lionn, NOT
+    light blond like Zaya. He wears a dark forest-green leather vest with
+    a bronze ram-horn belt buckle — NOT dark blue, NOT a lion emblem,
+    NOT ivory-white. He carries a heavy compact hammer — NOT a sword,
+    NOT twin blades. Stocky square-shouldered child build, pre-teen face
+    with no stubble. He must be visually distinguishable from Lionn and
+    Zaya at a glance through three identifiers: hair color, outfit color,
+    weapon."
+
+  alex_specific_injection: |
+    Alex's two failure modes are scale loss and weapon-archetype instability.
+    When Alex is in any cast block, always inject:
+
+    "Alex is significantly taller than every child in the frame — at least
+    a head and a half above the 12-year-olds. Mature adult face with adult
+    stubble. Broad adult shoulders, slightly overweight warrior build.
+    Weathered brown leather chest armor with a faded family-lion mark on
+    the chest. He carries a long sword + small round arm-shield (NOT a
+    hammer, NOT twin blades, NOT a shield-blade hybrid)."
+
+# ============================================================================
+# REGENERATE PROMPT GENERATOR
+# ============================================================================
+
+regenerate_generator:
+  inputs:
+    - "the original prompt"
+    - "the failure mode classification (from failure_modes taxonomy)"
+    - "specific characters or composition elements that failed"
+
+  required_blocks_in_regenerate:
+    - "header — diagnose the specific failure"
+    - "FORMAT INVARIANTS — verbatim restate all four"
+    - "CORRECTION — what specifically needs to change"
+    - "KEEP from the previous generation — explicit list of correct elements that must not change"
+    - "character lockdown for any character involved in the failure"
+    - "negative prompt — including spread-specific anti-failure clauses"
+
+  template: |
+    The previous Spread {N} generation has {failure_description}.
+    {specific_diagnosis}
+
+    Re-render with the same {list_of_correct_elements} — keep all of that.
+    {specific_corrections_needed}.
+
+    {character_lockdown_block — pulled from character identity sheet for each affected character}
+
+    KEEP from the previous generation:
+    {explicit_list_of_correct_elements_to_preserve}
+
+    FORMAT INVARIANTS (must hold):
+    1. A4 portrait orientation (1:1.414, taller than wide)
+    2. Leftmost 6% atmospheric blend zone fading to warm parchment-cream
+    3. Leftmost 8% clear of characters, weapons, hard focal elements
+    4. Focal point at 60–70% across portrait width
+
+    NEGATIVE for this regenerate:
+    {spread_specific_anti_failure_clauses}
+
+    Same Arcane / K-pop Demon Hunters style. Same negative prompt as
+    the established standard.
+
+# ============================================================================
+# ACCEPTANCE GATE
+# ============================================================================
+
+acceptance_gate:
+  description: "Programmatic checks before human review"
+  automatable_checks:
+    - check: "aspect ratio is A4 portrait (1:1.414)"
+      method: "compare image dimensions"
+    - check: "image is rectangular (not panel-strip)"
+      method: "check for internal panel divisions"
+    - check: "no readable text in image"
+      method: "OCR pass; flag if any readable text detected"
+  human_review_required:
+    - "character distinctiveness (no Damian-Lionn collapse)"
+    - "Alex scale appropriate (significantly taller than children)"
+    - "weapon assignments correct"
+    - "no duplicate characters"
+    - "Fynn absent in spreads 9-27 / present in correct spreads"
+    - "moment vs portrait test (does it read as a moment or as a hero shot?)"
+    - "leftmost blend zone present"
+    - "phase color matches chapter"
+
+  v6_16_point_checklist:
+    - "Output is one A4 portrait (1:1.414), no panel-strip?"
+    - "No parchment, no decorative border, no compass, no medallion in the generated portrait?"
+    - "Reads first as a MOMENT or first as a PORTRAIT? (If portrait: regenerate)"
+    - "Is the verb of the spread visually visible — can you see what is happening in 3 seconds?"
+    - "Focal point at 60-70% portrait width (right of portrait midline)?"
+    - "Leftmost 8% clear of hard focal elements?"
+    - "Leftmost 6% contains only soft atmospheric elements?"
+    - "Left edge fades to warm parchment-cream (no hard edge)?"
+    - "Style matches hero/villain/cover reference + Spread 1?"
+    - "Characters consistent with canon and earlier spreads in this chapter?"
+    - "Lina visibly 7, smallest character?"
+    - "Damian visibly 11, no adult features even in action poses?"
+    - "Alex the only adult-looking human, scale appropriate?"
+    - "Fynn absent in spreads 9-27 (only Pyra)?"
+    - "Cast in focus is 1-3 characters; no all-5-plus-dragons lineup unless scene requires it?"
+    - "No text in the portrait?"
+
+# ============================================================================
+# API VS CHATGPT ADAPTATION
+# ============================================================================
+
+api_adaptation_notes:
+  difference_from_chatgpt_testing: |
+    Production testing for this book happened in ChatGPT, where same-conversation
+    continuity preserved character details across multiple generations
+    implicitly. The OpenAI Images API does not preserve conversation context
+    between calls — each API call is independent.
+
+  implications_for_claude_code:
+    - "Cannot rely on 'same conversation' character continuity"
+    - "Reference images must be attached to every API call where that character is in focus"
+    - "Character identity sheet injection becomes the primary reliability mechanism"
+    - "Test reference-image attachment reliability before committing to multi-spread workflows"
+
+  reference_image_strategy:
+    rule: |
+      Attach reference images to every API call. Frequency:
+      - hero_lineup: every spread
+      - villain_sheet: every spread where the villain (or Drakenkoningin) is in focus
+      - spread_1_world_map: spreads 1, 2, 9, 10, 32 minimum (anywhere world geography matters)
+      - most_recent_approved_spread_in_chapter: every spread within a chapter
+        after the first spread
+
+    parchment_template:
+      rule: "NEVER attach the parchment template to AI generation calls. Parchment is composed in HTML post-production. Including it as a reference signals to the model that parchment is part of the scene, which causes parchment-creep failures."
+
+# ============================================================================
+# SYSTEM ARCHITECTURE — FUNCTIONAL DECOMPOSITION
+# ============================================================================
+
+system_components:
+
+  prompt_assembler:
+    inputs:
+      - "spread spec (YAML/JSON from 03_spread_template format)"
+      - "character identity sheet (01_characters.yaml)"
+      - "composition rules (02_composition_and_failures.yaml)"
+    output: "complete API-ready prompt string"
+    logic:
+      - "iterate through assembly_order blocks"
+      - "for each block, fill template from spread spec or static rules"
+      - "for cast blocks, inject full canon descriptions from character identity sheet"
+      - "for high-risk characters (Damian, Alex), inject anti-pattern reminders"
+      - "if cast_lockdown_required, inject visual distinctiveness rule"
+      - "merge spread-specific watch_points into negative prompt"
+
+  failure_mode_pre_check:
+    description: "Scan the assembled prompt for known anti-patterns BEFORE sending"
+    checks:
+      - "does the prompt describe Damian relationally? (e.g., 'between', 'unlike') → flag"
+      - "does the prompt mention 'shield-blade hybrid'? → replace with 'long sword + arm shield'"
+      - "for spreads 9-27, is Fynn absence explicit? → flag if missing"
+      - "for action scenes with 4+ characters, is the visual distinctiveness rule present? → flag if missing"
+      - "does THE MOMENT block exceed CAST IN FOCUS block in length? → flag if not"
+
+  reference_image_attacher:
+    description: "Per-call reference attachment based on spread spec"
+    logic: "consult spread spec reference_attachments list; pull image files from canonical reference store"
+
+  api_caller:
+    description: "Send to OpenAI Images API or equivalent"
+    note: "abstract this layer so the system can be retargeted to different image generation backends"
+
+  response_processor:
+    description: "Receive image, run automated acceptance checks"
+    logic:
+      - "verify aspect ratio (A4 portrait)"
+      - "OCR pass for text detection"
+      - "save to staging area for human review"
+
+  surgical_regenerate_generator:
+    inputs:
+      - "failed image"
+      - "failure mode classification"
+      - "original prompt"
+    output: "surgical regenerate prompt"
+    logic:
+      - "consult failure_modes taxonomy for the specific failure"
+      - "use the surgical_regenerate_template for that failure"
+      - "always restate the four format invariants"
+      - "always specify what to KEEP from the previous generation"
+
+  conversation_strategy_router:
+    description: "Decide whether to use new conversation or continued conversation per spread"
+    logic:
+      - "if API mode: every call is effectively a new conversation; reference images carry continuity"
+      - "if ChatGPT mode: combat-heavy chapters get new conversations; quiet chapters can continue"
+
+# ============================================================================
+# IMPLEMENTATION RECOMMENDATIONS FOR CLAUDE CODE
+# ============================================================================
+
+claude_code_recommendations:
+
+  start_simple:
+    - "Build the prompt_assembler first as a pure function: spread_spec + character_sheet + rules → prompt_string"
+    - "Test it on the two example specs (spread_05, spread_16) and verify output looks like the prompts in the production conversation"
+    - "Only after the prompt_assembler is reliable, add the API caller, regenerate generator, etc."
+
+  representational_choices:
+    - "YAML for the static specs (character sheet, composition rules) — humans need to edit these"
+    - "JSON for the per-spread specs if generated programmatically; YAML if hand-edited"
+    - "Markdown for the body text overlays (already established convention)"
+
+  iteration_loop:
+    - "1. Generate spread spec (manual or assisted)"
+    - "2. Assemble prompt"
+    - "3. Pre-check for anti-patterns"
+    - "4. Attach references"
+    - "5. Call API"
+    - "6. Run automated acceptance checks"
+    - "7. Human review"
+    - "8. If pass: store in approved spreads. If fail: classify failure mode, generate surgical regenerate prompt, return to step 4"
+
+  what_to_test_first:
+    - "Spread 05 (quiet, Lina + Pyra + Alex focal, no combat)"
+    - "Spread 16 (combat, all 5 figures + Guardian, highest-risk for character collapse)"
+    - "If both come back clean, the system handles the production range"
+
+  what_NOT_to_build:
+    - "Don't try to fully automate human acceptance — character distinctiveness still requires human eye"
+    - "Don't try to handle Spread 1 (the world map) with this system; it's the unique full-spread exception, generated separately"
+    - "Don't try to compose the final A3 spread in the AI generation; HTML post-production handles that"
+
+# ============================================================================
+# PRODUCTION DATA — KNOWN FAILURE LOG (for training the system on real cases)
+# ============================================================================
+
+production_failure_log:
+  description: "Eight character-distinctiveness failures observed during ChatGPT production. Use these as test cases for the system's regenerate generator."
+
+  failures:
+    - spread: 10
+      failure_type: "duplicate_lionn"
+      description: "Model placed Lionn in two compositional zones (foreground crouched + background walking ahead)"
+      surgical_fix_used: "explicit cast assignment per zone with anti-duplication language"
+
+    - spread: 19
+      failure_type: "damian_collapse + alex_scale_loss"
+      description: "Damian rendered with adult stubble (looking like another Alex); Alex missing entirely; duplicate Zaya"
+      surgical_fix_used: "explicit five-figure cast lockdown with absolute identifiers"
+
+    - spread: 20
+      failure_type: "zaya_collapsed_into_lionn"
+      description: "Zaya rendered with dark hair and dark clothing; visually indistinguishable from Lionn"
+      surgical_fix_used: "anti-comparison block — Zaya's coloring stated as opposite of Lionn's"
+
+    - spread: 22
+      failure_type: "damian_collapse + alex_scale_loss"
+      description: "Damian rendered with Lionn-coloring; Alex at child-scale even at small framing"
+      surgical_fix_used: "absolute scale anchors for Alex; absolute identifiers for Damian"
+
+    - spread: 23
+      failure_type: "damian_collapse + alex_scale_loss + duplicate_lionn"
+      description: "Damian replaced by duplicate Lionn; Alex rendered as older child rather than adult"
+      surgical_fix_used: "explicit cast lockdown; Alex described with adult-build absolute anchors"
+
+    - spread: 11_v2
+      failure_type: "weapon_swap"
+      description: "Lionn holding hammer (Damian's weapon); Damian holding sword (Lionn's weapon); hair coloring crossed"
+      surgical_fix_used: "explicit weapon-character ownership + anti-swap rule"
+
+    - spread: 15
+      failure_type: "weapon_swap + duplicate_zaya + missing_damian + shield_blade_hybrid_failure"
+      description: "Alex holding hammer instead of shield-blade; Damian replaced by second blond child"
+      surgical_fix_used: "fallback to long sword + arm shield for Alex; explicit Damian lockdown"
+
+    - spread: 21
+      failure_type: "damian_collapse"
+      description: "Damian on far right of team rendered with dark hair (Lionn-coloring) holding hammer"
+      surgical_fix_used: "explicit Damian lockdown with anti-comparison; absolute identifiers only"
+
+    - spread: 16
+      failure_type: "duplicate_lionn + missing_damian"
+      description: "Damian replaced by what reads as another Lionn rolling on the bridge with a sword"
+      surgical_fix_used: "explicit cast lockdown; Damian re-inserted in stabilizing pose with hammer"
+
+  pattern_summary:
+    most_common_failure: "Damian collapses toward Lionn (6 of 9 cases including 11_v2)"
+    second_most_common: "Alex scale loss when in tight group (3 of 9 cases)"
+    weapon_swap_rate: "2 of 9 cases"
+    structural_implication: |
+      Damian and Alex are the production system's two reliability bottlenecks.
+      Every prompt must lock both with absolute identifiers. The character
+      identity sheet's stability_note for each should be treated as
+      mandatory injection content, not optional reference.
