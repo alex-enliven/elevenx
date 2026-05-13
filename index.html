@@ -6037,6 +6037,46 @@ window.ElevenX.FalClient = class {
     return res.json();
   }
 
+  // ─── Retry helper: handles transient 5xx + network errors ───────────────
+  // fal.ai occasionally returns 500 "downstream_service_error" — their upstream
+  // model service hiccupped. Retry with exponential backoff. Don't retry 4xx
+  // (those are real errors that won't fix themselves).
+  async #fetchWithRetry(url, opts = {}, label = "fetch") {
+    const maxAttempts = 4;
+    const baseDelayMs = 2000;
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const res = await this.fetch(url, opts);
+        // Success or non-retryable client error
+        if (res.ok) return res;
+        if (res.status < 500) return res;
+        // 5xx → retry
+        const body = await res.clone().text().catch(() => "");
+        lastError = new Error(`${label} ${res.status} ${res.statusText} — ${body.slice(0, 300)}`);
+        if (attempt < maxAttempts) {
+          const delay = baseDelayMs * Math.pow(2, attempt - 1); // 2s · 4s · 8s
+          this.onLog(`  ⚠ ${label} returned ${res.status} (transient) — retrying in ${delay/1000}s (attempt ${attempt+1}/${maxAttempts})`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        return res; // last attempt — return the bad response, caller will handle
+      } catch (err) {
+        // Network error / fetch threw entirely. Treat as retryable.
+        lastError = err;
+        if (attempt < maxAttempts) {
+          const delay = baseDelayMs * Math.pow(2, attempt - 1);
+          this.onLog(`  ⚠ ${label} threw '${err.message}' — retrying in ${delay/1000}s (attempt ${attempt+1}/${maxAttempts})`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    if (lastError) throw lastError;
+    throw new Error(`${label}: exhausted ${maxAttempts} attempts`);
+  }
+
   // ─── Internal: queue submit + poll ────────────────────────────────────
 
   async #submitAndWait(endpoint, body, expectedMediaKind, opts = {}) {
@@ -6052,11 +6092,11 @@ window.ElevenX.FalClient = class {
     }
 
     this.onLog(`→ POST ${endpoint}`);
-    const submitRes = await this.fetch(submitUrl, {
+    const submitRes = await this.#fetchWithRetry(submitUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
-    });
+    }, "fal submit");
 
     if (!submitRes.ok) {
       const errText = await submitRes.text().catch(() => "");
@@ -6087,7 +6127,7 @@ window.ElevenX.FalClient = class {
       // replacing the host with our worker base. fal returns status_url like
       // "https://queue.fal.run/<rest>" so we rewrite it to "<worker>/fal/<rest>".
       const statusUrl = this.#rewriteToWorker(submitJson.status_url);
-      const sres = await this.fetch(statusUrl);
+      const sres = await this.#fetchWithRetry(statusUrl, {}, "fal status poll");
       if (!sres.ok) {
         const t = await sres.text().catch(() => "");
         throw new Error(`fal status poll failed: ${sres.status} — ${t.slice(0, 300)}`);
@@ -6097,7 +6137,9 @@ window.ElevenX.FalClient = class {
       if (sjson.status === "COMPLETED") {
         this.onLog(`  ✓ completed in ${Math.round((Date.now() - start)/1000)}s`);
         const respUrl = this.#rewriteToWorker(submitJson.response_url);
-        const rres = await this.fetch(respUrl);
+        // This is the fetch that hit "downstream_service_error" — most common
+        // failure point. fal hosts the result for a while; retries are free.
+        const rres = await this.#fetchWithRetry(respUrl, {}, "fal response fetch");
         if (!rres.ok) {
           const t = await rres.text().catch(() => "");
           throw new Error(`fal response fetch failed: ${rres.status} — ${t.slice(0, 300)}`);
@@ -7053,6 +7095,40 @@ function blobToDataUrl(blob) {
       this.fetch = fetchImpl ? fetchImpl.bind(globalThis) : null;
     }
 
+    // Retry on transient 5xx / network errors. Mirrors FalClient's pattern.
+    async _fetchWithRetry(url, opts = {}, label = "fetch") {
+      const maxAttempts = 4;
+      const baseDelayMs = 2000;
+      let lastError = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const res = await this.fetch(url, opts);
+          if (res.ok) return res;
+          if (res.status < 500) return res;
+          const body = await res.clone().text().catch(() => "");
+          lastError = new Error(`${label} ${res.status} ${res.statusText} — ${body.slice(0, 300)}`);
+          if (attempt < maxAttempts) {
+            const delay = baseDelayMs * Math.pow(2, attempt - 1);
+            this.onLog(`  ⚠ ${label} returned ${res.status} (transient) — retrying in ${delay/1000}s (attempt ${attempt+1}/${maxAttempts})`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          return res;
+        } catch (err) {
+          lastError = err;
+          if (attempt < maxAttempts) {
+            const delay = baseDelayMs * Math.pow(2, attempt - 1);
+            this.onLog(`  ⚠ ${label} threw '${err.message}' — retrying in ${delay/1000}s`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (lastError) throw lastError;
+      throw new Error(`${label}: exhausted ${maxAttempts} attempts`);
+    }
+
     /**
      * Generate an image with gpt-image-2.
      * @param {object} body
@@ -7080,11 +7156,11 @@ function blobToDataUrl(blob) {
       const url = `${this.workerUrl}/openai/v1/images/generations`;
       this.onLog(`→ POST /openai/v1/images/generations (${model}, ${size}, ${quality})`);
 
-      const res = await this.fetch(url, {
+      const res = await this._fetchWithRetry(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
-      });
+      }, "openai generations");
 
       if (!res.ok) {
         const text = await res.text().catch(() => "");
@@ -7155,11 +7231,11 @@ function blobToDataUrl(blob) {
       const url = `${this.workerUrl}/openai/v1/images/edits`;
       this.onLog(`→ POST /openai/v1/images/edits (${model}, ${size}, with reference)`);
 
-      const res = await this.fetch(url, {
+      const res = await this._fetchWithRetry(url, {
         method: "POST",
         body: formData,
         // NOTE: do NOT set Content-Type — the browser sets multipart boundary automatically.
-      });
+      }, "openai edits");
 
       if (!res.ok) {
         const text = await res.text().catch(() => "");
