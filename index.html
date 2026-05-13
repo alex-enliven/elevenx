@@ -7340,27 +7340,37 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const grid = $("#elx-loc-grid");
     if (!grid) return;
     grid.innerHTML = "";
+    // Same A/B pattern as the cast tab — one card per (location × model).
     for (const e of envs) {
-      const refs = e.refs || {};
-      const refCount = Object.keys(refs).filter(k => refs[k]?.dataUrl).length;
-      const portrait = refs.wide?.dataUrl;
-      const card = document.createElement("div");
-      card.className = "cast-card cast-card--loc";
-      card.dataset.id = e.id;
-      card.innerHTML = `
-        <div class="cast-card__portrait" style="${portrait ? `background-image:url('${portrait}'); background-size:cover; background-position:center;` : ''}">
-          ${portrait ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px;">${esc(e.id).toUpperCase()}</div>`}
-        </div>
-        <div class="cast-card__name">${esc(e.display_name)}</div>
-        <div class="cast-card__role">${esc(e.architecture?.type || "")}</div>
-        <div class="cast-card__palette">${(e.palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
-        <div class="cast-card__meta">${refCount}/2 refs · ${refCount === 2 ? '<span style="color:#4ade80">approved</span>' : '<span style="color:#fbbf24">pending</span>'}</div>
-        <div class="cast-card__bottom">
-          <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}">${refCount === 2 ? "Re-roll refs" : `Generate ${2 - refCount} ref${2-refCount===1?"":"s"}`}</button>
-        </div>
-      `;
-      grid.appendChild(card);
+      for (const [modelKey, modelMeta] of Object.entries(IMAGE_MODELS)) {
+        grid.appendChild(buildLocationCard(e, modelKey, modelMeta));
+      }
     }
+  }
+
+  function buildLocationCard(e, modelKey, modelMeta) {
+    const refsForModel = e.refs?.[modelKey] || {};
+    const kindKeys = ["wide", "detail"];
+    const refCount = kindKeys.filter(k => refsForModel[k]?.dataUrl).length;
+    const portrait = refsForModel.wide?.dataUrl || refsForModel.detail?.dataUrl;
+    const card = document.createElement("div");
+    card.className = `cast-card cast-card--loc cast-card--${modelKey}`;
+    card.dataset.id = e.id;
+    card.dataset.model = modelKey;
+    card.innerHTML = `
+      <div class="cast-card__portrait" style="${portrait ? `background-image:url('${portrait}'); background-size:cover; background-position:center;` : ''}">
+        ${portrait ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px;">${esc(e.id).toUpperCase()}</div>`}
+        <span class="cast-card__model-badge" style="background:${modelMeta.badge_color}22; color:${modelMeta.badge_color}; border:1px solid ${modelMeta.badge_color}55;">${esc(modelMeta.shortLabel)}</span>
+      </div>
+      <div class="cast-card__name">${esc(e.display_name)}</div>
+      <div class="cast-card__role">${esc(e.architecture?.type || "")}</div>
+      <div class="cast-card__palette">${(e.palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
+      <div class="cast-card__meta">${refCount}/2 refs · ${refCount === 2 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'} · <span style="color:#9a9aab">${esc(modelMeta.shortLabel)}</span></div>
+      <div class="cast-card__bottom">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}" data-model="${esc(modelKey)}">${refCount === 2 ? `Re-roll (${esc(modelMeta.shortLabel)})` : `Generate ${2 - refCount} ref${2-refCount===1?"":"s"}`}</button>
+      </div>
+    `;
+    return card;
   }
 
   function nameToColor(name) {
@@ -7563,40 +7573,75 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (failCount > 0)                  toast(`${m}: all ${failCount} angle${failCount===1?"":"s"} failed. Check console.`, { tone: "err", duration: 8000 });
   }
 
-  async function handleGenerateEnvRefs(locId) {
-    if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
+  async function handleGenerateEnvRefs(locId, modelKey = "seedream") {
+    const modelMeta = IMAGE_MODELS[modelKey];
+    if (!modelMeta) { toast(`Unknown model: ${modelKey}`, { tone: "err" }); return; }
+
+    const client = (modelKey === "seedream") ? State.fal : State.openai;
+    if (!client) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
+
     const e = await Storage.get("environments", locId);
     if (!e) return;
+
+    e.refs = e.refs || {};
+    e.refs[modelKey] = e.refs[modelKey] || {};
 
     State.activeJobs++;
     let okCount = 0, failCount = 0;
     for (const kind of ["wide", "detail"]) {
-      if (e.refs?.[kind]?.dataUrl) continue;
-      setGPS(true, `Generating <span class="mono">${esc(locId)} · ${kind}</span>`, "seedream-v4.5", 30);
+      if (e.refs[modelKey][kind]?.dataUrl) continue;
+      setGPS(true,
+        `Generating <span class="mono">${esc(locId)} · ${kind}</span>`,
+        `${modelMeta.label}`,
+        30);
       try {
-        const prompt = composer.composeEnvironmentReferencePrompt(e, kind);
-        const result = await State.fal.seedreamTextToImage(prompt);
-        const imgUrl = result?.images?.[0]?.url;
-        if (!imgUrl) { toast(`Failed: ${locId}/${kind}`, { tone: "err" }); failCount++; continue; }
-        const blob = await fetch(imgUrl).then(r => r.blob());
-        const dataUrl = await blobToDataUrl(blob);
-        e.refs = e.refs || {};
-        e.refs[kind] = { dataUrl, seed: result.seed, generated_at: Date.now() };
+        const promptSpec = composer.composeEnvironmentReferencePrompt(e, kind);
+        let dataUrl, seed, costUsd;
+
+        if (modelKey === "seedream") {
+          const result = await State.fal.seedreamTextToImage(promptSpec);
+          const imgUrl = result?.images?.[0]?.url;
+          if (!imgUrl) { toast(`Failed: ${locId}/${kind} (no image)`, { tone: "err" }); failCount++; continue; }
+          const blob = await fetch(imgUrl).then(r => r.blob());
+          dataUrl = await blobToDataUrl(blob);
+          seed = result.seed;
+          costUsd = modelMeta.cost_per_image_usd;
+        } else if (modelKey === "gpt") {
+          // Environments are 16:9-ish — use 1536x1024 landscape for both kinds
+          const result = await State.openai.imageGenerate({
+            prompt: promptSpec.prompt,
+            size: "1536x1024",
+            quality: "medium",
+            n: 1,
+          });
+          dataUrl = result?.images?.[0]?.dataUrl;
+          if (!dataUrl) { toast(`Failed: ${locId}/${kind} (no image)`, { tone: "err" }); failCount++; continue; }
+          seed = null;
+          costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
+        }
+
+        e.refs[modelKey][kind] = {
+          dataUrl, seed,
+          generated_at: Date.now(),
+          cost_usd: costUsd,
+          model: modelMeta.label,
+        };
         await Storage.put("environments", e);
-        await trackCost(0.05, `seedream env ${locId}/${kind}`);
+        await trackCost(costUsd, `${modelKey} env ${locId}/${kind}`);
         renderLocationTab();
         okCount++;
       } catch (err) {
-        console.error(err);
-        toast(`Error: ${err.message}`, { tone: "err" });
+        console.error(`[${modelKey}]`, err);
+        toast(`${modelMeta.shortLabel} error: ${err.message}`, { tone: "err" });
         failCount++;
       }
     }
     setGPS(false);
     State.activeJobs--;
-    if (okCount > 0 && failCount === 0)      toast(`Environment ${e.display_name}: ${okCount} ref${okCount===1?"":"s"} added.`);
-    else if (okCount > 0 && failCount > 0)   toast(`Partial: ${okCount} succeeded, ${failCount} failed.`, { tone: "warn", duration: 7000 });
-    else if (failCount > 0)                  toast(`All ${failCount} env ref${failCount===1?"":"s"} failed. Check console.`, { tone: "err", duration: 8000 });
+    const m = modelMeta.shortLabel;
+    if (okCount > 0 && failCount === 0)      toast(`${e.display_name} · ${m}: ${okCount} ref${okCount===1?"":"s"} added.`);
+    else if (okCount > 0 && failCount > 0)   toast(`${m} partial: ${okCount} ok, ${failCount} failed.`, { tone: "warn", duration: 7000 });
+    else if (failCount > 0)                  toast(`${m}: all ${failCount} env ref${failCount===1?"":"s"} failed.`, { tone: "err", duration: 8000 });
   }
 
   async function handleRollShot(shotId) {
@@ -7860,6 +7905,20 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       } else if (!hasNewShape) {
         c.refs = { seedream: {}, gpt: {} };
         await Storage.put("characters", c);
+      }
+    }
+
+    // Same migration for environments: e.refs[kind] → e.refs[modelKey][kind]
+    for (const env of await Storage.getAll("environments")) {
+      const r = env.refs || {};
+      const hasOldShape = r.wide || r.detail;
+      const hasNewShape = r.seedream || r.gpt;
+      if (hasOldShape && !hasNewShape) {
+        env.refs = { seedream: { wide: r.wide, detail: r.detail }, gpt: {} };
+        await Storage.put("environments", env);
+      } else if (!hasNewShape) {
+        env.refs = { seedream: {}, gpt: {} };
+        await Storage.put("environments", env);
       }
     }
 
