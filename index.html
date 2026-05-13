@@ -5776,9 +5776,14 @@ const SEEDANCE = {
   reference_to_video_fast: "/fal/bytedance/seedance-2.0/fast/reference-to-video",
 };
 
+// IMPORTANT: fal.ai's path convention is mixed. Seedance lives under
+// `bytedance/seedance-2.0/...` (no `fal-ai/` prefix); Seedream and Kling
+// live under `fal-ai/bytedance/seedream/...` and `fal-ai/kling-video/...`
+// respectively. Match the live fal docs verbatim — getting this wrong
+// gives a 404 with body `{"detail":"Application "<name>" not found"}`.
 const SEEDREAM = {
-  text_to_image: "/fal/bytedance/seedream/v4.5/text-to-image",
-  edit:          "/fal/bytedance/seedream/v4.5/edit",
+  text_to_image: "/fal/fal-ai/bytedance/seedream/v4.5/text-to-image",
+  edit:          "/fal/fal-ai/bytedance/seedream/v4.5/edit",
 };
 
 const KLING = {
