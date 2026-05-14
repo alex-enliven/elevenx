@@ -6634,13 +6634,26 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
 
   const blocks = [];
 
-  // ── [Style Canon] — project-level prose (v3) ─────────────────────────
+  // ── [Style Canon] — project-level prose + world rules (v3 → v3.1) ────
   // Authored by the director on the project. Seedance respects long-form
   // style cues when placed early — and the canon lets a single sentence
   // ("Premium stylized 3D animated dark-fantasy adventure for ages 10–14...")
-  // pin every shot to the same world.
+  // pin every shot to the same world. v3.1: project.world_rules[] gets
+  // appended here too — they're the invariants the world obeys (e.g.,
+  // "Shadow magic is mysterious and powerful — never demonic"), and
+  // Seedance treats them as additional style guidance.
+  const styleCanonParts = [];
   if (project.style_canon && String(project.style_canon).trim()) {
-    blocks.push(`[Style Canon] ${String(project.style_canon).trim()}`);
+    styleCanonParts.push(String(project.style_canon).trim());
+  }
+  if (Array.isArray(project.world_rules) && project.world_rules.length > 0) {
+    const rules = project.world_rules.filter(r => r && String(r).trim()).map(r => `- ${String(r).trim()}`);
+    if (rules.length > 0) {
+      styleCanonParts.push(`World rules (always obeyed):\n${rules.join("\n")}`);
+    }
+  }
+  if (styleCanonParts.length > 0) {
+    blocks.push(`[Style Canon] ${styleCanonParts.join("\n\n")}`);
   }
 
   // ── [Aesthetic] — visual + grade language, medium-aware (v3) ─────────
@@ -6686,13 +6699,27 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
   }
   blocks.push(`[Aesthetic] ${aestheticParts.filter(Boolean).join(". ")}.`);
 
-  // ── [Storyline] — narrative context ──────────────────────────────────
+  // ── [Storyline] — narrative context (v3.1: theme + visual rule + audience) ──
+  // The project-level strategic fields (theme/visual_rule/audience) belong
+  // here, just before the per-shot moment: they answer "why does this shot
+  // exist, who is it for, what does it mean." Seedance won't act on theme
+  // directly, but it WILL respect the visual_rule (e.g. "gold = legacy,
+  // violet = shadow") when staging color choices.
   const m = shot.the_moment || {};
-  const seriesTitle = series?.series?.display_name || series?.display_name || "";
+  const seriesTitle = project.display_name || series?.series?.display_name || series?.display_name || "";
   const episodeTitle = episode?.episode?.display_name || episode?.display_name || "";
   const storyParts = [];
   if (seriesTitle || episodeTitle) {
-    storyParts.push(`${seriesTitle ? seriesTitle + " — " : ""}${episodeTitle || ""}.`.trim());
+    storyParts.push(`${seriesTitle ? seriesTitle + (episodeTitle ? " — " + episodeTitle : "") : episodeTitle}.`.trim());
+  }
+  if (project.theme && String(project.theme).trim()) {
+    storyParts.push(`Project theme: ${String(project.theme).trim()}`);
+  }
+  if (project.visual_rule && String(project.visual_rule).trim()) {
+    storyParts.push(`Visual rule: ${String(project.visual_rule).trim()}`);
+  }
+  if (project.audience && String(project.audience).trim()) {
+    storyParts.push(`Audience: ${String(project.audience).trim()}.`);
   }
   storyParts.push(`Shot ${shot.shot_number} of the episode: ${shot.display_name || shot.id}.`);
   if (m.verb && m.focal_point) {
@@ -6701,6 +6728,7 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
     storyParts.push(`Focal point: ${m.focal_point}.`);
   }
   if (m.emotional_beat) storyParts.push(`Emotional beat: ${m.emotional_beat}.`);
+  if (m.description) storyParts.push(m.description);
   blocks.push(`[Storyline] ${storyParts.join(" ")}`);
 
   // ── [Characters] — who's in frame + brief descriptors ────────────────
@@ -6849,6 +6877,29 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
     blocks.push(`[Cast Distinctiveness] These characters must remain visually distinct from each other:\n${distinct.map(d => "- " + d).join("\n")}`);
   }
 
+  // ── [Character Arc Context] — emotional state cues (v3.1) ────────────
+  // Bibles imported via JSON often carry character.arc { wound, false_belief,
+  // truth, outer_wish, inner_need }. Seedance can't act on full character
+  // psychology, but it CAN respect the emotional register for the actors
+  // in frame — e.g. "performance reads as someone who believes they're
+  // dangerous" is actionable. We feed only the in-frame cast.
+  const arcLines = cast
+    .map(c => {
+      const arc = c.arc || {};
+      const fragments = [];
+      if (arc.false_belief) fragments.push(`believes: "${arc.false_belief}"`);
+      if (arc.inner_need)   fragments.push(`needs: ${arc.inner_need}`);
+      if (arc.arc_expression || c.performance?.arc_expression) {
+        fragments.push(`body language: ${arc.arc_expression || c.performance.arc_expression}`);
+      }
+      if (fragments.length === 0) return null;
+      return `${c.display_name} — ${fragments.join("; ")}`;
+    })
+    .filter(Boolean);
+  if (arcLines.length > 0) {
+    blocks.push(`[Character Arc Context] Performance should reflect each character's emotional state:\n${arcLines.map(l => "- " + l).join("\n")}`);
+  }
+
   const highRisk = cast.filter(c => c.high_risk && c.stability_note);
   if (highRisk.length > 0) {
     blocks.push(`[Identity Locks] ${highRisk.map(c => `${c.display_name}: ${c.stability_note}`).join(" / ")}`);
@@ -6867,12 +6918,35 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
     blocks.push(`[Anti-Patterns] ${antiPatterns.join(" / ")}.`);
   }
 
+  // ── [Known Failure Modes] — shot.watch_points + project.reroll_rules ─
+  // Per-shot watch_points come from the bible's shot spec; project-wide
+  // reroll_rules apply to EVERY shot. Both go in the same block so the
+  // model sees a consolidated "watch for these" list. Project rules are
+  // listed second (more general after specific).
+  const failureLines = [];
   const watchPoints = shot.watch_points || [];
   if (watchPoints.length > 0) {
-    const wp = watchPoints.map(w => `${w.failure} → ${w.surgical_fix}`).filter(s => s && s.length > 4);
-    if (wp.length > 0) {
-      blocks.push(`[Known Failure Modes] ${wp.join(" / ")}.`);
-    }
+    const wp = watchPoints
+      .map(w => `${w.failure}${w.surgical_fix ? ` → ${w.surgical_fix}` : ""}`)
+      .filter(s => s && s.length > 4);
+    failureLines.push(...wp);
+  }
+  if (Array.isArray(project.reroll_rules) && project.reroll_rules.length > 0) {
+    const projectRules = project.reroll_rules
+      .filter(r => r && String(r).trim())
+      .map(r => `project-wide: ${String(r).trim()}`);
+    failureLines.push(...projectRules);
+  }
+  if (failureLines.length > 0) {
+    blocks.push(`[Known Failure Modes] ${failureLines.join(" / ")}.`);
+  }
+
+  // ── [Director Note] — shot-specific intent line (v3.1) ──────────────
+  // From shot.director_note. Placed AFTER failure modes so it lands at
+  // the tail of the prompt where autoregressive models weight heavily.
+  // Use this for one-line intent like "Keep this beautiful, not chaotic."
+  if (shot.director_note && String(shot.director_note).trim()) {
+    blocks.push(`[Director Note] ${String(shot.director_note).trim()}`);
   }
 
   // ── [Negative Prompt] — universal + shot-specific + prop reinforcement
@@ -11387,21 +11461,57 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           ${continuity.start_image_ref ? `<div class="elx-rail__inherit">Inherits: <span class="mono">${esc(continuity.start_image_ref)}</span></div>` : ""}
         </div>
 
+        ${(shot.voiceover && shot.voiceover.length > 0) ? `
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Voiceover (off-screen)</div>
+          ${shot.voiceover.map(v => {
+            const speakerId = String(v.speaker_id || "narrator");
+            const speakerName = speakerId === "narrator"
+              ? "Narrator"
+              : (cast.find(b => b.id === speakerId)?.display_name || speakerId);
+            const timing = (v.start_at_seconds != null) ? ` <span style="color:#6a6a78;font-size:10.5px;">@ ${v.start_at_seconds}s</span>` : "";
+            return `
+              <div class="elx-rail__cast-row">
+                <div class="elx-rail__cast-name">${esc(speakerName)}${timing}</div>
+                ${v.text ? `<div class="elx-rail__cast-dialogue">"${esc(v.text)}"</div>` : ""}
+              </div>
+            `;
+          }).join("")}
+          <div class="elx-rail__muted" style="margin-top:6px;font-size:10.5px;">Overlaid via ElevenLabs v3 post-roll.</div>
+        </div>` : ""}
+
+        ${(shot.references && shot.references.length > 0) ? `
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Additional references</div>
+          ${shot.references.map(r => {
+            const kindLabel = r.kind === "asset" ? "style asset" : r.kind === "environment" ? "environment plate" : r.kind === "character" ? "extra cast" : r.kind;
+            return `<div class="elx-rail__kv"><span>${esc(r.id)}</span><span style="color:#9a9aab">${esc(kindLabel)}${r.role ? ` · ${esc(r.role)}` : ""}</span></div>`;
+          }).join("")}
+        </div>` : ""}
+
         ${watchPoints.length > 0 ? `
         <div class="elx-rail__section">
           <div class="elx-rail__label">Watch points</div>
           ${watchPoints.map(w => `
             <div class="elx-rail__watch">
               <div class="elx-rail__watch-fail">⚠ ${esc(w.failure || "")}</div>
-              <div class="elx-rail__watch-fix">→ ${esc(w.surgical_fix || "")}</div>
+              ${w.surgical_fix ? `<div class="elx-rail__watch-fix">→ ${esc(w.surgical_fix)}</div>` : ""}
             </div>
           `).join("")}
+        </div>` : ""}
+
+        ${shot.director_note ? `
+        <div class="elx-rail__section">
+          <div class="elx-rail__label">Director note</div>
+          <div style="font-size:12px; color:#c8c8d4; line-height:1.55; font-style:italic; padding:8px 10px; background:rgba(201,162,90,0.06); border-left:2px solid #c9a25a; border-radius:0 4px 4px 0;">
+            ${esc(shot.director_note)}
+          </div>
         </div>` : ""}
 
         <div class="elx-rail__section">
           <div class="elx-rail__label">Specs</div>
           <div class="elx-rail__kv"><span>Mode</span><span>${esc(shot.generation?.mode || "auto")}</span></div>
-          <div class="elx-rail__kv"><span>Duration</span><span>${shot.timecode?.duration_seconds || "?"}s</span></div>
+          <div class="elx-rail__kv"><span>Duration</span><span>${shot.timecode?.duration_seconds_override != null ? `${shot.timecode.duration_seconds_override}s <span style="color:#c9a25a;font-size:10px;">override</span>` : `${shot.timecode?.duration_seconds || "?"}s`}</span></div>
           <div class="elx-rail__kv"><span>Timecode</span><span>${esc(shot.timecode?.in || "?")} – ${esc(shot.timecode?.out || "?")}</span></div>
           <div class="elx-rail__kv"><span>Cost so far</span><span>${fmtUsd(shot.cost_usd || 0)}</span></div>
         </div>
