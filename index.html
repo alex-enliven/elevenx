@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="765aa6df163d" data-build-time="2026-05-14T21:09:01.652Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"765aa6df163d",time:"2026-05-14T21:09:01.652Z"};</script>
+<meta name="elevenx-build" content="e9056bf6b605" data-build-time="2026-05-14T21:22:32.022Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"e9056bf6b605",time:"2026-05-14T21:22:32.022Z"};</script>
 
 </head>
-<!-- elevenx-build: 765aa6df163d @ 2026-05-14T21:09:01.652Z -->
+<!-- elevenx-build: e9056bf6b605 @ 2026-05-14T21:22:32.022Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9605,6 +9605,417 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     });
   }
 
+  // ─── Master-sheet crop-and-distribute (v3.7) ────────────────────────
+  // Directors increasingly receive single "style anchor" sheets from their
+  // AI tools (GPT, Midjourney, etc.) — a multi-panel composite with cast
+  // portraits, environment plates, FX sheets, etc. all in one image.
+  // Uploading the whole sheet as a single ref is the WORST option: the
+  // model sees multiple subjects, embedded text labels, and panel borders;
+  // every generated frame inherits that confusion.
+  //
+  // This tool lets the director upload the master sheet once, draw crop
+  // rectangles on it, and assign each crop to a specific slot (cast head_on,
+  // env wide, asset primary, etc.). All crops land in the refs.user bucket
+  // — sacred from re-rolls.
+
+  // Crop a region from a data URL using a hidden canvas.
+  // x/y/width/height are in the SOURCE image's pixel coordinates (not the
+  // display canvas's coordinates — the caller must scale before passing).
+  async function cropImageDataUrl(srcDataUrl, x, y, width, height) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(width));
+          canvas.height = Math.max(1, Math.round(height));
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, x, y, width, height, 0, 0, canvas.width, canvas.height);
+          // Use PNG for fidelity; cropped panels of a master sheet are usually
+          // ≤ 1MB even at full res, which is well within IDB practical limits.
+          resolve(canvas.toDataURL("image/png"));
+        } catch (err) {
+          reject(err);
+        }
+      };
+      img.onerror = () => reject(new Error("Could not load source image for crop"));
+      img.src = srcDataUrl;
+    });
+  }
+  NS.cropImageDataUrl = cropImageDataUrl;
+
+  // Enumerate every assignable slot in the active project. Returns a flat
+  // list usable as a sidebar in the distribute modal.
+  // Each entry: { kind, entityId, entityName, slotKey, slotLabel, currentDataUrl, currentSource }
+  async function listAllAssignableSlots() {
+    const characters   = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const assets       = await Storage.getAll("assets");
+    const slots = [];
+    for (const c of characters) {
+      for (const [k, label] of [["head_on", "Head-on"], ["three_quarter", "3/4 view"], ["full_body", "Full body"]]) {
+        slots.push({
+          kind: "character",
+          entityId: c.id,
+          entityName: c.display_name,
+          slotKey: k,
+          slotLabel: label,
+          currentDataUrl: refUrlFor(c, k),
+          currentSource: refSourceFor(c, k),
+        });
+      }
+    }
+    for (const e of environments) {
+      for (const [k, label] of [["wide", "Wide establisher"], ["detail", "Detail / close"]]) {
+        slots.push({
+          kind: "environment",
+          entityId: e.id,
+          entityName: e.display_name,
+          slotKey: k,
+          slotLabel: label,
+          currentDataUrl: refUrlFor(e, k),
+          currentSource: refSourceFor(e, k),
+        });
+      }
+    }
+    for (const a of assets) {
+      slots.push({
+        kind: "asset",
+        entityId: a.id,
+        entityName: a.display_name,
+        slotKey: "primary",
+        slotLabel: "Primary",
+        currentDataUrl: refUrlFor(a, "primary"),
+        currentSource: refSourceFor(a, "primary"),
+      });
+    }
+    return slots;
+  }
+
+  // Assign a cropped data URL to a specific slot. Writes to refs.user so the
+  // crop is sacred from re-rolls AND becomes the identity/style anchor for
+  // chained-gen of derived angles.
+  async function assignCropToSlot(slot, dataUrl) {
+    const storeMap = { character: "characters", environment: "environments", asset: "assets" };
+    const store = storeMap[slot.kind];
+    if (!store) throw new Error(`Unknown slot kind "${slot.kind}"`);
+    const row = await Storage.get(store, slot.entityId);
+    if (!row) throw new Error(`Entity ${slot.entityId} not found`);
+    row.refs = row.refs || { user: {}, seedream: {}, gpt: {} };
+    row.refs.user = row.refs.user || {};
+    row.refs.user[slot.slotKey] = {
+      dataUrl,
+      source: "user_upload_cropped",
+      uploaded_at: Date.now(),
+    };
+    await Storage.put(store, row);
+    return row;
+  }
+
+  // The distribute master-sheet modal. Two-pane layout:
+  //   - LEFT (large): canvas with the master sheet; drag-to-select
+  //   - RIGHT (sidebar): slot list with thumbnails; click "Use selection"
+  // The selection persists until the user re-draws, so the same crop can be
+  // assigned to multiple slots (e.g., Lionn's head_on AND three_quarter from
+  // the same panel crop).
+  function showDistributeMasterSheetModal() {
+    if ($("#elx-distribute-modal")) return;
+    const panel = document.createElement("div");
+    panel.id = "elx-distribute-modal";
+    panel.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 9300;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px);
+    `;
+    panel.innerHTML = `
+      <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
+                  padding:20px 24px; width:96vw; max-width:1480px; height:92vh; max-height:920px;
+                  display:flex; flex-direction:column;
+                  font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
+        <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:10px;">
+          <div>
+            <h2 style="margin:0 0 4px; font-size:17px; font-weight:600;">Distribute master sheet</h2>
+            <div style="font-size:11.5px; color:#9a9aab; line-height:1.5;">
+              Upload a multi-panel style anchor — then drag to select each region and assign it to a slot. One image, many slots. Crops save to <code style="color:#c9a25a;">refs.user</code> (sacred from re-rolls).
+            </div>
+          </div>
+          <button id="elx-distribute-close" style="background:none; border:none; color:#9a9aab; font-size:20px; cursor:pointer; line-height:1; padding:4px 8px;">×</button>
+        </div>
+
+        <div id="elx-distribute-stage1" style="flex:1; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:14px; border:2px dashed #2a2a35; border-radius:10px; padding:40px;">
+          <div style="font-size:38px; color:#3a3a45; line-height:1;">↹</div>
+          <div style="font-size:13px; color:#e8e8ee;">Upload your master sheet</div>
+          <div style="font-size:11.5px; color:#6a6a78; line-height:1.5; text-align:center; max-width:440px;">
+            PNG, JPEG, or WebP. The sheet stays local — never uploaded to fal.ai or OpenAI. Only the individual crops you assign get persisted in IDB.
+          </div>
+          <label style="cursor:pointer; background:#c9a25a; color:#14141a; padding:10px 20px; border-radius:6px; font-size:13px; font-weight:600;">
+            Choose file
+            <input id="elx-distribute-file" type="file" accept="image/png,image/jpeg,image/webp" style="display:none;">
+          </label>
+        </div>
+
+        <div id="elx-distribute-stage2" style="display:none; flex:1; gap:14px; min-height:0;">
+          <div style="flex:1; min-width:0; display:flex; flex-direction:column; gap:8px;">
+            <div style="display:flex; gap:8px; align-items:center; font-size:11.5px; color:#9a9aab;">
+              <span><strong style="color:#e8e8ee;">Click + drag</strong> on the sheet to draw a crop. Then assign it to one or more slots →</span>
+              <button id="elx-distribute-clear-selection" style="background:none; color:#9a9aab; border:1px solid #2a2a35; padding:4px 10px; border-radius:5px; font-size:11px; cursor:pointer;">Clear selection</button>
+              <button id="elx-distribute-replace" style="background:none; color:#9a9aab; border:1px solid #2a2a35; padding:4px 10px; border-radius:5px; font-size:11px; cursor:pointer;">Replace sheet</button>
+            </div>
+            <div style="flex:1; min-height:0; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; overflow:auto; display:flex; align-items:flex-start; justify-content:center; padding:8px;">
+              <canvas id="elx-distribute-canvas" style="display:block; cursor:crosshair;"></canvas>
+            </div>
+            <div id="elx-distribute-selection-info" style="font-size:10.5px; color:#6a6a78; line-height:1.5; min-height:14px;"></div>
+          </div>
+          <div style="width:340px; flex-shrink:0; display:flex; flex-direction:column; gap:8px; min-height:0;">
+            <div style="font-size:11px; color:#9a9aab; letter-spacing:0.04em; text-transform:uppercase; padding:4px 0;">Project slots</div>
+            <div id="elx-distribute-slot-list" style="flex:1; overflow-y:auto; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; padding:8px;"></div>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
+          <div id="elx-distribute-progress" style="font-size:11.5px; color:#9a9aab; align-self:center; margin-right:auto;"></div>
+          <button id="elx-distribute-done"
+                  style="background:#c9a25a; color:#14141a; border:none;
+                         padding:8px 20px; border-radius:6px; font-size:12.5px;
+                         font-weight:600; cursor:pointer;">Done</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    const close = () => panel.remove();
+    panel.addEventListener("click", (e) => { if (e.target === panel) close(); });
+    $("#elx-distribute-close", panel).addEventListener("click", close);
+    $("#elx-distribute-done", panel).addEventListener("click", close);
+
+    // ── Stage 1 → Stage 2: file upload + canvas hydration ─────────────────
+    let sourceDataUrl = null;
+    let sourceImage = null;       // HTMLImageElement at natural size
+    let displayScale = 1;          // canvas → natural scale ratio
+    let currentRect = null;        // { x, y, w, h } in CANVAS coords
+    let assignmentCount = 0;       // how many crops have been assigned in this session
+
+    const stage1 = $("#elx-distribute-stage1", panel);
+    const stage2 = $("#elx-distribute-stage2", panel);
+    const fileInput = $("#elx-distribute-file", panel);
+    const canvas = $("#elx-distribute-canvas", panel);
+    const ctx = canvas.getContext("2d");
+    const selectionInfo = $("#elx-distribute-selection-info", panel);
+    const progressEl = $("#elx-distribute-progress", panel);
+
+    async function loadSheet(dataUrl) {
+      sourceDataUrl = dataUrl;
+      sourceImage = await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error("Image failed to load"));
+        img.src = dataUrl;
+      });
+      // Pick a display size that fits within ~70% of the modal width.
+      // Canvas pixel size = display size (1:1) for crisp drawing; CSS size matches.
+      const maxDisplayWidth = Math.min(960, window.innerWidth * 0.6);
+      const maxDisplayHeight = window.innerHeight * 0.65;
+      const ratio = sourceImage.naturalWidth / sourceImage.naturalHeight;
+      let dispW = sourceImage.naturalWidth;
+      let dispH = sourceImage.naturalHeight;
+      if (dispW > maxDisplayWidth) { dispW = maxDisplayWidth; dispH = dispW / ratio; }
+      if (dispH > maxDisplayHeight) { dispH = maxDisplayHeight; dispW = dispH * ratio; }
+      displayScale = sourceImage.naturalWidth / dispW;
+      canvas.width = dispW;
+      canvas.height = dispH;
+      canvas.style.width = dispW + "px";
+      canvas.style.height = dispH + "px";
+      currentRect = null;
+      redrawCanvas();
+      stage1.style.display = "none";
+      stage2.style.display = "flex";
+      await renderSlotList();
+    }
+
+    function redrawCanvas() {
+      if (!sourceImage) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
+      if (currentRect && currentRect.w > 2 && currentRect.h > 2) {
+        ctx.fillStyle = "rgba(201,162,90,0.18)";
+        ctx.fillRect(currentRect.x, currentRect.y, currentRect.w, currentRect.h);
+        ctx.strokeStyle = "#c9a25a";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(currentRect.x, currentRect.y, currentRect.w, currentRect.h);
+      }
+      // Update info line
+      if (currentRect && currentRect.w > 2 && currentRect.h > 2) {
+        const realW = Math.round(currentRect.w * displayScale);
+        const realH = Math.round(currentRect.h * displayScale);
+        selectionInfo.textContent = `Selection: ${realW}×${realH}px (source). Click "Use selection" on a slot to assign.`;
+      } else {
+        selectionInfo.textContent = "No selection — click and drag on the sheet.";
+      }
+    }
+
+    fileInput.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      try {
+        const dataUrl = await readFileAsDataUrl(file);
+        await loadSheet(dataUrl);
+      } catch (err) {
+        toast(`Couldn't read sheet: ${err.message}`, { tone: "err" });
+      }
+    });
+
+    $("#elx-distribute-clear-selection", panel).addEventListener("click", () => {
+      currentRect = null;
+      redrawCanvas();
+      renderSlotList(); // refresh button states
+    });
+
+    $("#elx-distribute-replace", panel).addEventListener("click", () => {
+      sourceDataUrl = null;
+      sourceImage = null;
+      currentRect = null;
+      stage2.style.display = "none";
+      stage1.style.display = "flex";
+      fileInput.value = "";
+    });
+
+    // ── Canvas mouse handlers for drag-to-select ──────────────────────────
+    let dragging = false;
+    let startX = 0, startY = 0;
+
+    canvas.addEventListener("mousedown", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      startX = e.clientX - rect.left;
+      startY = e.clientY - rect.top;
+      currentRect = { x: startX, y: startY, w: 0, h: 0 };
+      dragging = true;
+    });
+
+    canvas.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const rect = canvas.getBoundingClientRect();
+      const curX = Math.max(0, Math.min(canvas.width, e.clientX - rect.left));
+      const curY = Math.max(0, Math.min(canvas.height, e.clientY - rect.top));
+      currentRect = {
+        x: Math.min(startX, curX),
+        y: Math.min(startY, curY),
+        w: Math.abs(curX - startX),
+        h: Math.abs(curY - startY),
+      };
+      redrawCanvas();
+    });
+
+    canvas.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      if (!currentRect || currentRect.w < 4 || currentRect.h < 4) {
+        currentRect = null;
+        redrawCanvas();
+        return;
+      }
+      redrawCanvas();
+      renderSlotList(); // refresh button states (enable "Use selection")
+    });
+
+    canvas.addEventListener("mouseleave", () => {
+      if (dragging) {
+        dragging = false;
+        redrawCanvas();
+        renderSlotList();
+      }
+    });
+
+    // ── Right sidebar: slot list ──────────────────────────────────────────
+    async function renderSlotList() {
+      const wrap = $("#elx-distribute-slot-list", panel);
+      if (!wrap) return;
+      const slots = await listAllAssignableSlots();
+      const hasSelection = !!(currentRect && currentRect.w > 4 && currentRect.h > 4);
+
+      // Group by entity for readability
+      const grouped = new Map();
+      for (const s of slots) {
+        const key = `${s.kind}:${s.entityId}`;
+        if (!grouped.has(key)) grouped.set(key, { kind: s.kind, name: s.entityName, slots: [] });
+        grouped.get(key).slots.push(s);
+      }
+
+      const groupsHtml = Array.from(grouped.values()).map(g => {
+        const kindLabel = { character: "CAST", environment: "ENV", asset: "ASSET" }[g.kind] || g.kind.toUpperCase();
+        return `
+          <div style="margin-bottom:10px;">
+            <div style="font-size:9.5px; color:#6a6a78; letter-spacing:0.06em; text-transform:uppercase; padding:6px 4px 4px;">
+              <span style="background:#1a1a22; padding:2px 6px; border-radius:3px; margin-right:6px;">${esc(kindLabel)}</span>${esc(g.name)}
+            </div>
+            ${g.slots.map(s => {
+              const thumbStyle = s.currentDataUrl
+                ? `background-image:url('${s.currentDataUrl}'); background-size:cover; background-position:center;`
+                : "background:#14141a;";
+              const sourceBadge = s.currentSource === "user_upload_cropped"
+                ? `<span style="font-size:8px; color:#c9a25a; letter-spacing:0.06em;">↑ CROP</span>`
+                : s.currentSource === "user_upload"
+                  ? `<span style="font-size:8px; color:#c9a25a; letter-spacing:0.06em;">↑ UPLOAD</span>`
+                  : s.currentDataUrl
+                    ? `<span style="font-size:8px; color:#6a6a78; letter-spacing:0.06em;">GENERATED</span>`
+                    : `<span style="font-size:8px; color:#6a6a78; letter-spacing:0.06em;">EMPTY</span>`;
+              return `
+                <div data-slot-key="${esc(s.kind)}:${esc(s.entityId)}:${esc(s.slotKey)}"
+                     style="display:flex; align-items:center; gap:8px; padding:6px 4px; border-radius:4px;">
+                  <div style="width:42px; height:42px; border:1px solid #2a2a35; border-radius:4px; flex-shrink:0; ${thumbStyle}"></div>
+                  <div style="flex:1; min-width:0;">
+                    <div style="font-size:11.5px; color:#e8e8ee;">${esc(s.slotLabel)}</div>
+                    <div style="font-size:9.5px; line-height:1.2;">${sourceBadge}</div>
+                  </div>
+                  <button data-assign-slot="${esc(s.kind)}:${esc(s.entityId)}:${esc(s.slotKey)}"
+                          ${hasSelection ? "" : "disabled"}
+                          style="background:${hasSelection ? "#c9a25a" : "#1a1a22"}; color:${hasSelection ? "#14141a" : "#5a5a6e"};
+                                 border:none; padding:5px 9px; border-radius:4px; font-size:10.5px;
+                                 cursor:${hasSelection ? "pointer" : "not-allowed"}; font-weight:600;
+                                 white-space:nowrap;">Use selection</button>
+                </div>
+              `;
+            }).join("")}
+          </div>
+        `;
+      }).join("");
+
+      wrap.innerHTML = groupsHtml || `<div style="padding:14px; font-size:11.5px; color:#6a6a78; text-align:center; line-height:1.5;">This project has no cast, environments, or style assets yet. Add some first, then re-open this tool.</div>`;
+
+      // Wire assign buttons
+      wrap.querySelectorAll("[data-assign-slot]").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          if (!currentRect || currentRect.w < 4) return;
+          const [kind, entityId, slotKey] = btn.dataset.assignSlot.split(":");
+          const slot = (await listAllAssignableSlots()).find(s =>
+            s.kind === kind && s.entityId === entityId && s.slotKey === slotKey
+          );
+          if (!slot) return;
+          try {
+            // Translate display-coord rect to source pixel coords
+            const realX = currentRect.x * displayScale;
+            const realY = currentRect.y * displayScale;
+            const realW = currentRect.w * displayScale;
+            const realH = currentRect.h * displayScale;
+            const cropDataUrl = await cropImageDataUrl(sourceDataUrl, realX, realY, realW, realH);
+            await assignCropToSlot(slot, cropDataUrl);
+            assignmentCount++;
+            progressEl.textContent = `${assignmentCount} crop${assignmentCount === 1 ? "" : "s"} assigned`;
+            // Re-render slot list so the thumbnail + badge update inline
+            await renderSlotList();
+            // Re-render the underlying tabs so the user sees changes when modal closes
+            await renderCastTab();
+            await renderLocationTab();
+            await renderAssetsTab();
+          } catch (err) {
+            toast(`Couldn't assign crop: ${err.message}`, { tone: "err", duration: 7000 });
+          }
+        });
+      });
+    }
+  }
+  NS.showDistributeMasterSheetModal = showDistributeMasterSheetModal;
+
   // ─── Bulk reference generation across the whole project (v3+) ──────
   // After a bible import, every character / environment / style asset row
   // exists but has no images. Rather than make the director click "Generate"
@@ -12114,6 +12525,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "create-asset")       showCreateAssetModal();
     else if (action === "gen-asset")          handleGenerateAsset(target.dataset.assetId);
     else if (action === "generate-all-refs")  showAutoGenPostImportModal({ fromManualTrigger: true, surfaceWhenEmpty: true });
+    else if (action === "distribute-sheet")   showDistributeMasterSheetModal();
     else if (action === "upload-cast")        showUploadCharacterModal(target.dataset.charId);
     else if (action === "upload-env")         showUploadEnvironmentModal(target.dataset.locId);
     else if (action === "upload-asset")       showUploadAssetModal(target.dataset.assetId);
@@ -12140,6 +12552,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             <button class="btn btn--sm btn--ghost" data-action="batch-reroll" data-batch-tab="cast">Re-roll all</button>
           </div>
           <div class="s2__spacer"></div>
+          <button class="btn btn--sm btn--ghost" data-action="distribute-sheet" title="Upload one multi-panel master sheet (the kind GPT / Midjourney / etc. produce). Crop each panel and assign to a specific slot — cast head_on, env wide, FX asset, etc. All crops land in refs.user (sacred from re-rolls).">↹ Master sheet</button>
           <button class="btn btn--sm" data-action="generate-all-refs" title="Open the auto-gen modal to fill every missing cast portrait, environment plate, and style asset across the whole project">↻ Generate references</button>
           <button class="btn btn--ghost btn--sm" data-action="open-connection">Connection</button>
         </div>
