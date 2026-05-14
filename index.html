@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="06547f5b1a71" data-build-time="2026-05-14T21:59:26.618Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"06547f5b1a71",time:"2026-05-14T21:59:26.618Z"};</script>
+<meta name="elevenx-build" content="51c052dcffed" data-build-time="2026-05-14T22:05:43.287Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"51c052dcffed",time:"2026-05-14T22:05:43.287Z"};</script>
 
 </head>
-<!-- elevenx-build: 06547f5b1a71 @ 2026-05-14T21:59:26.618Z -->
+<!-- elevenx-build: 51c052dcffed @ 2026-05-14T22:05:43.287Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9288,6 +9288,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       <div class="cast-card__meta">${meta}</div>
       <div class="cast-card__bottom" style="display:flex; gap:6px;">
         <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}" style="flex:1;">${refCount === 3 ? `Re-roll` : `Generate ${3 - refCount} angle${3-refCount===1?"":"s"}`}</button>
+        ${(refCount > 0 && refCount < 3) ? `<button class="btn btn--sm btn--ghost" data-action="reroll-cast" data-char-id="${esc(c.id)}" title="Wipe ALL generated portraits and re-roll from scratch (user uploads preserved). Use this when one or more existing angles are off-brief.">↻</button>` : ""}
         <button class="btn btn--sm btn--ghost" data-action="edit-cast" data-char-id="${esc(c.id)}" title="Edit character bible (wardrobe, distinctive features, etc.)">✎</button>
         <button class="btn btn--sm btn--ghost" data-action="upload-cast" data-char-id="${esc(c.id)}" title="Upload pre-drafted images">↑</button>
       </div>
@@ -11715,6 +11716,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       <div class="cast-card__meta">${meta}</div>
       <div class="cast-card__bottom" style="display:flex; gap:6px;">
         <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}" style="flex:1;">${refCount === 2 ? `Re-roll` : `Generate ${2 - refCount} ref${2-refCount===1?"":"s"}`}</button>
+        ${(refCount > 0 && refCount < 2) ? `<button class="btn btn--sm btn--ghost" data-action="reroll-env" data-loc-id="${esc(e.id)}" title="Wipe ALL generated plates and re-roll from scratch (user uploads preserved)">↻</button>` : ""}
         <button class="btn btn--sm btn--ghost" data-action="upload-env" data-loc-id="${esc(e.id)}" title="Upload pre-drafted plates">↑</button>
       </div>
     `;
@@ -12083,6 +12085,57 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   // ─── Actions ────────────────────────────────────────────────────────
+  // v4.1: explicit re-roll handlers for partial states. The existing handlers
+  // ALREADY auto-clear when refCount === 3, but at 1/3 or 2/3 they just fill
+  // missing slots — leaving a broken-looking head_on stuck in place (the
+  // "Fynn rendered as Lionn" case after the bug fix). These handlers wipe
+  // the modelKey bucket explicitly and re-fire generation from scratch.
+  // User uploads in refs.user are NEVER touched (sacred from re-rolls).
+  async function handleRerollCastRefs(charId, modelKey) {
+    const c = await Storage.get("characters", charId);
+    if (!c) return;
+    modelKey = modelKey || ACTIVE_IMAGE_MODEL;
+    const hasGenerated = ["head_on","three_quarter","full_body"].some(k => c.refs?.[modelKey]?.[k]?.dataUrl);
+    if (!hasGenerated) { toast(`${c.display_name} has no generated refs to re-roll.`, { tone: "warn" }); return; }
+    if (!confirm(`Re-roll all generated portraits for ${c.display_name}? Your uploaded refs (if any) will be preserved.`)) return;
+    c.refs = c.refs || { user: {}, seedream: {}, gpt: {} };
+    c.refs[modelKey] = {};
+    await Storage.put("characters", c);
+    await renderCastTab();
+    // Re-fire the standard chain with the current opts derived from card state.
+    // We chain all 3 angles since this is an explicit re-roll (user wants to
+    // start fresh, not a Quick first pass).
+    await handleGenerateCastRefs(charId, modelKey);
+  }
+
+  async function handleRerollEnvRefs(locId, modelKey) {
+    const e = await Storage.get("environments", locId);
+    if (!e) return;
+    modelKey = modelKey || ACTIVE_IMAGE_MODEL;
+    const hasGenerated = ["wide","detail"].some(k => e.refs?.[modelKey]?.[k]?.dataUrl);
+    if (!hasGenerated) { toast(`${e.display_name} has no generated plates to re-roll.`, { tone: "warn" }); return; }
+    if (!confirm(`Re-roll all generated plates for ${e.display_name}? Your uploaded refs (if any) will be preserved.`)) return;
+    e.refs = e.refs || { user: {}, seedream: {}, gpt: {} };
+    e.refs[modelKey] = {};
+    await Storage.put("environments", e);
+    await renderLocationTab();
+    await handleGenerateEnvRefs(locId, modelKey);
+  }
+
+  async function handleRerollAsset(assetId) {
+    const a = await Storage.get("assets", assetId);
+    if (!a) return;
+    const hasGenerated = a.refs?.gpt?.primary?.dataUrl || a.refs?.seedream?.primary?.dataUrl;
+    if (!hasGenerated) { toast(`${a.display_name} has no generated image to re-roll.`, { tone: "warn" }); return; }
+    if (!confirm(`Re-roll style asset "${a.display_name}"? Your uploaded ref (if any) will be preserved.`)) return;
+    a.refs = a.refs || { user: {}, seedream: {}, gpt: {} };
+    if (a.refs.gpt) a.refs.gpt = {};
+    if (a.refs.seedream) a.refs.seedream = {};
+    await Storage.put("assets", a);
+    await renderAssetsTab();
+    await handleGenerateAsset(assetId);
+  }
+
   // v4.0: `opts.onlyBase` skips the chained 3/4 + full_body generation.
   // The bulk-gen flow uses this for the "Quick" first pass — generates ONE
   // head_on per character, lets the user review before spending 2x more on
@@ -12975,6 +13028,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     e.preventDefault();
     if (action === "gen-cast")          handleGenerateCastRefs(target.dataset.charId, target.dataset.model || ACTIVE_IMAGE_MODEL);
     else if (action === "gen-env")      handleGenerateEnvRefs(target.dataset.locId, target.dataset.model || ACTIVE_IMAGE_MODEL);
+    else if (action === "reroll-cast")  handleRerollCastRefs(target.dataset.charId, target.dataset.model || ACTIVE_IMAGE_MODEL);
+    else if (action === "reroll-env")   handleRerollEnvRefs(target.dataset.locId, target.dataset.model || ACTIVE_IMAGE_MODEL);
     else if (action === "choose-canonical") handleChooseCanonical(target.dataset.assetKind, target.dataset.assetId, target.dataset.model);
     else if (action === "batch-gen" || action === "batch-reroll") handleBatch(action, target.dataset.batchTab || "cast", target.dataset.batchModel || ACTIVE_IMAGE_MODEL);
     else if (action === "roll-shot")          handleRollShot(target.dataset.shotId);
@@ -15024,6 +15079,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
   // Expose import for verify-build + future scripted-import use cases.
   NS.importBibleJson = importBibleJson;
+  NS.handleRerollCastRefs = handleRerollCastRefs;
+  NS.handleRerollEnvRefs  = handleRerollEnvRefs;
+  NS.handleRerollAsset    = handleRerollAsset;
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
