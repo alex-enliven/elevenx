@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="51c052dcffed" data-build-time="2026-05-14T22:05:43.287Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"51c052dcffed",time:"2026-05-14T22:05:43.287Z"};</script>
+<meta name="elevenx-build" content="e49948f53973" data-build-time="2026-05-14T22:15:04.080Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"e49948f53973",time:"2026-05-14T22:15:04.080Z"};</script>
 
 </head>
-<!-- elevenx-build: 51c052dcffed @ 2026-05-14T22:05:43.287Z -->
+<!-- elevenx-build: e49948f53973 @ 2026-05-14T22:15:04.080Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -10222,6 +10222,378 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
   NS.generateImageWithOptionalAnchor = generateImageWithOptionalAnchor;
 
+  // ─── Anchor Planner (v4.2) ──────────────────────────────────────────
+  // Bridges the gap between "bible imported" and "ready to generate". For
+  // each entity (cast / env / asset), produces a deterministic recipe:
+  //   - description: human-readable summary of what the anchor should depict
+  //   - externalPrompt: copy-paste-ready prompt for Midjourney / DALL-E / etc.
+  //   - missingFields: what bible data is needed for a better recipe
+  //
+  // Why this exists: single project-wide style anchors don't work for identity.
+  // The dominant subject in the anchor (Lionn) bleeds into every cast gen.
+  // Empirical: Veyr re-roll after Edit still produced Lionn. Conclusion: every
+  // character needs its OWN identity reference — either uploaded directly or
+  // generated externally using a prompt this tool produces.
+
+  function _styleCueForMedium(medium) {
+    if (medium === "animated_3d") return "Premium stylized 3D animated";
+    if (medium === "animated_2d") return "Stylized 2D animated";
+    if (medium === "documentary") return "Observational documentary";
+    return "Photographic cinematic";
+  }
+  function _canonExcerpt(styleCanon) {
+    if (!styleCanon) return "";
+    return String(styleCanon).split(/\.\s+/).slice(0, 2).join(". ").trim().replace(/\.$/, "") + ".";
+  }
+
+  function buildAnchorRecipeForCharacter(c, project) {
+    const styleCue = _styleCueForMedium(project?.medium);
+    const canon = _canonExcerpt(project?.style_canon);
+    const phys = c.physical || {};
+    const wrd = c.wardrobe?.episode_default || {};
+    const hair = phys.hair || {};
+    const features = (phys.distinctive_features || []).filter(Boolean);
+
+    const ageStr = c.identity?.age ? `${c.identity.age}-year-old ` : "";
+    const role = c.identity?.role_in_story || c.identity?.archetype || "";
+    const hairLine = [hair.color, hair.length, hair.style].filter(Boolean).join(" ");
+    const physicalLine = [
+      hairLine ? `${hairLine} hair` : "",
+      phys.eyes ? `${phys.eyes} eyes` : "",
+      phys.skin || "",
+    ].filter(Boolean).join(", ");
+    const wardrobeLine = [wrd.top, wrd.bottom, wrd.footwear].filter(Boolean).join(", ");
+
+    // Human-readable description
+    const description = [
+      `${ageStr}${role || "character"}`.trim(),
+      physicalLine,
+      wardrobeLine ? `wearing ${wardrobeLine}` : "",
+      features.length ? `distinctive: ${features.join(", ")}` : "",
+      c.stability_note ? `Identity lock: ${c.stability_note}` : "",
+    ].filter(Boolean).join(" — ");
+
+    // External prompt — copy/paste ready for an outside generator
+    const externalPrompt = [
+      `${styleCue} character reference portrait of ${c.display_name}.`,
+      ageStr ? `${ageStr.trim()}.` : "",
+      role ? `Role: ${role}.` : "",
+      physicalLine ? `Appearance: ${physicalLine}.` : "",
+      wardrobeLine ? `Wardrobe: ${wardrobeLine}.` : "",
+      features.length ? `Distinctive features: ${features.join(", ")}.` : "",
+      c.stability_note ? `Identity anchor: ${c.stability_note}` : "",
+      canon ? `Style canon: ${canon}` : "",
+      "Composition: head-and-shoulders or three-quarter framing, single character isolated on a neutral background.",
+      "CRITICAL: This is a NEW character — do NOT reference or copy any other characters from related projects.",
+      c.never?.length ? `Never: ${c.never.join("; ")}.` : "",
+      `Negative prompt: ${project?.medium?.startsWith("animated") ? "photoreal, photograph, live-action, " : ""}multiple characters, ensemble, complex background, text, watermark, low quality, other named cast.`,
+    ].filter(Boolean).join(" ");
+
+    // Acceptance criteria — what makes a good anchor
+    const acceptanceCriteria = [
+      "Single character only, fills most of the frame.",
+      "Neutral or simple background (so model focuses on identity).",
+      project?.medium?.startsWith("animated") ? "Rendering style matches the project medium (animation, not photoreal)." : "",
+      ageStr ? `Subject reads as ${ageStr.trim()}.` : "",
+      features.length ? `All distinctive features visible: ${features.slice(0, 3).join(", ")}.` : "",
+    ].filter(Boolean);
+
+    // What's missing — signals to user that Edit would improve the recipe
+    const missingFields = [];
+    if (!features.length) missingFields.push("distinctive features");
+    if (!wardrobeLine) missingFields.push("wardrobe (top/bottom/footwear)");
+    if (!hairLine) missingFields.push("hair description");
+    if (!c.stability_note) missingFields.push("stability note (identity lock)");
+
+    return { description, externalPrompt, acceptanceCriteria, missingFields };
+  }
+
+  function buildAnchorRecipeForEnvironment(e, project) {
+    const styleCue = _styleCueForMedium(project?.medium);
+    const canon = _canonExcerpt(project?.style_canon);
+    const a = e.architecture || {};
+    const l = e.lighting || {};
+    const materials = (a.materials || []).filter(Boolean);
+    const props = (e.props || []).filter(Boolean).slice(0, 5);
+    const palette = (e.palette || []).filter(Boolean);
+
+    const description = [
+      a.type || e.display_name,
+      materials.length ? `materials: ${materials.join(", ")}` : "",
+      l.description || (l.primary_source ? `lighting: ${l.primary_source}` : ""),
+      palette.length ? `palette: ${palette.join(", ")}` : "",
+      props.length ? `props: ${props.join(", ")}` : "",
+    ].filter(Boolean).join(" — ");
+
+    const externalPrompt = [
+      `${styleCue} environment establishing wide shot of ${e.display_name}.`,
+      a.type ? `Type: ${a.type}.` : "",
+      materials.length ? `Materials: ${materials.join(", ")}.` : "",
+      l.description ? `Lighting: ${l.description}.` : (l.primary_source ? `Lighting source: ${l.primary_source}.` : ""),
+      palette.length ? `Palette: ${palette.join(", ")}.` : "",
+      props.length ? `Visible props: ${props.join(", ")}.` : "",
+      e.ambient_sound ? `Ambient feel: ${e.ambient_sound}.` : "",
+      canon ? `Style canon: ${canon}` : "",
+      "Composition: 24mm wide establishing shot, eye level, no characters in frame.",
+      `Negative prompt: ${project?.medium?.startsWith("animated") ? "photoreal, photograph, live-action, " : ""}characters, people, faces, text, watermark, soundstage, lens flare.`,
+    ].filter(Boolean).join(" ");
+
+    const acceptanceCriteria = [
+      "No characters or people in frame.",
+      "Wide establishing framing.",
+      l.time_of_day ? `Time of day: ${l.time_of_day}.` : "",
+      palette.length ? `Palette readable: ${palette.slice(0, 3).join(", ")}.` : "",
+    ].filter(Boolean);
+
+    const missingFields = [];
+    if (!a.type) missingFields.push("architecture.type");
+    if (!l.primary_source && !l.description) missingFields.push("lighting");
+    if (!palette.length) missingFields.push("palette");
+
+    return { description, externalPrompt, acceptanceCriteria, missingFields };
+  }
+
+  function buildAnchorRecipeForAsset(a, project) {
+    const styleCue = _styleCueForMedium(project?.medium);
+    const canon = _canonExcerpt(project?.style_canon);
+    const palette = (a.palette || []).filter(Boolean);
+
+    const kindFraming = {
+      fx_sheet: "FX / atmosphere reference frame, no characters or environments — pure effect study.",
+      prop: "Single prop reference, isolated on neutral ground, three-quarter view, clean lighting.",
+      moodboard: "Mood / atmosphere reference plate, lighting and color study, no specific subject.",
+      style_frame: "Style frame reference — full-frame composition demonstrating the visual language.",
+      ui_sheet: "UI / typography reference sheet, clean layout, motifs and treatments.",
+    }[a.kind] || "Style reference frame.";
+
+    const description = [
+      a.display_name,
+      a.kind ? `(${a.kind.replace(/_/g, " ")})` : "",
+      a.description || "",
+      palette.length ? `palette: ${palette.join(", ")}` : "",
+    ].filter(Boolean).join(" — ");
+
+    const externalPrompt = [
+      `${styleCue} style asset — ${kindFraming}`,
+      a.description ? `Subject: ${a.description}.` : `Subject: ${a.display_name}.`,
+      palette.length ? `Palette: ${palette.join(", ")}.` : "",
+      canon ? `Style canon: ${canon}` : "",
+      "Composition: full-frame, no text, no characters unless the asset description specifies them.",
+      `Negative prompt: ${project?.medium?.startsWith("animated") ? "photoreal, " : ""}text, watermark, low quality, mismatched style.`,
+    ].filter(Boolean).join(" ");
+
+    const acceptanceCriteria = [
+      a.kind === "fx_sheet" ? "Pure FX with no characters." : "",
+      "Style matches the project medium.",
+      palette.length ? `Palette anchored: ${palette.slice(0, 3).join(", ")}.` : "",
+    ].filter(Boolean);
+
+    const missingFields = [];
+    if (!a.description) missingFields.push("description (prompt seed)");
+    if (!a.kind) missingFields.push("kind");
+
+    return { description, externalPrompt, acceptanceCriteria, missingFields };
+  }
+
+  // Build a recipe for any entity by kind
+  function buildAnchorRecipe(entity, kind, project) {
+    if (kind === "character") return buildAnchorRecipeForCharacter(entity, project);
+    if (kind === "environment") return buildAnchorRecipeForEnvironment(entity, project);
+    if (kind === "asset") return buildAnchorRecipeForAsset(entity, project);
+    throw new Error(`buildAnchorRecipe: unknown kind "${kind}"`);
+  }
+  NS.buildAnchorRecipe = buildAnchorRecipe;
+
+  // The Anchor Planner modal — the post-import landing.
+  async function showAnchorPlannerModal(opts = {}) {
+    if ($("#elx-anchor-planner")) return;
+    const project = await Storage.Projects.getActive();
+    if (!project) return;
+    const characters   = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const styleAssets  = await Storage.getAll("assets");
+
+    const panel = document.createElement("div");
+    panel.id = "elx-anchor-planner";
+    panel.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 9400;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px);
+    `;
+
+    // Count anchors uploaded vs total entities
+    const castWith = characters.filter(c => ["head_on","three_quarter","full_body"].some(k => c.refs?.user?.[k]?.dataUrl)).length;
+    const envWith = environments.filter(e => ["wide","detail"].some(k => e.refs?.user?.[k]?.dataUrl)).length;
+    const assetWith = styleAssets.filter(a => a.refs?.user?.primary?.dataUrl).length;
+    const totalEntities = characters.length + environments.length + styleAssets.length;
+    const anchoredTotal = castWith + envWith + assetWith;
+
+    const renderEntityRow = (entity, kind, label) => {
+      const recipe = buildAnchorRecipe(entity, kind, project);
+      // Status check
+      const hasUserAnchor = (() => {
+        if (kind === "character") return ["head_on","three_quarter","full_body"].some(k => entity.refs?.user?.[k]?.dataUrl);
+        if (kind === "environment") return ["wide","detail"].some(k => entity.refs?.user?.[k]?.dataUrl);
+        return !!entity.refs?.user?.primary?.dataUrl;
+      })();
+      const hasGenerated = (() => {
+        const m = ACTIVE_IMAGE_MODEL;
+        if (kind === "character") return ["head_on","three_quarter","full_body"].some(k => entity.refs?.[m]?.[k]?.dataUrl);
+        if (kind === "environment") return ["wide","detail"].some(k => entity.refs?.[m]?.[k]?.dataUrl);
+        return !!entity.refs?.[m]?.primary?.dataUrl;
+      })();
+      const status = hasUserAnchor
+        ? `<span style="color:#4ade80; font-size:10.5px; font-weight:600;">✓ ANCHOR UPLOADED</span>`
+        : hasGenerated
+          ? `<span style="color:#fbbf24; font-size:10.5px; font-weight:600;">⚠ GENERATED (no anchor — risk of identity drift)</span>`
+          : `<span style="color:#f87171; font-size:10.5px; font-weight:600;">○ NO ANCHOR YET</span>`;
+
+      const missingHint = recipe.missingFields.length > 0
+        ? `<div style="font-size:10.5px; color:#fbbf24; margin-top:4px; line-height:1.4;">⚠ Bible missing: ${recipe.missingFields.join(", ")}. <button data-edit-entity="${esc(kind)}:${esc(entity.id)}" style="background:none; color:#c9a25a; border:none; padding:0; cursor:pointer; text-decoration:underline; font-size:10.5px;">Edit ${entity.display_name}</button> to improve.</div>`
+        : "";
+
+      const uploadAction = kind === "character" ? "upload-cast" : kind === "environment" ? "upload-env" : "upload-asset";
+      const uploadIdAttr = kind === "character" ? "data-char-id" : kind === "environment" ? "data-loc-id" : "data-asset-id";
+
+      return `
+        <div style="background:${hasUserAnchor ? "#0d1410" : hasGenerated ? "#141008" : "#140a0a"};
+                    border:1px solid ${hasUserAnchor ? "rgba(74,222,128,0.30)" : hasGenerated ? "rgba(251,191,36,0.30)" : "rgba(248,113,113,0.30)"};
+                    border-radius:8px; padding:12px 14px; margin-bottom:10px;">
+          <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px; gap:10px;">
+            <div style="font-size:13.5px; font-weight:600; color:#e8e8ee;">
+              ${esc(label)} <span style="font-size:10.5px; color:#9a9aab; font-weight:400;">${esc(entity.display_name)}</span>
+            </div>
+            ${status}
+          </div>
+          <div style="font-size:11.5px; color:#c8c8d4; line-height:1.5; margin-bottom:8px;">
+            ${esc(recipe.description) || "<em style='color:#6a6a78'>No description — Edit the entity to fill in details.</em>"}
+          </div>
+          ${missingHint}
+          <details style="margin-top:8px;">
+            <summary style="font-size:10.5px; color:#9a9aab; cursor:pointer; user-select:none;">▸ Suggested external prompt (copy to Midjourney / DALL-E / etc.)</summary>
+            <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:10px 12px; margin-top:6px; font-family:'JetBrains Mono', monospace; font-size:10.5px; color:#c8c8d4; line-height:1.55; white-space:pre-wrap; user-select:all;">${esc(recipe.externalPrompt)}</div>
+            ${recipe.acceptanceCriteria.length ? `
+              <div style="margin-top:6px; font-size:10.5px; color:#6a6a78;">
+                <strong style="color:#9a9aab;">Good anchor checklist:</strong> ${recipe.acceptanceCriteria.map(a => esc(a)).join(" · ")}
+              </div>
+            ` : ""}
+          </details>
+          <div style="display:flex; gap:6px; margin-top:10px;">
+            <button data-copy-prompt="${esc(kind)}:${esc(entity.id)}"
+                    style="background:#14141a; color:#c9a25a; border:1px solid #c9a25a;
+                           padding:6px 12px; border-radius:5px; font-size:11px; cursor:pointer;">📋 Copy prompt</button>
+            <button data-action="${uploadAction}" ${uploadIdAttr}="${esc(entity.id)}"
+                    style="background:#c9a25a; color:#14141a; border:none;
+                           padding:6px 14px; border-radius:5px; font-size:11px;
+                           font-weight:600; cursor:pointer;">↑ Upload anchor</button>
+          </div>
+        </div>
+      `;
+    };
+
+    panel.innerHTML = `
+      <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
+                  padding:20px 24px; width:94vw; max-width:920px; height:92vh; max-height:920px;
+                  display:flex; flex-direction:column;
+                  font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
+        <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:8px;">
+          <div>
+            <h2 style="margin:0 0 4px; font-size:17px; font-weight:600;">Anchor planner</h2>
+            <div style="font-size:11.5px; color:#9a9aab; line-height:1.5;">
+              For consistent identity, each entity needs its OWN anchor reference. Single project-wide anchors bleed the dominant character into every gen. Upload an anchor per entity (or use the suggested prompt in an external tool, then upload the result).
+            </div>
+          </div>
+          <button id="elx-planner-close" style="background:none; border:none; color:#9a9aab; font-size:20px; cursor:pointer; line-height:1; padding:4px 8px;">×</button>
+        </div>
+        <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:8px 14px; font-size:11.5px; color:#c8c8d4; margin-bottom:14px; line-height:1.5;">
+          <strong style="color:#c9a25a;">${anchoredTotal} / ${totalEntities}</strong> entities have uploaded anchors.
+          Cast: <strong>${castWith}/${characters.length}</strong> ·
+          Environments: <strong>${envWith}/${environments.length}</strong> ·
+          Style assets: <strong>${assetWith}/${styleAssets.length}</strong>
+        </div>
+        <div style="flex:1; overflow-y:auto; padding-right:6px;">
+          ${characters.length > 0 ? `
+            <div style="font-size:10.5px; color:#6a6a78; letter-spacing:0.08em; text-transform:uppercase; margin:14px 0 8px; font-weight:600;">Cast (${characters.length})</div>
+            ${characters.map(c => renderEntityRow(c, "character", "CAST")).join("")}
+          ` : ""}
+          ${environments.length > 0 ? `
+            <div style="font-size:10.5px; color:#6a6a78; letter-spacing:0.08em; text-transform:uppercase; margin:18px 0 8px; font-weight:600;">Environments (${environments.length})</div>
+            ${environments.map(e => renderEntityRow(e, "environment", "ENV")).join("")}
+          ` : ""}
+          ${styleAssets.length > 0 ? `
+            <div style="font-size:10.5px; color:#6a6a78; letter-spacing:0.08em; text-transform:uppercase; margin:18px 0 8px; font-weight:600;">Style assets (${styleAssets.length})</div>
+            ${styleAssets.map(a => renderEntityRow(a, "asset", "ASSET")).join("")}
+          ` : ""}
+          ${totalEntities === 0 ? `<div style="padding:30px; text-align:center; color:#6a6a78;">No entities to plan for. Import a bible first.</div>` : ""}
+        </div>
+        <div style="display:flex; gap:8px; justify-content:space-between; align-items:center; margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
+          <div style="font-size:11px; color:#9a9aab; line-height:1.5; max-width:480px;">
+            ${anchoredTotal === totalEntities && totalEntities > 0
+              ? `✓ Every entity has an anchor. You're ready to generate consistent refs.`
+              : `Upload at least the hero character + each environment for best identity lock. Per-card uploads are still available on the cast/locations tabs.`}
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button id="elx-planner-defer" style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35; padding:8px 16px; border-radius:6px; font-size:12px; cursor:pointer;">Close — I'll plan later</button>
+            <button id="elx-planner-continue" style="background:#c9a25a; color:#14141a; border:none; padding:8px 18px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer;">Continue to generation →</button>
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    const close = () => panel.remove();
+    panel.addEventListener("click", (e) => { if (e.target === panel) close(); });
+    $("#elx-planner-close", panel).addEventListener("click", close);
+    $("#elx-planner-defer",  panel).addEventListener("click", close);
+    $("#elx-planner-continue", panel).addEventListener("click", async () => {
+      panel.remove();
+      await Storage.setSetting("auto_gen_pending", null);
+      showAutoGenPostImportModal({ fromManualTrigger: true });
+    });
+
+    // Wire copy-prompt buttons
+    panel.querySelectorAll("[data-copy-prompt]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const [kind, id] = btn.dataset.copyPrompt.split(":");
+        const store = kind === "character" ? "characters" : kind === "environment" ? "environments" : "assets";
+        const entity = await Storage.get(store, id);
+        if (!entity) return;
+        const recipe = buildAnchorRecipe(entity, kind, project);
+        try {
+          await navigator.clipboard.writeText(recipe.externalPrompt);
+          const orig = btn.textContent;
+          btn.textContent = "✓ Copied!";
+          btn.style.background = "rgba(74,222,128,0.10)";
+          btn.style.color = "#4ade80";
+          btn.style.borderColor = "#4ade80";
+          setTimeout(() => {
+            btn.textContent = orig;
+            btn.style.background = "#14141a";
+            btn.style.color = "#c9a25a";
+            btn.style.borderColor = "#c9a25a";
+          }, 1800);
+        } catch (err) {
+          toast(`Couldn't copy: ${err.message}. Use the textarea below the button.`, { tone: "err", duration: 7000 });
+        }
+      });
+    });
+
+    // Wire edit-entity links inside missing-fields hints
+    panel.querySelectorAll("[data-edit-entity]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const [kind, id] = btn.dataset.editEntity.split(":");
+        if (kind === "character") {
+          panel.remove();
+          showEditCharacterModal(id);
+        } else {
+          toast(`Edit form for ${kind} not built yet — edit the bible JSON and re-import.`, { tone: "warn" });
+        }
+      });
+    });
+  }
+  NS.showAnchorPlannerModal = showAnchorPlannerModal;
+
   // ─── Bulk reference generation across the whole project (v3+) ──────
   // After a bible import, every character / environment / style asset row
   // exists but has no images. Rather than make the director click "Generate"
@@ -11439,14 +11811,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
                   style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
                          padding:10px 18px; border-radius:6px; font-size:12.5px; cursor:pointer;">${opts.fromManualTrigger ? "Cancel" : "Skip — I'll do it manually"}</button>
           ${(noAnchorsAtAll && !hasProjectAnchor) ? `
-            <button id="elx-autogen-anyway"
-                    style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
-                           padding:10px 18px; border-radius:6px; font-size:12.5px; cursor:pointer;"
-                    title="Generate without uploading anchors first — riskier for style consistency on the first portrait of each character">Per-card uploads…</button>
             <button id="elx-autogen-go-anchorless"
+                    style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
+                           padding:10px 18px; border-radius:6px; font-size:12px; cursor:pointer;"
+                    title="Generate without uploading anchors. Risky — text-to-image base portraits can drift to the model's default for 'boy', 'man', etc. Especially bad in multi-character projects.">Generate without anchors anyway</button>
+            <button id="elx-autogen-open-planner"
                     style="background:#c9a25a; color:#14141a; border:none;
                            padding:10px 22px; border-radius:6px; font-size:12.5px;
-                           font-weight:600; cursor:pointer;">Generate without anchor</button>
+                           font-weight:600; cursor:pointer;">📋 Open Anchor Planner</button>
           ` : workerConnected ? `
             <button id="elx-autogen-go"
                     style="background:#c9a25a; color:#14141a; border:none;
@@ -11527,19 +11899,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     $("#elx-autogen-skip", panel).addEventListener("click", close);
 
     if (noAnchorsAtAll && !hasProjectAnchor) {
-      // No project anchor AND no per-card anchors. Modal shows three CTAs:
-      //   1. Skip (handled above)
-      //   2. Per-card uploads… → navigates to Cast tab for the granular flow
-      //   3. Generate without anchor → fires bulk-gen as text-to-image
-      $("#elx-autogen-anyway", panel).addEventListener("click", async () => {
+      // v4.2: When no anchors exist anywhere, the recommended path is the
+      // Anchor Planner — per-entity recipes that produce identity-locked
+      // references. "Generate without anchors anyway" remains as the explicit
+      // override (still useful for solo-character projects or testing).
+      $("#elx-autogen-open-planner", panel).addEventListener("click", async () => {
         await Storage.setSetting("auto_gen_pending", null);
         panel.remove();
-        const castTab = document.querySelector('.proto-tab[data-screen="s2"]');
-        if (castTab) castTab.click();
-        toast(
-          `Upload per-card anchors via the ↑ buttons, or use ↹ Master sheet for crop-and-distribute. When ready, click "Generate references" to resume.`,
-          { tone: "ok", duration: 12000 }
-        );
+        showAnchorPlannerModal();
       });
       $("#elx-autogen-go-anchorless", panel).addEventListener("click", fireBulkGen);
     } else if (workerConnected) {
@@ -13057,6 +13424,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "gen-asset")          handleGenerateAsset(target.dataset.assetId);
     else if (action === "generate-all-refs")  showAutoGenPostImportModal({ fromManualTrigger: true, surfaceWhenEmpty: true });
     else if (action === "distribute-sheet")   showDistributeMasterSheetModal();
+    else if (action === "anchor-planner")     showAnchorPlannerModal();
     else if (action === "upload-cast")        showUploadCharacterModal(target.dataset.charId);
     else if (action === "edit-cast")          showEditCharacterModal(target.dataset.charId);
     else if (action === "upload-env")         showUploadEnvironmentModal(target.dataset.locId);
@@ -13084,8 +13452,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             <button class="btn btn--sm btn--ghost" data-action="batch-reroll" data-batch-tab="cast">Re-roll all</button>
           </div>
           <div class="s2__spacer"></div>
+          <button class="btn btn--sm" data-action="anchor-planner" title="Show the per-entity anchor recipe for the project. Each cast member, environment, and style asset needs its own anchor for identity-locked generation. The planner produces a copy-paste prompt per entity you can use in Midjourney / DALL-E / etc.">📋 Anchor planner</button>
           <button class="btn btn--sm btn--ghost" data-action="distribute-sheet" title="Upload one multi-panel master sheet (the kind GPT / Midjourney / etc. produce). Crop each panel and assign to a specific slot — cast head_on, env wide, FX asset, etc. All crops land in refs.user (sacred from re-rolls).">↹ Master sheet</button>
-          <button class="btn btn--sm" data-action="generate-all-refs" title="Open the auto-gen modal to fill every missing cast portrait, environment plate, and style asset across the whole project">↻ Generate references</button>
+          <button class="btn btn--sm btn--ghost" data-action="generate-all-refs" title="Open the auto-gen modal to fill every missing cast portrait, environment plate, and style asset across the whole project">↻ Generate references</button>
           <button class="btn btn--ghost btn--sm" data-action="open-connection">Connection</button>
         </div>
         <div class="cast-grid s2__grid" id="elx-cast-grid"></div>
@@ -15048,8 +15417,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       if (flag && flag.project_id === activeProjectId) {
         const ageSec = (Date.now() - (flag.requested_at || 0)) / 1000;
         if (ageSec < 60) {
-          // Slight delay so the page paints before the modal lands
-          setTimeout(showAutoGenPostImportModal, 350);
+          // v4.2: post-import lands on the Anchor Planner FIRST, not the
+          // auto-gen modal. The planner shows per-entity anchor recipes so
+          // the user can upload identity references BEFORE spending money on
+          // text-to-image generations that drift to the dominant subject.
+          // Clear the auto_gen_pending flag so we don't double-fire if the
+          // user closes the planner and reloads.
+          await Storage.setSetting("auto_gen_pending", null);
+          setTimeout(showAnchorPlannerModal, 350);
         } else {
           // Stale flag — clear it silently
           await Storage.setSetting("auto_gen_pending", null);
