@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="1868bce8f139" data-build-time="2026-05-14T22:26:38.342Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"1868bce8f139",time:"2026-05-14T22:26:38.342Z"};</script>
+<meta name="elevenx-build" content="e9400190c8c6" data-build-time="2026-05-14T22:34:11.770Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"e9400190c8c6",time:"2026-05-14T22:34:11.770Z"};</script>
 
 </head>
-<!-- elevenx-build: 1868bce8f139 @ 2026-05-14T22:26:38.342Z -->
+<!-- elevenx-build: e9400190c8c6 @ 2026-05-14T22:34:11.770Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9503,8 +9503,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if ($("#elx-upload-modal")) return;
     const panel = document.createElement("div");
     panel.id = "elx-upload-modal";
+    // v4.4: z-index 9500 (above Anchor Planner at 9400). The upload modal
+    // can be triggered from any context — including from within the planner —
+    // and must always render on top so the file picker is reachable.
     panel.style.cssText = `
-      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9000;
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9500;
       display: flex; align-items: center; justify-content: center;
       backdrop-filter: blur(6px);
     `;
@@ -9653,6 +9656,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         await Storage.put("characters", c);
         toast(`Saved uploads for ${c.display_name}`, { tone: "ok" });
         await renderCastTab();
+        refreshAnchorPlannerIfOpen();
       },
     });
   }
@@ -9687,6 +9691,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         await Storage.put("environments", e);
         toast(`Saved uploads for ${e.display_name}`, { tone: "ok" });
         await renderLocationTab();
+        refreshAnchorPlannerIfOpen();
       },
     });
   }
@@ -9720,8 +9725,21 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         await Storage.put("assets", a);
         toast(`Saved upload for ${a.display_name}`, { tone: "ok" });
         await renderAssetsTab();
+        refreshAnchorPlannerIfOpen();
       },
     });
+  }
+
+  // v4.4: if the Anchor Planner is open, close it and re-open with fresh
+  // state so the just-saved upload's status badge flips to "✓ ANCHOR UPLOADED".
+  // The planner reads from IDB at open time; without a refresh it shows stale
+  // status. Called from each upload modal's save callback.
+  function refreshAnchorPlannerIfOpen() {
+    const open = document.getElementById("elx-anchor-planner");
+    if (!open) return;
+    open.remove();
+    // Small delay so any toast / focus events complete before re-render
+    setTimeout(() => showAnchorPlannerModal(), 50);
   }
 
   // ─── Master-sheet crop-and-distribute (v3.7) ────────────────────────
@@ -14157,8 +14175,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if ($("#elx-form-modal")) return;
     const panel = document.createElement("div");
     panel.id = "elx-form-modal";
+    // v4.4: z-index 9500 (above Anchor Planner at 9400). Edit modals can be
+    // opened from the planner's "Edit [entity]" inline link; must render above.
     panel.style.cssText = `
-      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9000;
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9500;
       display: flex; align-items: center; justify-content: center;
       backdrop-filter: blur(6px);
     `;
