@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="6c48557f9ba8" data-build-time="2026-05-14T20:34:45.185Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"6c48557f9ba8",time:"2026-05-14T20:34:45.185Z"};</script>
+<meta name="elevenx-build" content="5b9d431e8abd" data-build-time="2026-05-14T20:52:09.964Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"5b9d431e8abd",time:"2026-05-14T20:52:09.964Z"};</script>
 
 </head>
-<!-- elevenx-build: 6c48557f9ba8 @ 2026-05-14T20:34:45.185Z -->
+<!-- elevenx-build: 5b9d431e8abd @ 2026-05-14T20:52:09.964Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -7278,18 +7278,78 @@ function resolveVoiceoverSpeakerName(vo, cast) {
 }
 
 /**
- * Compose a Seedream still-image prompt for a cast reference angle.
- * Used to populate the cast bible from a structured character spec.
+ * Per-medium rendering spec for the image reference builders (cast, env, asset).
+ * The OPENING sentence drives Seedance/GPT-image style hardest — it must
+ * match the project's medium or every generated portrait reads photoreal.
+ *
+ * This is the bug-fix for "Generate all" producing a photoreal teenage boy
+ * portrait when the project was animated_3d: the cast prompt builder was
+ * hardcoded to "Photographic portrait" regardless of medium.
+ */
+function mediumPromptSpec(medium) {
+  if (medium === "animated_3d") {
+    return {
+      opening: "Premium stylized 3D animated character reference sheet — feature-film quality.",
+      qualityCues: "Polished PBR materials, stylized shading, expressive character animation. Cinematic but emotionally readable lighting. Single character on a clean neutral background suitable as a reference sheet.",
+      negativeCues: "photoreal, photograph, photorealistic, live-action, skin pores, lens flare, shallow depth of field, stock photo, plastic skin, AI sheen, makeup-heavy, exaggerated features, uncanny valley",
+      envOpening: "Premium stylized 3D animated environment reference plate — feature-film quality.",
+      envQuality: "Stylized 3D rendering, painterly atmosphere, no photoreal lens artifacts.",
+      envNegative: "photoreal, photograph, fisheye, neon, sci-fi, sterile, lens flare, photo-quality skin tones on any visible characters",
+    };
+  }
+  if (medium === "animated_2d") {
+    return {
+      opening: "Stylized 2D animated character reference sheet, clean linework with painterly shading.",
+      qualityCues: "Expressive limited-frame animation aesthetic, flat-but-considered color, no photoreal rendering. Single character on a neutral background.",
+      negativeCues: "photoreal, photograph, 3D render, skin pores, lens flare, shallow depth of field, stock photo, plastic, AI sheen",
+      envOpening: "Stylized 2D animated environment reference plate, painterly background style.",
+      envQuality: "Hand-painted feel, no 3D rendering tells.",
+      envNegative: "photoreal, 3D render, photograph, fisheye, neon, sci-fi, lens flare",
+    };
+  }
+  if (medium === "documentary") {
+    return {
+      opening: "Observational documentary portrait, available light.",
+      qualityCues: "Naturalistic, subtle camera presence. No studio lighting setup. Natural skin texture, real environment.",
+      negativeCues: "stock photo, plastic skin, over-smoothed, AI sheen, theatrical lighting, glossy",
+      envOpening: "Observational documentary establishing shot of the location.",
+      envQuality: "Available light, real environment, no theatrical staging.",
+      envNegative: "neon, sci-fi, fake plants, lens flare, dramatic lighting, soundstage feel",
+    };
+  }
+  // live_action (default)
+  return {
+    opening: "Photographic portrait, documentary corporate style.",
+    qualityCues: "Neutral grey studio background. Soft north-facing daylight from camera right. 35mm lens, shallow depth of field, natural skin texture visible, high resolution.",
+    negativeCues: "stock photo, plastic skin, over-smoothed, makeup-heavy, exaggerated features, AI sheen, glossy",
+    envOpening: "Photographic establishing wide shot, architectural photography style, 24mm wide, eye level, no people in frame.",
+    envQuality: "Documentary realism. 35mm lens feel.",
+    envNegative: "fisheye, dramatic lighting, neon, futuristic, sci-fi, empty soundstage feel, fake plants, lens flare",
+  };
+}
+
+/**
+ * Compose a Seedream prompt for a cast bible reference angle.
  *
  * @param {object} character — cast bible entry
  * @param {"head_on"|"three_quarter"|"full_body"} angle
+ * @param {object} [project] — project row { medium, style_canon }. When absent
+ *                              defaults to live_action. CRITICAL for animation:
+ *                              without this arg the prompt produces photoreal
+ *                              output, which is wrong for animated_3d/2d
+ *                              projects AND ethically problematic when the
+ *                              character is a minor.
  */
-function composeCastReferencePrompt(character, angle = "head_on") {
+function composeCastReferencePrompt(character, angle = "head_on", project) {
   const id   = character.identity || {};
   const phys = character.physical || {};
   const wrd  = character.wardrobe?.episode_default || {};
   const hair = phys.hair || {};
   const distinctive = (phys.distinctive_features || []).join(", ");
+
+  const medium = (project?.medium || "live_action").trim();
+  const styleCanon = (project?.style_canon || "").trim();
+  const styleSpec = mediumPromptSpec(medium);
 
   const angleClause = {
     head_on:       "Head and shoulders, front view, neutral expression, looking at camera.",
@@ -7301,16 +7361,30 @@ function composeCastReferencePrompt(character, angle = "head_on") {
     ? `Wearing: ${[wrd.top, wrd.bottom, wrd.footwear].filter(Boolean).join(", ")}.`
     : `Wearing: ${wrd.top || ""}.`;
 
+  const ageSafetyClause = (id.age != null && Number(id.age) < 18 && (medium === "animated_3d" || medium === "animated_2d"))
+    ? `Stylized animated character — youthful proportions appropriate for a ${id.age}-year-old, NOT photoreal. Features expressive and readable.`
+    : "";
+
   const prompt = [
-    "Photographic portrait, documentary corporate style.",
+    // OPENING — defines the rendering style. Was hardcoded to "Photographic
+    // portrait, documentary corporate style". Now medium-aware: animation gets
+    // "Premium stylized 3D animated character reference sheet" etc.
+    styleSpec.opening,
+    // STYLE CANON — full project canon goes here so the model has the whole
+    // visual world context, not just a generic "documentary realism" hint.
+    styleCanon ? `Style canon: ${styleCanon}` : null,
     angleClause,
-    `${id.age || "?"}-year-old ${id.nationality || ""} ${character.display_name?.split(" ")[0] || "person"}.`,
+    `Subject: ${id.age || "?"}-year-old ${id.nationality || ""} ${character.display_name?.split(" ")[0] || "person"}.`,
     `${hair.color || ""} ${hair.length || ""} hair${hair.style ? ", " + hair.style : ""}.`,
-    distinctive ? `${distinctive}.` : "",
+    distinctive ? `Distinctive features: ${distinctive}.` : "",
     bodyClause,
-    "Neutral grey studio background. Soft north-facing daylight from camera right. 35mm lens, shallow depth of field, natural skin texture visible, high resolution.",
-    `Negative: stock photo, plastic skin, over-smoothed, makeup-heavy, exaggerated features, AI sheen, glossy.`,
-  ].filter(s => s && s.trim().length > 1).join(" ");
+    // SAFETY — for minors in animation, explicitly disallow photoreal output.
+    ageSafetyClause,
+    // RENDERING — medium-specific quality cues. Animation skips "natural skin
+    // texture / 35mm shallow depth" (photoreal pushes).
+    styleSpec.qualityCues,
+    `Negative: ${styleSpec.negativeCues}.`,
+  ].filter(s => s && String(s).trim().length > 1).join(" ");
 
   const aspectMap = { head_on: "square_hd", three_quarter: "portrait_4_3", full_body: "portrait_16_9" };
   return {
@@ -7337,36 +7411,47 @@ function composeCastReferencePrompt(character, angle = "head_on") {
  *
  * @param {object} character — cast bible entry
  * @param {"three_quarter"|"full_body"} angle — target angle
+ * @param {object} [project] — project row { medium, style_canon }. Medium-aware
+ *                              language so 3/4 + full_body inherit animation style
+ *                              from the head_on anchor.
  */
-function composeCastReferenceEditPrompt(character, angle) {
+function composeCastReferenceEditPrompt(character, angle, project) {
   const id   = character.identity || {};
   const phys = character.physical || {};
   const wrd  = character.wardrobe?.episode_default || {};
   const hair = phys.hair || {};
   const distinctive = (phys.distinctive_features || []).join(", ");
+  const medium = (project?.medium || "live_action").trim();
+  const styleSpec = mediumPromptSpec(medium);
 
   const transform = {
     three_quarter:
-      "Transform the input portrait to show the EXACT SAME PERSON from a three-quarter angle, " +
+      "Transform the input portrait to show the EXACT SAME CHARACTER from a three-quarter angle, " +
       "head slightly turned toward camera right, neutral closed-mouth expression, looking off camera right. " +
-      "Same face structure, same hair, same wardrobe, same lighting, same background.",
+      "Same face structure, same hair, same wardrobe, same lighting, same background, SAME RENDERING STYLE.",
     full_body:
-      "Transform the input portrait to show the EXACT SAME PERSON in a full-body standing pose, " +
+      "Transform the input portrait to show the EXACT SAME CHARACTER in a full-body standing pose, " +
       "relaxed posture, hands at sides or one holding a relevant prop. Camera pulls back to show " +
       "the full figure head to toe. Same face, same hair, same wardrobe palette, " +
-      "same lighting, same background. The face must be unmistakably the same person from the input.",
+      "same lighting, same background, SAME RENDERING STYLE. The character must be unmistakably " +
+      "the same one from the input.",
   }[angle];
 
   if (!transform) throw new Error(`composeCastReferenceEditPrompt: unknown angle '${angle}'`);
 
+  const ageSafetyClause = (id.age != null && Number(id.age) < 18 && (medium === "animated_3d" || medium === "animated_2d"))
+    ? `Stylized animated character — youthful proportions for a ${id.age}-year-old, NOT photoreal.`
+    : "";
+
   const continuity = [
-    "Identity preservation is critical — the face must be visually identical to the input.",
-    `Subject: ${id.age || "?"}-year-old ${id.nationality || ""} ${character.display_name?.split(" ")[0] || "person"}.`,
+    "Identity preservation is critical — face must be visually identical to the input AND match the input's rendering style.",
+    `Subject: ${id.age || "?"}-year-old ${id.nationality || ""} ${character.display_name?.split(" ")[0] || "character"}.`,
     `Hair: ${hair.color || ""} ${hair.length || ""} hair${hair.style ? ", " + hair.style : ""} — match exactly.`,
     distinctive ? `Distinctive features (must persist): ${distinctive}.` : "",
     `Wardrobe (must persist): ${wrd.top || ""}${wrd.bottom ? ", " + wrd.bottom : ""}${wrd.footwear && angle === "full_body" ? ", " + wrd.footwear : ""}.`,
-    "Studio quality, soft north-facing daylight from camera right, 35mm lens feel, natural skin texture.",
-    "Negative: different person, identity drift, plastic skin, AI sheen, stock photo, makeup-heavy, exaggerated features.",
+    ageSafetyClause,
+    styleSpec.qualityCues,
+    `Negative: different person, identity drift, rendering style drift, ${styleSpec.negativeCues}.`,
   ].filter(s => s && s.trim().length > 1).join(" ");
 
   const prompt = `${transform} ${continuity}`;
@@ -7388,31 +7473,33 @@ function composeCastReferenceEditPrompt(character, angle) {
  * `detail` is then generated as an edit using the wide as reference —
  * same physical room, closer / different framing.
  */
-function composeEnvironmentReferenceEditPrompt(environment, kind = "detail") {
+function composeEnvironmentReferenceEditPrompt(environment, kind = "detail", project) {
   const a = environment.architecture || {};
   const l = environment.lighting || {};
+  const medium = (project?.medium || "live_action").trim();
+  const styleSpec = mediumPromptSpec(medium);
 
   const transform = {
     wide:
       "Transform the input frame to a wider establishing view of the SAME PHYSICAL SPACE. " +
       "Pull camera back, show more of the room from the same vantage. " +
-      "Same materials, same lighting, same time of day, same palette.",
+      "Same materials, same lighting, same time of day, same palette, SAME RENDERING STYLE.",
     detail:
       "Transform the input frame to a closer detail view of the SAME PHYSICAL SPACE. " +
       "Camera moves in to show texture and props at mid-distance. " +
-      "Same materials, same lighting, same palette — only the framing changes.",
+      "Same materials, same lighting, same palette, SAME RENDERING STYLE — only the framing changes.",
   }[kind];
 
   if (!transform) throw new Error(`composeEnvironmentReferenceEditPrompt: unknown kind '${kind}'`);
 
   const continuity = [
-    "Spatial consistency is critical — this must be unmistakably the same physical space as the input.",
+    "Spatial consistency is critical — this must be unmistakably the same physical space as the input AND match the input's rendering style.",
     `Space: ${a.type || environment.display_name || "interior"}.`,
     a.materials?.length ? `Materials (must persist): ${a.materials.join(", ")}.` : "",
     l.primary_source ? `Lighting (must persist): ${l.primary_source}, ${l.quality || ""}, ${l.time_of_day || ""}.` : "",
     environment.palette?.length ? `Palette (must persist): ${environment.palette.join(", ")}.` : "",
-    "Documentary realism. 35mm lens feel.",
-    "Negative: different room, different lighting, fisheye, dramatic lighting, neon, sci-fi, fake plants.",
+    styleSpec.envQuality,
+    `Negative: different room, different lighting, rendering style drift, ${styleSpec.envNegative}.`,
   ].filter(s => s && s.trim().length > 1).join(" ");
 
   return {
@@ -7425,23 +7512,34 @@ function composeEnvironmentReferenceEditPrompt(environment, kind = "detail") {
 
 /**
  * Compose a Seedream prompt for an environment wide reference.
+ *
+ * @param {object} environment
+ * @param {"wide"|"detail"} kind
+ * @param {object} [project] — project row { medium, style_canon }. Medium-aware
+ *                              opening + style canon prepended.
  */
-function composeEnvironmentReferencePrompt(environment, kind = "wide") {
+function composeEnvironmentReferencePrompt(environment, kind = "wide", project) {
   const a = environment.architecture || {};
   const l = environment.lighting || {};
+  const medium = (project?.medium || "live_action").trim();
+  const styleCanon = (project?.style_canon || "").trim();
+  const styleSpec = mediumPromptSpec(medium);
+
   const angleClause = kind === "wide"
-    ? "Photographic establishing wide shot, architectural photography style, 24mm wide, eye level, no people in frame."
-    : "Photographic mid-distance detail shot, 35mm lens.";
+    ? "Establishing wide framing, 24mm wide-equivalent, eye level, no characters in frame."
+    : "Mid-distance detail framing, 35mm-equivalent, single focal element.";
 
   const prompt = [
+    styleSpec.envOpening,
+    styleCanon ? `Style canon: ${styleCanon}` : null,
     angleClause,
-    `Interior of a ${a.type || environment.display_name || "space"}.`,
+    `Subject: ${a.type || environment.display_name || "space"}.`,
     a.materials?.length ? `Materials: ${a.materials.join(", ")}.` : "",
     l.primary_source ? `Lighting: ${l.primary_source}, ${l.quality || ""}, ${l.time_of_day || ""}.` : "",
     environment.palette?.length ? `Palette: ${environment.palette.join(", ")}.` : "",
-    "Documentary realism.",
-    "Negative: fisheye, dramatic lighting, neon, futuristic, sci-fi, empty soundstage feel, fake plants, lens flare.",
-  ].filter(s => s && s.trim().length > 1).join(" ");
+    styleSpec.envQuality,
+    `Negative: ${styleSpec.envNegative}.`,
+  ].filter(s => s && String(s).trim().length > 1).join(" ");
 
   return {
     prompt,
@@ -9723,28 +9821,35 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
   // Auto-create style asset stubs for reference_assets ids that don't match any cast/env.
   // Heuristic kind detection from naming convention (e.g., "..._fx_sheet_v01" → fx_sheet).
-  function deriveStyleAssetsFromShots(shots, charIds, envIds) {
+  // v3.4: also pulls ids from asset_generation_plan_gpt_image_2.priority_order so
+  // assets the director listed but didn't reference in shots still get created.
+  function deriveStyleAssetsFromShots(shots, charIds, envIds, extraIds) {
     const seen = new Map(); // id → { display_name, kind }
+    const allIdSources = [];
     for (const s of (shots || [])) {
-      for (const ref of (s.reference_assets || [])) {
-        const id = String(ref).toLowerCase();
-        if (seen.has(id)) continue;
-        let matchesCast = charIds.has(id) || Array.from(charIds).some(cid => id.includes(cid));
-        if (matchesCast) continue;
-        let matchesEnv = envIds.has(id) || Array.from(envIds).some(eid => id.includes(eid));
-        if (matchesEnv) continue;
-        // It's a style asset
-        const lower = id;
-        let kind = "style_frame";
-        if (lower.includes("fx") || lower.includes("shadow_fx") || lower.includes("atmosphere")) kind = "fx_sheet";
-        else if (lower.includes("ui") || lower.includes("typography") || lower.includes("hud")) kind = "ui_sheet";
-        else if (lower.includes("prop") || lower.includes("weapon") || lower.includes("blade")) kind = "prop";
-        else if (lower.includes("moodboard") || lower.includes("mood")) kind = "moodboard";
-        seen.set(id, {
-          display_name: snakeToTitleCase(id.replace(/^golden_/, "").replace(/_v\d+$/, "").replace(/_sheet$/, "")),
-          kind,
-        });
-      }
+      if (Array.isArray(s.reference_assets)) allIdSources.push(...s.reference_assets);
+    }
+    if (Array.isArray(extraIds)) allIdSources.push(...extraIds);
+
+    for (const ref of allIdSources) {
+      if (!ref) continue;
+      const id = String(ref).toLowerCase();
+      if (seen.has(id)) continue;
+      let matchesCast = charIds.has(id) || Array.from(charIds).some(cid => id.includes(cid));
+      if (matchesCast) continue;
+      let matchesEnv = envIds.has(id) || Array.from(envIds).some(eid => id.includes(eid));
+      if (matchesEnv) continue;
+      // It's a style asset
+      const lower = id;
+      let kind = "style_frame";
+      if (lower.includes("fx") || lower.includes("shadow_fx") || lower.includes("atmosphere")) kind = "fx_sheet";
+      else if (lower.includes("ui") || lower.includes("typography") || lower.includes("hud")) kind = "ui_sheet";
+      else if (lower.includes("prop") || lower.includes("weapon") || lower.includes("blade")) kind = "prop";
+      else if (lower.includes("moodboard") || lower.includes("mood")) kind = "moodboard";
+      seen.set(id, {
+        display_name: snakeToTitleCase(id.replace(/^golden_/, "").replace(/_v\d+$/, "").replace(/_sheet$/, "")),
+        kind,
+      });
     }
     return Array.from(seen.entries()).map(([id, info]) => ({
       id, display_name: info.display_name, kind: info.kind, description: "",
@@ -9801,9 +9906,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         display_name: c.display_name || snakeToTitleCase(id),
         identity: {
           age: Number(c.age) || null,
-          nationality: "",
-          role_in_story: c.role || "",
-          archetype: c.personality || "",
+          nationality: c.nationality || "",
+          // Different director outputs use different field names for the
+          // one-line personality summary. Support all common variants:
+          //   - `archetype` (the explicit field)
+          //   - `personality` (descriptive narrative)
+          //   - `role` (when the role itself is descriptive, e.g.,
+          //     "loyal muscle" or "reluctant heir")
+          archetype: c.archetype || c.personality || c.role || "",
+          role_in_story: c.role || c.role_in_story || "",
         },
         physical: { distinctive_features: [] },
         wardrobe: { color_palette: [] },
@@ -9834,7 +9945,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // STYLE ASSETS — auto-generate stubs from shot reference_assets that don't match cast/env
     const charIds = new Set(characters.map(c => c.id));
     const envIds  = new Set(environments.map(e => e.id));
-    const style_assets = deriveStyleAssetsFromShots(teaser.shots || [], charIds, envIds);
+    // v3.4: gather extra ids from asset_generation_plan_gpt_image_2.priority_order
+    // (when present) so assets the director listed but didn't reference inside
+    // a shot still get created — needed for the user's Lionn bible, which has
+    // 8 entries in priority_order but only some show up in shot reference_assets.
+    const agp = raw.asset_generation_plan_gpt_image_2 || raw.asset_generation_plan || {};
+    const priorityOrderIds = Array.isArray(agp.priority_order) ? agp.priority_order : [];
+    const style_assets = deriveStyleAssetsFromShots(teaser.shots || [], charIds, envIds, priorityOrderIds);
     const assetIds = new Set(style_assets.map(a => a.id));
 
     // SHOTS — teaser.shots → strict shape
@@ -10916,6 +11033,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     State.activeJobs++;
     let okCount = 0, failCount = 0;
 
+    // CRITICAL: read the active project so the reference prompts are
+    // medium-aware. Without this, animated_3d projects get photoreal
+    // portraits, which is ethically wrong for minors AND off-brief.
+    const project = await Storage.Projects.getActive();
+
     try {
       // ── STEP 1: head_on via text-to-image (no reference) ────────────────
       // User uploads win — if a director has dropped in their own head_on,
@@ -10928,7 +11050,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       if (!headOnDataUrl) {
         setGPS(true, `Generating <span class="mono">${esc(charId)} · head_on</span>`, `${modelMeta.label} · base portrait`, 15);
         try {
-          const promptSpec = composer.composeCastReferencePrompt(c, "head_on");
+          const promptSpec = composer.composeCastReferencePrompt(c, "head_on", project);
           let dataUrl, seed, costUsd;
           if (modelKey === "seedream") {
             const result = await State.fal.seedreamTextToImage(promptSpec);
@@ -10972,7 +11094,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         setGPS(true, `Generating <span class="mono">${esc(charId)} · ${angle}</span>`,
           `${modelMeta.label} · identity-locked from head_on`, 40);
         try {
-          const editSpec = composer.composeCastReferenceEditPrompt(c, angle);
+          const editSpec = composer.composeCastReferenceEditPrompt(c, angle, project);
           let dataUrl, seed, costUsd;
           if (modelKey === "seedream") {
             const result = await State.fal.seedreamEdit({
@@ -11048,6 +11170,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     State.activeJobs++;
     let okCount = 0, failCount = 0;
 
+    // CRITICAL: read active project for medium-aware prompts. Same reason as
+    // handleGenerateCastRefs — without this, animation projects get photoreal
+    // env plates that drift from the project's style canon.
+    const project = await Storage.Projects.getActive();
+
     try {
       // ── STEP 1: wide via text-to-image (user upload wins as anchor) ─────
       let wideDataUrl = e.refs.user.wide?.dataUrl
@@ -11056,7 +11183,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       if (!wideDataUrl) {
         setGPS(true, `Generating <span class="mono">${esc(locId)} · wide</span>`, `${modelMeta.label} · base frame`, 20);
         try {
-          const promptSpec = composer.composeEnvironmentReferencePrompt(e, "wide");
+          const promptSpec = composer.composeEnvironmentReferencePrompt(e, "wide", project);
           let dataUrl, seed, costUsd;
           if (modelKey === "seedream") {
             const result = await State.fal.seedreamTextToImage(promptSpec);
@@ -11094,7 +11221,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       if (!e.refs.user.detail?.dataUrl && !e.refs[modelKey].detail?.dataUrl) {
         setGPS(true, `Generating <span class="mono">${esc(locId)} · detail</span>`, `${modelMeta.label} · space-locked from wide`, 60);
         try {
-          const editSpec = composer.composeEnvironmentReferenceEditPrompt(e, "detail");
+          const editSpec = composer.composeEnvironmentReferenceEditPrompt(e, "detail", project);
           let dataUrl, seed, costUsd;
           if (modelKey === "seedream") {
             const result = await State.fal.seedreamEdit({
