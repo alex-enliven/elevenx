@@ -11437,6 +11437,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         await Storage.put("characters", row);
         toast(`Added "${display_name}"`, { tone: "ok" });
         await renderCastTab();
+        await adaptLeftTreeCast();
         const cc = $("#elx-cast-count"); if (cc) cc.textContent = (await Storage.getAll("characters")).length;
       },
     });
@@ -11483,6 +11484,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         await Storage.put("environments", row);
         toast(`Added "${display_name}"`, { tone: "ok" });
         await renderLocationTab();
+        await adaptLeftTreeEnvironments();
         const lc = $("#elx-loc-count"); if (lc) lc.textContent = (await Storage.getAll("environments")).length;
       },
     });
@@ -12072,6 +12074,140 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // Replace the v2 mockup's hardcoded shot rows in the left tree with
   // dynamic rows driven by our seed data — so tree names always match the
   // names on the Storyboard cards. Each row navigates on click.
+  // ─── Left tree cast / env children (v3) ─────────────────────────────
+  // The v2 mockup hard-coded Maya/Tom/Aisha/David under Cast Bible and
+  // Glass Meeting Pod/Open Floor under Environment Bible. Both leak when
+  // viewing any project that isn't Standup. Replace with live data
+  // from the active project's IDB, same pattern as adaptLeftTreeShots.
+  async function adaptLeftTreeCast() {
+    const characters = await Storage.getAll("characters");
+    // The cast subrows live in the <div class="tree__children"> immediately
+    // after the "Cast Bible" header. Find them by their data-tree-row
+    // attribute prefix "cast-" (excluding "cast-bible" itself).
+    const castBibleHeader = document.querySelector('[data-tree-row="cast-bible"]');
+    if (!castBibleHeader) return;
+    const childrenContainer = castBibleHeader.nextElementSibling; // <div class="tree__children">
+    if (!childrenContainer || !childrenContainer.classList.contains("tree__children")) return;
+    // Wipe existing rows
+    childrenContainer.innerHTML = "";
+    // Build fresh rows
+    for (const c of characters) {
+      const refCount = ["head_on", "three_quarter", "full_body"]
+        .filter(k => refUrlFor(c, k)).length;
+      const row = document.createElement("div");
+      row.className = "tree__row";
+      row.dataset.treeRow = `cast-${c.id}`;
+      row.dataset.charId = c.id;
+      row.innerHTML = `
+        <span style="width:10px"></span>
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="6" r="2.5"></circle><path d="M3 13c0-2.5 2.5-4 5-4s5 1.5 5 4"></path></svg>
+        <span class="label">${esc(c.display_name)}</span>
+        <span class="count">${refCount}</span>
+      `;
+      childrenContainer.appendChild(row);
+    }
+    // Update the Cast Bible header count too
+    const castCount = castBibleHeader.querySelector(".count");
+    if (castCount) castCount.textContent = characters.length;
+  }
+
+  async function adaptLeftTreeEnvironments() {
+    const envs = await Storage.getAll("environments");
+    const envHeader = document.querySelector('[data-tree-row="env-bible"]');
+    if (!envHeader) return;
+    const childrenContainer = envHeader.nextElementSibling;
+    if (!childrenContainer || !childrenContainer.classList.contains("tree__children")) return;
+    childrenContainer.innerHTML = "";
+    for (const e of envs) {
+      const refCount = ["wide", "detail"].filter(k => refUrlFor(e, k)).length;
+      const row = document.createElement("div");
+      row.className = "tree__row";
+      row.dataset.treeRow = `env-${e.id}`;
+      row.dataset.envId = e.id;
+      row.innerHTML = `
+        <span style="width:10px"></span>
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.5" y="4.5" width="11" height="8" rx="1"></rect></svg>
+        <span class="label">${esc(e.display_name)}</span>
+        <span class="count">${refCount}</span>
+      `;
+      childrenContainer.appendChild(row);
+    }
+    const envCountHeader = envHeader.querySelector(".count");
+    if (envCountHeader) envCountHeader.textContent = envs.length;
+  }
+
+  // Episode row: the v2 mockup labels "EP 01 · The Standup". For non-Standup
+  // projects this is a stale carry-over. Relabel to "EP 01 · {project name}".
+  // (We don't model multiple episodes per project yet — Tier 2.)
+  async function adaptEpisodeRow() {
+    const epRow = document.querySelector('[data-tree-row="ep01"] .label');
+    if (!epRow) return;
+    const project = await Storage.Projects.getActive();
+    if (!project) return;
+    epRow.textContent = `EP 01 · ${project.display_name}`;
+  }
+
+  // Center-header breadcrumb: "The Standup > EP 01 > Cast & Locations"
+  // is hard-coded in the v2 mockup. Replace with "{project} > EP 01 > {tab}".
+  // The tab portion gets updated when the user switches screens.
+  const SCREEN_LABELS = {
+    s1: "AI Producer",
+    s2: "Cast & Locations",
+    s3: "Storyboard",
+    s4: "Shot Editor",
+    s5: "Finish",
+  };
+  async function adaptBreadcrumb(activeScreen = "s2") {
+    const crumb = document.getElementById("crumb");
+    if (!crumb) return;
+    const project = await Storage.Projects.getActive();
+    if (!project) return;
+    const tab = SCREEN_LABELS[activeScreen] || "Workspace";
+    // Tail span gets a `THINKING` indicator dot — preserve if present
+    const thinkSpan = crumb.querySelector(".think") || null;
+    crumb.innerHTML = `
+      <span>${esc(project.display_name)}</span>
+      <span class="crumb__sep">›</span>
+      <span>EP 01</span>
+      <span class="crumb__sep">›</span>
+      <span>${esc(tab)}</span>
+    `;
+    if (thinkSpan) crumb.appendChild(thinkSpan);
+  }
+
+  // GPS top-bar right-side: "The Standup · EP 01 · $74.20 / $250.00" is
+  // hard-coded. Replace project + episode portions. (Cost is already
+  // dynamic via updateCostUi; we just touch the labels.)
+  async function adaptGpsRightSide() {
+    const gpsRight = document.querySelector(".gps__right");
+    if (!gpsRight) return;
+    const project = await Storage.Projects.getActive();
+    if (!project) return;
+    // The right span has: [project, sep, episode, sep, cost]
+    // Replace text of the first two spans (project + episode).
+    const spans = gpsRight.querySelectorAll("span:not(.sep)");
+    if (spans[0]) spans[0].textContent = project.display_name;
+    if (spans[1]) spans[1].textContent = "EP 01";
+    // spans[2] is the cost line — leave it; updateCostUi() manages it.
+  }
+
+  // Right rail s2 panel: the v2 mockup hard-codes a full Aisha Bello bible
+  // panel in `[data-rail="s2"]`. There's no character-selection-from-grid
+  // wired yet, so blank the rail to a clean "select a character" placeholder.
+  // (When we add click-to-edit on cast cards in a future tier, this rail
+  // will hydrate dynamically. For now it just stops showing wrong data.)
+  function adaptRailS2() {
+    const railS2 = document.querySelector('[data-rail="s2"]');
+    if (!railS2) return;
+    railS2.innerHTML = `
+      <div style="padding:24px; text-align:center; color:#6a6a78; font-size:12px; line-height:1.6; max-width:280px; margin:0 auto; margin-top:60px;">
+        <div style="font-size:24px; color:#3a3a45; margin-bottom:14px;">·</div>
+        <div style="color:#9a9aab; margin-bottom:6px;">Bible details</div>
+        <div>Select a character or location from the grid to see and edit its bible here.</div>
+      </div>
+    `;
+  }
+
   async function adaptLeftTreeShots() {
     const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
     // Mockup tree rows carry data-tree-row="shot-sNN". Find the first one's
@@ -12205,8 +12341,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // Project picker: replace static "ElevenX / DIRECTOR" brand with the active
     // project name and wire the + icon to the create-project flow.
     await adaptProjectPicker();
-    // Hydrate the left tree's shot list from seed data (matches grid names)
+    // Hydrate every other v2 mockup leakage point with active-project data.
+    await adaptLeftTreeCast();
+    await adaptLeftTreeEnvironments();
+    await adaptEpisodeRow();
     await adaptLeftTreeShots();
+    await adaptBreadcrumb("s1"); // first screen on load is AI Producer
+    await adaptGpsRightSide();
+    adaptRailS2();
 
     // Initial render
     await renderCastTab();
@@ -12228,10 +12370,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     // Hook into the proto-nav so we can re-render screens when they become
     // active. Storyboard re-renders on every nav so filter state is fresh;
-    // Finish builds its playlist lazily.
+    // Finish builds its playlist lazily. Breadcrumb updates per tab.
     document.querySelectorAll(".proto-tab").forEach(t => {
       t.addEventListener("click", () => {
         const sid = t.dataset.screen;
+        adaptBreadcrumb(sid).catch(() => {});
         if (sid === "s3") renderStoryboard();
         else if (sid === "s5") renderFinishScreen();
       });
