@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="e9056bf6b605" data-build-time="2026-05-14T21:22:32.022Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"e9056bf6b605",time:"2026-05-14T21:22:32.022Z"};</script>
+<meta name="elevenx-build" content="30e42d11a28a" data-build-time="2026-05-14T21:34:25.416Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"30e42d11a28a",time:"2026-05-14T21:34:25.416Z"};</script>
 
 </head>
-<!-- elevenx-build: e9056bf6b605 @ 2026-05-14T21:22:32.022Z -->
+<!-- elevenx-build: 30e42d11a28a @ 2026-05-14T21:34:25.416Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -8531,6 +8531,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           "style_canon", "default_shot_duration_seconds",
           // Tier 2 strategic bible
           "theme", "audience", "tone", "visual_rule", "world_rules", "reroll_rules",
+          // v3.8: project-wide style anchor — single image used as a style
+          // reference for every text-to-image base generation (cast head_on,
+          // env wide, asset primary). Shape: { dataUrl, filename, byte_size,
+          //   source: "user_upload", uploaded_at } or null to clear.
+          "style_anchor",
         ];
         const merged = { ...existing };
         for (const k of ALLOWED) {
@@ -9318,28 +9323,33 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     setGPS(true, `Generating style asset <span class="mono">${esc(asset.display_name)}</span>`, "gpt-image-2 · style-canon-anchored", 30);
     try {
-      let dataUrl, model;
-      if (ACTIVE_IMAGE_MODEL === "gpt" && State.openai) {
-        const result = await State.openai.imageGenerate({ prompt, size: "1024x1024", quality: "medium" });
-        dataUrl = result.dataUrl;
-        model = "gpt";
-      } else if (State.fal) {
-        const result = await State.fal.seedreamTextToImage({ prompt });
-        dataUrl = result.dataUrl;
-        model = "seedream";
-      } else {
-        throw new Error("No image client available — set Worker URL");
-      }
+      // v3.8: route through the anchor-aware helper so style assets inherit
+      // the project's style anchor (when one is set).
+      const anchorUrl = project?.style_anchor?.dataUrl || null;
+      const modelKey = (ACTIVE_IMAGE_MODEL === "gpt" && State.openai) ? "gpt"
+                     : State.fal ? "seedream"
+                     : null;
+      if (!modelKey) throw new Error("No image client available — set Worker URL");
+      const result = await generateImageWithOptionalAnchor({
+        prompt,
+        anchorDataUrl: anchorUrl,
+        size: "1024x1024",
+        modelKey,
+        label: `asset ${assetId}`,
+      });
       asset.refs = asset.refs || { seedream: {}, gpt: {}, user: {} };
-      asset.refs[model] = asset.refs[model] || {};
-      asset.refs[model].primary = { dataUrl, generatedAt: Date.now() };
+      asset.refs[modelKey] = asset.refs[modelKey] || {};
+      asset.refs[modelKey].primary = {
+        dataUrl: result.dataUrl,
+        generatedAt: Date.now(),
+        style_anchor_used: !!anchorUrl,
+      };
       // Don't overwrite chosenModel if a user upload is the canonical source.
       // refUrlFor() already prefers user > active model regardless of this flag.
-      if (!asset.refs.user?.primary?.dataUrl) asset.chosenModel = model;
+      if (!asset.refs.user?.primary?.dataUrl) asset.chosenModel = modelKey;
       await Storage.put("assets", asset);
-      const costGuess = model === "gpt" ? 0.042 : 0.05;
-      await trackCost(costGuess, `asset ${assetId}`);
-      toast(`Generated "${asset.display_name}"`, { tone: "ok" });
+      await trackCost(result.costUsd, `asset ${assetId}${anchorUrl ? " (anchored)" : ""}`);
+      toast(`Generated "${asset.display_name}"${anchorUrl ? " · style anchor applied" : ""}`, { tone: "ok" });
       await renderAssetsTab();
     } catch (err) {
       toast(`Asset gen failed: ${err.message}`, { tone: "err", duration: 8000 });
@@ -10015,6 +10025,93 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
   }
   NS.showDistributeMasterSheetModal = showDistributeMasterSheetModal;
+
+  // ─── Project-wide style anchor (v3.8) ───────────────────────────────
+  // The user uploads ONE image after JSON import that acts as a style guide
+  // for every text-to-image base generation in the project (cast head_on,
+  // env wide, asset primary). The chained gens (3/4, full_body, detail)
+  // anchor off the entity's own head_on/wide as before, so the whole tree
+  // inherits the style.
+  //
+  // The anchor is used as a STYLE reference, NOT identity. Generation prompts
+  // explicitly instruct the model: "Use the input image as a style reference
+  // only — do not copy any subjects from it. Generate a NEW subject as
+  // described, matching only the rendering style."
+  //
+  // Per-card uploads still take precedence — when refs.user.head_on exists
+  // for a character, that's used directly (chain anchor), bypassing the
+  // project anchor for that specific slot.
+
+  async function setProjectStyleAnchor(dataUrl, fileMeta = {}) {
+    const project = await Storage.Projects.getActive();
+    if (!project) throw new Error("No active project");
+    const value = dataUrl ? {
+      dataUrl,
+      filename: fileMeta.filename || null,
+      byte_size: fileMeta.byte_size || null,
+      source: "user_upload",
+      uploaded_at: Date.now(),
+    } : null;
+    return Storage.Projects.update(project.id, { style_anchor: value });
+  }
+  NS.setProjectStyleAnchor = setProjectStyleAnchor;
+
+  // Run one image gen with optional style anchor. If the anchor is present,
+  // routes through the edit endpoint with explicit "style only" wording.
+  // Otherwise falls back to text-to-image.
+  //
+  // The fal/openai client APIs return slightly different shapes; this helper
+  // normalizes them to { dataUrl, seed, costUsd }.
+  async function generateImageWithOptionalAnchor({ prompt, anchorDataUrl, size, modelKey, label }) {
+    const styleOnlyClause =
+      "IMPORTANT: The input image is a STYLE REFERENCE ONLY. Do NOT copy any subjects, characters, " +
+      "or composition from it. Generate a completely new image of the subject described above, " +
+      "matching ONLY the rendering style, palette, lighting quality, and overall aesthetic of the reference.";
+
+    if (anchorDataUrl) {
+      const editPrompt = `${prompt}\n\n${styleOnlyClause}`;
+      if (modelKey === "gpt") {
+        const result = await State.openai.imageEdit({
+          prompt: editPrompt,
+          imageDataUrl: anchorDataUrl,
+          size: size || "1024x1024",
+          quality: "medium",
+          n: 1,
+        });
+        const dataUrl = result?.images?.[0]?.dataUrl;
+        if (!dataUrl) throw new Error(`${label || "edit"}: no image in OpenAI response`);
+        return { dataUrl, seed: null, costUsd: result.cost_usd_estimated || 0.042 };
+      } else {
+        const result = await State.fal.seedreamEdit({
+          prompt: editPrompt,
+          image_urls: [anchorDataUrl],
+          num_images: 1,
+        });
+        const imgUrl = result?.images?.[0]?.url;
+        if (!imgUrl) throw new Error(`${label || "edit"}: no image in Seedream response`);
+        const blob = await fetch(imgUrl).then(r => r.blob());
+        const dataUrl = await blobToDataUrl(blob);
+        return { dataUrl, seed: result.seed, costUsd: 0.05 };
+      }
+    }
+    // No anchor → fall back to text-to-image
+    if (modelKey === "gpt") {
+      const result = await State.openai.imageGenerate({
+        prompt, size: size || "1024x1024", quality: "medium", n: 1,
+      });
+      const dataUrl = result?.images?.[0]?.dataUrl;
+      if (!dataUrl) throw new Error(`${label || "gen"}: no image in OpenAI response`);
+      return { dataUrl, seed: null, costUsd: result.cost_usd_estimated || 0.042 };
+    } else {
+      const result = await State.fal.seedreamTextToImage({ prompt });
+      const imgUrl = result?.images?.[0]?.url;
+      if (!imgUrl) throw new Error(`${label || "gen"}: no image in Seedream response`);
+      const blob = await fetch(imgUrl).then(r => r.blob());
+      const dataUrl = await blobToDataUrl(blob);
+      return { dataUrl, seed: result.seed, costUsd: 0.05 };
+    }
+  }
+  NS.generateImageWithOptionalAnchor = generateImageWithOptionalAnchor;
 
   // ─── Bulk reference generation across the whole project (v3+) ──────
   // After a bible import, every character / environment / style asset row
@@ -10972,24 +11069,64 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (estimate.breakdown.environments > 0) breakdownLines.push(`<li>${estimate.breakdown.environments} environment plate${estimate.breakdown.environments === 1 ? "" : "s"}</li>`);
     if (estimate.breakdown.assets > 0) breakdownLines.push(`<li>${estimate.breakdown.assets} style asset${estimate.breakdown.assets === 1 ? "" : "s"}</li>`);
 
-    // The zero-anchor warning block — only rendered when noAnchorsAtAll is true.
-    const anchorWarning = noAnchorsAtAll ? `
-      <div style="background:rgba(201,162,90,0.10); border:1px solid #c9a25a; border-radius:8px; padding:14px 18px; margin-bottom:16px; line-height:1.55;">
-        <div style="font-size:13px; color:#c9a25a; font-weight:600; margin-bottom:6px; letter-spacing:0.02em;">
-          ↑ Upload at least one anchor first (strongly recommended)
-        </div>
-        <div style="font-size:12px; color:#c8c8d4; margin-bottom:8px;">
-          The first portrait of each character is text-to-image — the only shot without an anchor. Even with the project's style canon in the prompt, the model can still drift to photoreal output (especially for young characters).
-        </div>
-        <div style="font-size:12px; color:#c8c8d4;">
-          Upload your director's master sheets (or any concept art) for at least the hero character. The chained generator then uses your art as the identity AND style anchor for 3/4 + full_body. Everything stays on-brief.
+    // v3.8: project-wide style anchor — the simplest path to lock every
+    // generation to one consistent visual style. The user uploads ONE image
+    // here; it's used as the style reference for every text-to-image base
+    // gen (cast head_on, env wide, asset primary). Per-card uploads still
+    // work as overrides for specific slots.
+    const projectAnchor = project?.style_anchor || null;
+    const hasProjectAnchor = !!projectAnchor?.dataUrl;
+
+    const anchorSection = `
+      <div style="background:${hasProjectAnchor ? "rgba(74,222,128,0.06)" : "rgba(201,162,90,0.10)"};
+                  border:1px solid ${hasProjectAnchor ? "rgba(74,222,128,0.35)" : "#c9a25a"};
+                  border-radius:8px; padding:14px 18px; margin-bottom:16px; line-height:1.55;">
+        <div style="display:flex; align-items:flex-start; gap:14px;">
+          ${hasProjectAnchor ? `
+            <div style="width:72px; height:72px; flex-shrink:0; border:1px solid #2a2a35; border-radius:6px;
+                        background-image:url('${projectAnchor.dataUrl}'); background-size:cover; background-position:center;"></div>
+          ` : `
+            <div style="width:72px; height:72px; flex-shrink:0; border:1.5px dashed #c9a25a; border-radius:6px;
+                        display:flex; align-items:center; justify-content:center; font-size:24px; color:#c9a25a;">↑</div>
+          `}
+          <div style="flex:1; min-width:0;">
+            <div style="font-size:13px; color:${hasProjectAnchor ? "#4ade80" : "#c9a25a"}; font-weight:600; margin-bottom:4px; letter-spacing:0.02em;">
+              ${hasProjectAnchor
+                ? "✓ Project style anchor set"
+                : "Upload one project style anchor (strongly recommended)"}
+            </div>
+            <div style="font-size:11.5px; color:#c8c8d4; line-height:1.55; margin-bottom:8px;">
+              ${hasProjectAnchor
+                ? `Every cast portrait, environment plate, and style asset will be generated with this image as the style reference. Identity comes from the bible's text; rendering style comes from this anchor.`
+                : `One image covers the whole project's style. The model uses it as a style reference (not identity) for every cast head-on, environment wide, and style asset. Per-card uploads still work for specific overrides.`}
+            </div>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <label style="cursor:pointer; background:#c9a25a; color:#14141a; padding:6px 12px; border-radius:5px; font-size:11px; font-weight:600;">
+                ${hasProjectAnchor ? "Replace anchor" : "Upload anchor"}
+                <input id="elx-autogen-anchor-file" type="file" accept="image/png,image/jpeg,image/webp" style="display:none;">
+              </label>
+              ${hasProjectAnchor ? `
+                <button id="elx-autogen-anchor-clear"
+                        style="background:none; color:#9a9aab; border:1px solid #2a2a35; padding:6px 12px; border-radius:5px; font-size:11px; cursor:pointer;">Remove</button>
+              ` : ""}
+            </div>
+            ${hasProjectAnchor ? `
+              <div style="font-size:10.5px; color:#6a6a78; margin-top:6px;">
+                ${projectAnchor.filename ? esc(projectAnchor.filename) + " · " : ""}saved ${new Date(projectAnchor.uploaded_at).toLocaleString()}
+              </div>
+            ` : ""}
+          </div>
         </div>
       </div>
-    ` : (anchors.total > 0 ? `
+    `;
+
+    // The existing per-card anchor status (only shown if no project anchor exists,
+    // so we don't double up on warning UI).
+    const perCardStatus = !hasProjectAnchor && anchors.total > 0 ? `
       <div style="background:rgba(74,222,128,0.08); border:1px solid rgba(74,222,128,0.35); border-radius:6px; padding:8px 14px; margin-bottom:14px; font-size:11.5px; color:#4ade80; line-height:1.5;">
-        ✓ ${anchors.total} anchor${anchors.total === 1 ? "" : "s"} uploaded — derived angles will inherit your art's style.
+        ✓ ${anchors.total} per-card anchor${anchors.total === 1 ? "" : "s"} uploaded — those slots will use them directly.
       </div>
-    ` : "");
+    ` : "";
 
     panel.innerHTML = `
       <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
@@ -11000,7 +11137,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         <p style="margin:0 0 16px; font-size:13px; color:#9a9aab; line-height:1.55;">
           Your bible is imported. ElevenX can generate every missing reference image from the bible's prompts.
         </p>
-        ${anchorWarning}
+        ${anchorSection}
+        ${perCardStatus}
         <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; padding:14px 18px; margin-bottom:18px;">
           <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
             <span style="font-size:12px; color:#9a9aab; letter-spacing:0.04em; text-transform:uppercase;">References to generate</span>
@@ -11014,7 +11152,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             <span style="font-size:16px; color:#c9a25a; font-weight:600;">$${estimate.totalCost.toFixed(2)}</span>
           </div>
           <div style="font-size:10.5px; color:#6a6a78; margin-top:4px; line-height:1.4;">
-            ${esc(estimate.modelLabel)} · $${estimate.perImg.toFixed(3)} per image
+            ${esc(estimate.modelLabel)} · $${estimate.perImg.toFixed(3)} per image${hasProjectAnchor ? " · using edit endpoint (anchor style transfer)" : " · text-to-image"}
           </div>
         </div>
         ${workerConnected ? "" : `
@@ -11026,15 +11164,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           <button id="elx-autogen-skip"
                   style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
                          padding:10px 18px; border-radius:6px; font-size:12.5px; cursor:pointer;">${opts.fromManualTrigger ? "Cancel" : "Skip — I'll do it manually"}</button>
-          ${noAnchorsAtAll ? `
+          ${(noAnchorsAtAll && !hasProjectAnchor) ? `
             <button id="elx-autogen-anyway"
                     style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
                            padding:10px 18px; border-radius:6px; font-size:12.5px; cursor:pointer;"
-                    title="Generate without uploading anchors first — riskier for style consistency on the first portrait of each character">Generate without anchors</button>
-            <button id="elx-autogen-upload-first"
+                    title="Generate without uploading anchors first — riskier for style consistency on the first portrait of each character">Per-card uploads…</button>
+            <button id="elx-autogen-go-anchorless"
                     style="background:#c9a25a; color:#14141a; border:none;
                            padding:10px 22px; border-radius:6px; font-size:12.5px;
-                           font-weight:600; cursor:pointer;">↑ Upload anchors first</button>
+                           font-weight:600; cursor:pointer;">Generate without anchor</button>
           ` : workerConnected ? `
             <button id="elx-autogen-go"
                     style="background:#c9a25a; color:#14141a; border:none;
@@ -11056,10 +11194,38 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       panel.remove();
     };
 
+    // Wire the project-anchor upload / clear handlers
+    const anchorFileInput = $("#elx-autogen-anchor-file", panel);
+    if (anchorFileInput) {
+      anchorFileInput.addEventListener("change", async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        try {
+          const dataUrl = await readFileAsDataUrl(file);
+          await setProjectStyleAnchor(dataUrl, { filename: file.name, byte_size: file.size });
+          toast(`Project anchor set — every generation will inherit its style.`, { tone: "ok" });
+          // Re-render the modal so the anchor section flips to the "set" state
+          panel.remove();
+          showAutoGenPostImportModal(opts);
+        } catch (err) {
+          toast(`Couldn't set anchor: ${err.message}`, { tone: "err", duration: 7000 });
+        }
+      });
+    }
+    const anchorClearBtn = $("#elx-autogen-anchor-clear", panel);
+    if (anchorClearBtn) {
+      anchorClearBtn.addEventListener("click", async () => {
+        if (!confirm("Remove the project style anchor? Generations will fall back to text-to-image (riskier for style consistency).")) return;
+        await setProjectStyleAnchor(null);
+        toast("Project anchor cleared.", { tone: "warn" });
+        panel.remove();
+        showAutoGenPostImportModal(opts);
+      });
+    }
+
     // Common: fire bulk-gen and close
     const fireBulkGen = async () => {
       if (!workerConnected) {
-        // Reroute to connect if somehow they got here without a worker
         panel.remove();
         showConnectionPanel();
         return;
@@ -11074,23 +11240,22 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     $("#elx-autogen-skip", panel).addEventListener("click", close);
 
-    if (noAnchorsAtAll) {
-      // Upload-first primary CTA: close modal + switch to Cast tab + clear flag.
-      // The user uploads via ↑ buttons, then comes back via the s2 toolbar's
-      // "Generate references" button to re-trigger this modal.
-      $("#elx-autogen-upload-first", panel).addEventListener("click", async () => {
+    if (noAnchorsAtAll && !hasProjectAnchor) {
+      // No project anchor AND no per-card anchors. Modal shows three CTAs:
+      //   1. Skip (handled above)
+      //   2. Per-card uploads… → navigates to Cast tab for the granular flow
+      //   3. Generate without anchor → fires bulk-gen as text-to-image
+      $("#elx-autogen-anyway", panel).addEventListener("click", async () => {
         await Storage.setSetting("auto_gen_pending", null);
         panel.remove();
-        // Switch to Cast & Locations screen
         const castTab = document.querySelector('.proto-tab[data-screen="s2"]');
         if (castTab) castTab.click();
         toast(
-          `Upload anchors via the ↑ button on each cast / location / style card. When ready, click "Generate references" in the toolbar to resume auto-gen.`,
+          `Upload per-card anchors via the ↑ buttons, or use ↹ Master sheet for crop-and-distribute. When ready, click "Generate references" to resume.`,
           { tone: "ok", duration: 12000 }
         );
       });
-      // Secondary: proceed anyway
-      $("#elx-autogen-anyway", panel).addEventListener("click", fireBulkGen);
+      $("#elx-autogen-go-anchorless", panel).addEventListener("click", fireBulkGen);
     } else if (workerConnected) {
       $("#elx-autogen-go", panel).addEventListener("click", fireBulkGen);
     } else {
@@ -11674,35 +11839,35 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
                        || c.refs[modelKey].head_on?.dataUrl
                        || null;
       if (!headOnDataUrl) {
-        setGPS(true, `Generating <span class="mono">${esc(charId)} · head_on</span>`, `${modelMeta.label} · base portrait`, 15);
+        const anchorUrl = project?.style_anchor?.dataUrl || null;
+        const anchorTag = anchorUrl ? "style-anchor-locked" : "text-to-image";
+        setGPS(true, `Generating <span class="mono">${esc(charId)} · head_on</span>`, `${modelMeta.label} · ${anchorTag}`, 15);
         try {
           const promptSpec = composer.composeCastReferencePrompt(c, "head_on", project);
-          let dataUrl, seed, costUsd;
-          if (modelKey === "seedream") {
-            const result = await State.fal.seedreamTextToImage(promptSpec);
-            const imgUrl = result?.images?.[0]?.url;
-            if (!imgUrl) throw new Error("no image in Seedream response");
-            const blob = await fetch(imgUrl).then(r => r.blob());
-            dataUrl = await blobToDataUrl(blob);
-            seed = result.seed;
-            costUsd = modelMeta.cost_per_image_usd;
-          } else {
-            const result = await State.openai.imageGenerate({
-              prompt: promptSpec.prompt,
-              size: "1024x1024",
-              quality: "medium",
-              n: 1,
-            });
-            dataUrl = result?.images?.[0]?.dataUrl;
-            if (!dataUrl) throw new Error("no image in OpenAI response");
-            seed = null;
-            costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
-          }
-          c.refs[modelKey].head_on = { dataUrl, seed, generated_at: Date.now(), cost_usd: costUsd, model: modelMeta.label };
+          // v3.8: route through anchor-aware helper. When project.style_anchor
+          // exists, the head_on is generated via the edit endpoint using the
+          // anchor as a STYLE reference — every character inherits the project's
+          // visual style automatically. The 3/4 + full_body chain then derives
+          // from this style-locked head_on.
+          const result = await generateImageWithOptionalAnchor({
+            prompt: promptSpec.prompt,
+            anchorDataUrl: anchorUrl,
+            size: "1024x1024",
+            modelKey,
+            label: `${modelKey} cast ${charId}/head_on`,
+          });
+          c.refs[modelKey].head_on = {
+            dataUrl: result.dataUrl,
+            seed: result.seed,
+            generated_at: Date.now(),
+            cost_usd: result.costUsd,
+            model: modelMeta.label,
+            style_anchor_used: !!anchorUrl,
+          };
           await Storage.put("characters", c);
-          await trackCost(costUsd, `${modelKey} cast ${charId}/head_on`);
+          await trackCost(result.costUsd, `${modelKey} cast ${charId}/head_on${anchorUrl ? " (anchored)" : ""}`);
           renderCastTab();
-          headOnDataUrl = dataUrl;
+          headOnDataUrl = result.dataUrl;
           okCount++;
         } catch (err) {
           console.error(`[${modelKey}] head_on failed:`, err);
@@ -11807,32 +11972,31 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
                      || e.refs[modelKey].wide?.dataUrl
                      || null;
       if (!wideDataUrl) {
-        setGPS(true, `Generating <span class="mono">${esc(locId)} · wide</span>`, `${modelMeta.label} · base frame`, 20);
+        const anchorUrl = project?.style_anchor?.dataUrl || null;
+        const anchorTag = anchorUrl ? "style-anchor-locked" : "text-to-image";
+        setGPS(true, `Generating <span class="mono">${esc(locId)} · wide</span>`, `${modelMeta.label} · ${anchorTag}`, 20);
         try {
           const promptSpec = composer.composeEnvironmentReferencePrompt(e, "wide", project);
-          let dataUrl, seed, costUsd;
-          if (modelKey === "seedream") {
-            const result = await State.fal.seedreamTextToImage(promptSpec);
-            const imgUrl = result?.images?.[0]?.url;
-            if (!imgUrl) throw new Error("no image in Seedream response");
-            const blob = await fetch(imgUrl).then(r => r.blob());
-            dataUrl = await blobToDataUrl(blob);
-            seed = result.seed;
-            costUsd = modelMeta.cost_per_image_usd;
-          } else {
-            const result = await State.openai.imageGenerate({
-              prompt: promptSpec.prompt, size: "1536x1024", quality: "medium", n: 1,
-            });
-            dataUrl = result?.images?.[0]?.dataUrl;
-            if (!dataUrl) throw new Error("no image in OpenAI response");
-            seed = null;
-            costUsd = result.cost_usd_estimated || modelMeta.cost_per_image_usd;
-          }
-          e.refs[modelKey].wide = { dataUrl, seed, generated_at: Date.now(), cost_usd: costUsd, model: modelMeta.label };
+          // v3.8: same anchor-aware routing as cast head_on
+          const result = await generateImageWithOptionalAnchor({
+            prompt: promptSpec.prompt,
+            anchorDataUrl: anchorUrl,
+            size: "1536x1024",
+            modelKey,
+            label: `${modelKey} env ${locId}/wide`,
+          });
+          e.refs[modelKey].wide = {
+            dataUrl: result.dataUrl,
+            seed: result.seed,
+            generated_at: Date.now(),
+            cost_usd: result.costUsd,
+            model: modelMeta.label,
+            style_anchor_used: !!anchorUrl,
+          };
           await Storage.put("environments", e);
-          await trackCost(costUsd, `${modelKey} env ${locId}/wide`);
+          await trackCost(result.costUsd, `${modelKey} env ${locId}/wide${anchorUrl ? " (anchored)" : ""}`);
           renderLocationTab();
-          wideDataUrl = dataUrl;
+          wideDataUrl = result.dataUrl;
           okCount++;
         } catch (err) {
           console.error(`[${modelKey}] wide failed:`, err);
