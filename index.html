@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="5d492ae93de8" data-build-time="2026-05-14T21:52:27.208Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"5d492ae93de8",time:"2026-05-14T21:52:27.208Z"};</script>
+<meta name="elevenx-build" content="06547f5b1a71" data-build-time="2026-05-14T21:59:26.618Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"06547f5b1a71",time:"2026-05-14T21:59:26.618Z"};</script>
 
 </head>
-<!-- elevenx-build: 5d492ae93de8 @ 2026-05-14T21:52:27.208Z -->
+<!-- elevenx-build: 06547f5b1a71 @ 2026-05-14T21:59:26.618Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -10230,22 +10230,36 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
   // Count how many ref slots across the active project still need generation,
   // and what that costs at the active image model's per-image rate.
-  async function estimateMissingRefs() {
+  //
+  // v4.0: `mode` selects which angles count.
+  //   "quick" → only head_on (cast) + wide (env) + primary (asset)
+  //   "full"  → all angles: head_on/three_quarter/full_body + wide/detail + primary
+  //
+  // Quick mode aligns with how the shot pipeline actually uses refs:
+  // image_to_video consumes ONE keyframe, text_to_video uses zero refs, only
+  // reference_to_video uses multi-angle (and that's the minority of shots).
+  async function estimateMissingRefs(mode = "quick") {
     const modelKey = ACTIVE_IMAGE_MODEL;
     const perImg = IMAGE_MODELS[modelKey].cost_per_image_usd;
     const characters   = await Storage.getAll("characters");
     const environments = await Storage.getAll("environments");
     const styleAssets  = await Storage.getAll("assets");
+    const castAngles = mode === "full"
+      ? ["head_on", "three_quarter", "full_body"]
+      : ["head_on"];
+    const envKinds = mode === "full"
+      ? ["wide", "detail"]
+      : ["wide"];
     let count = 0;
     const breakdown = { characters: 0, environments: 0, assets: 0 };
     for (const c of characters) {
-      for (const k of ["head_on", "three_quarter", "full_body"]) {
+      for (const k of castAngles) {
         const has = c.refs?.user?.[k]?.dataUrl || c.refs?.[modelKey]?.[k]?.dataUrl;
         if (!has) { count++; breakdown.characters++; }
       }
     }
     for (const e of environments) {
-      for (const k of ["wide", "detail"]) {
+      for (const k of envKinds) {
         const has = e.refs?.user?.[k]?.dataUrl || e.refs?.[modelKey]?.[k]?.dataUrl;
         if (!has) { count++; breakdown.environments++; }
       }
@@ -10254,13 +10268,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       const has = a.refs?.user?.primary?.dataUrl || a.refs?.[modelKey]?.primary?.dataUrl;
       if (!has) { count++; breakdown.assets++; }
     }
-    return { count, totalCost: count * perImg, breakdown, perImg, modelLabel: IMAGE_MODELS[modelKey].label };
+    return { count, totalCost: count * perImg, breakdown, perImg, modelLabel: IMAGE_MODELS[modelKey].label, mode };
   }
 
   // Walk cast → environments → style assets and call the existing per-type
   // gen handlers. Sequential so we don't hammer the worker rate limits and
   // so the user sees clear progress in the GPS bar.
-  async function bulkGenerateAllRefs() {
+  async function bulkGenerateAllRefs({ mode = "quick" } = {}) {
     if (!State.fal && !State.openai) {
       toast("Set your Worker URL first.", { tone: "warn" });
       showConnectionPanel();
@@ -10271,15 +10285,22 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const environments = await Storage.getAll("environments");
     const styleAssets  = await Storage.getAll("assets");
 
-    // Filter to "needs work" — items where at least one slot is still empty.
+    // v4.0: mode selects which slots count as "needs work"
+    //   "quick" → only head_on (cast) / wide (env) need to exist
+    //   "full"  → all angles need to exist
+    const castAngles = mode === "full"
+      ? ["head_on", "three_quarter", "full_body"]
+      : ["head_on"];
+    const envKinds = mode === "full" ? ["wide", "detail"] : ["wide"];
+
     const charsToDo = characters.filter(c => {
-      const have = ["head_on","three_quarter","full_body"].every(k =>
+      const have = castAngles.every(k =>
         c.refs?.user?.[k]?.dataUrl || c.refs?.[modelKey]?.[k]?.dataUrl
       );
       return !have;
     });
     const envsToDo = environments.filter(e => {
-      const have = ["wide","detail"].every(k =>
+      const have = envKinds.every(k =>
         e.refs?.user?.[k]?.dataUrl || e.refs?.[modelKey]?.[k]?.dataUrl
       );
       return !have;
@@ -10290,25 +10311,27 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     const totalItems = charsToDo.length + envsToDo.length + assetsToDo.length;
     if (totalItems === 0) {
-      toast("Nothing to generate — every ref is either uploaded or already generated.", { tone: "ok" });
+      toast(`Nothing to generate — every ${mode === "quick" ? "base" : ""} ref is either uploaded or already generated.`, { tone: "ok" });
       return { ok: 0, failed: 0, skipped: 0 };
     }
 
     let okCount = 0, failedCount = 0;
     State.batchActive = true;
     let done = 0;
+    const modeLabel = mode === "quick" ? "Quick first pass" : "Full angle set";
 
     const updateGps = (label) => {
       const pct = totalItems > 0 ? Math.round((done / totalItems) * 100) : 0;
-      setGPS(true, `Auto-generating references`, label, pct);
+      setGPS(true, `Auto-generating references · ${modeLabel}`, label, pct);
     };
 
-    // CHARACTERS — each call chains head_on → 3/4 → full_body internally
+    // CHARACTERS — Quick mode = ONE head_on per character (no chained angles).
+    //              Full mode  = head_on → 3/4 → full_body chained.
     for (const c of charsToDo) {
       done++;
-      updateGps(`<span class="mono">${esc(c.display_name)}</span> · cast portraits (${done}/${totalItems})`);
+      updateGps(`<span class="mono">${esc(c.display_name)}</span> · ${mode === "quick" ? "head_on" : "3 angles"} (${done}/${totalItems})`);
       try {
-        await handleGenerateCastRefs(c.id, modelKey);
+        await handleGenerateCastRefs(c.id, modelKey, { onlyBase: mode === "quick" });
         okCount++;
       } catch (err) {
         console.error(`[bulk-gen] cast ${c.id} failed:`, err);
@@ -10316,12 +10339,12 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       }
     }
 
-    // ENVIRONMENTS — each call chains wide → detail internally
+    // ENVIRONMENTS — Quick mode = wide only. Full mode = wide → detail chained.
     for (const e of envsToDo) {
       done++;
-      updateGps(`<span class="mono">${esc(e.display_name)}</span> · environment plates (${done}/${totalItems})`);
+      updateGps(`<span class="mono">${esc(e.display_name)}</span> · ${mode === "quick" ? "wide" : "wide + detail"} (${done}/${totalItems})`);
       try {
-        await handleGenerateEnvRefs(e.id, modelKey);
+        await handleGenerateEnvRefs(e.id, modelKey, { onlyBase: mode === "quick" });
         okCount++;
       } catch (err) {
         console.error(`[bulk-gen] env ${e.id} failed:`, err);
@@ -11255,18 +11278,24 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // point of style failure. One uploaded anchor locks the whole 3-angle chain.
   async function showAutoGenPostImportModal(opts = {}) {
     if ($("#elx-autogen-modal")) return;
-    const estimate = await estimateMissingRefs();
-    if (estimate.count === 0) {
-      // Manual trigger from a toolbar button — explain why nothing's needed.
+    // v4.0: Quick mode is now the default — generates ONE base image per
+    // entity (head_on / wide / primary). Multi-angle is an opt-in second
+    // pass via "Full" mode OR per-card re-rolls. See critical assessment
+    // in the v4.0 commit notes — angles past head_on only help in
+    // reference_to_video shots, which are the minority for most projects.
+    let mode = opts.mode || "quick";
+    const project = await Storage.Projects.getActive();
+    const projectName = project?.display_name || "your project";
+    const workerConnected = !!State.fal || !!State.openai;
+    const anchors = await countUserUploads();
+    let estimate = await estimateMissingRefs(mode);
+    let fullEstimate = await estimateMissingRefs("full");
+    if (estimate.count === 0 && fullEstimate.count === 0) {
       if (opts.surfaceWhenEmpty) {
         toast("Every reference is already uploaded or generated. Nothing to do.", { tone: "ok" });
       }
       return;
     }
-    const project = await Storage.Projects.getActive();
-    const projectName = project?.display_name || "your project";
-    const workerConnected = !!State.fal || !!State.openai;
-    const anchors = await countUserUploads();
     const noAnchorsAtAll = (anchors.total === 0) && (anchors.castTotal > 0);
 
     const panel = document.createElement("div");
@@ -11277,9 +11306,40 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       backdrop-filter: blur(6px);
     `;
     const breakdownLines = [];
-    if (estimate.breakdown.characters > 0) breakdownLines.push(`<li>${estimate.breakdown.characters} cast portrait${estimate.breakdown.characters === 1 ? "" : "s"}</li>`);
+    if (estimate.breakdown.characters > 0) breakdownLines.push(`<li>${estimate.breakdown.characters} cast ${mode === "quick" ? "portrait" : "angle"}${estimate.breakdown.characters === 1 ? "" : "s"}</li>`);
     if (estimate.breakdown.environments > 0) breakdownLines.push(`<li>${estimate.breakdown.environments} environment plate${estimate.breakdown.environments === 1 ? "" : "s"}</li>`);
     if (estimate.breakdown.assets > 0) breakdownLines.push(`<li>${estimate.breakdown.assets} style asset${estimate.breakdown.assets === 1 ? "" : "s"}</li>`);
+
+    // v4.0 mode-toggle section: Quick (default) vs Full
+    const modeToggle = `
+      <div style="display:flex; gap:8px; margin-bottom:16px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; padding:4px;">
+        <button data-mode="quick" style="flex:1; padding:10px 12px; border-radius:6px;
+                background:${mode === "quick" ? "#c9a25a" : "transparent"};
+                color:${mode === "quick" ? "#14141a" : "#c8c8d4"};
+                border:none; cursor:pointer; font-size:12px; font-weight:${mode === "quick" ? "600" : "500"};
+                text-align:left;">
+          <div>Quick first pass <span style="font-size:10px; opacity:0.7;">${mode === "quick" ? "· active" : ""}</span></div>
+          <div style="font-size:10px; opacity:0.75; font-weight:400; margin-top:2px;">
+            1 ref per entity · ~$${fullEstimate.count > 0 ? ((fullEstimate.breakdown.characters / 3 + fullEstimate.breakdown.environments / 2 + fullEstimate.breakdown.assets) * estimate.perImg).toFixed(2) : "0.00"} total
+          </div>
+        </button>
+        <button data-mode="full" style="flex:1; padding:10px 12px; border-radius:6px;
+                background:${mode === "full" ? "#c9a25a" : "transparent"};
+                color:${mode === "full" ? "#14141a" : "#c8c8d4"};
+                border:none; cursor:pointer; font-size:12px; font-weight:${mode === "full" ? "600" : "500"};
+                text-align:left;">
+          <div>Full angle set <span style="font-size:10px; opacity:0.7;">${mode === "full" ? "· active" : ""}</span></div>
+          <div style="font-size:10px; opacity:0.75; font-weight:400; margin-top:2px;">
+            All angles · ~$${(fullEstimate.count * estimate.perImg).toFixed(2)} total
+          </div>
+        </button>
+      </div>
+      <div style="font-size:10.5px; color:#6a6a78; margin-bottom:14px; line-height:1.5;">
+        ${mode === "quick"
+          ? `<strong style="color:#c9a25a;">Quick</strong> generates one base image per cast / env / asset. Most shots (image_to_video, text_to_video) only consume one ref per entity. You can expand specific characters to 3 angles later via the per-card Re-roll button — useful for reference_to_video shots with multiple identity-critical characters.`
+          : `<strong style="color:#c9a25a;">Full</strong> generates all 3 cast angles + env detail upfront. Best when you know you need reference_to_video shots with multi-angle identity lock. ~2x the cost of Quick mode.`}
+      </div>
+    `;
 
     // v3.8: project-wide style anchor — the simplest path to lock every
     // generation to one consistent visual style. The user uploads ONE image
@@ -11351,6 +11411,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         </p>
         ${anchorSection}
         ${perCardStatus}
+        ${modeToggle}
         <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; padding:14px 18px; margin-bottom:18px;">
           <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
             <span style="font-size:12px; color:#9a9aab; letter-spacing:0.04em; text-transform:uppercase;">References to generate</span>
@@ -11444,11 +11505,23 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       }
       await Storage.setSetting("auto_gen_pending", null);
       panel.remove();
-      bulkGenerateAllRefs().catch(err => {
+      // v4.0: thread the active mode into bulk gen
+      bulkGenerateAllRefs({ mode }).catch(err => {
         console.error("[bulk-gen]", err);
         toast(`Bulk generation errored: ${err.message}`, { tone: "err", duration: 8000 });
       });
     };
+
+    // v4.0 mode toggle — re-render the modal with the new mode selected.
+    // Simpler than partial DOM updates given the breakdown changes too.
+    panel.querySelectorAll("[data-mode]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const newMode = btn.dataset.mode;
+        if (newMode === mode) return;
+        panel.remove();
+        showAutoGenPostImportModal({ ...opts, mode: newMode });
+      });
+    });
 
     $("#elx-autogen-skip", panel).addEventListener("click", close);
 
@@ -12010,7 +12083,12 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   // ─── Actions ────────────────────────────────────────────────────────
-  async function handleGenerateCastRefs(charId, modelKey = "seedream") {
+  // v4.0: `opts.onlyBase` skips the chained 3/4 + full_body generation.
+  // The bulk-gen flow uses this for the "Quick" first pass — generates ONE
+  // head_on per character, lets the user review before spending 2x more on
+  // angles that may not even be needed (only reference_to_video shots use
+  // multi-angle; image_to_video uses one ref, text_to_video uses zero).
+  async function handleGenerateCastRefs(charId, modelKey = "seedream", opts = {}) {
     const modelMeta = IMAGE_MODELS[modelKey];
     if (!modelMeta) { toast(`Unknown model: ${modelKey}`, { tone: "err" }); return; }
 
@@ -12097,6 +12175,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       }
 
       // ── STEP 2 + 3: three_quarter & full_body as EDITS using head_on as reference ──
+      // v4.0: short-circuit when opts.onlyBase is set — Quick mode generates
+      // ONLY head_on, leaving 3/4 + full_body for an opt-in second pass.
+      // This is cheaper AND aligns with how the shot pipeline actually consumes
+      // refs: keyframes use ONE cast image; only reference_to_video shots benefit
+      // from multi-angle.
+      if (opts.onlyBase) {
+        // Done — head_on is generated, the chain stops here.
+      } else
       for (const angle of ["three_quarter", "full_body"]) {
         // Skip if already present in EITHER bucket (user upload OR generated)
         if (c.refs.user[angle]?.dataUrl) continue;
@@ -12153,7 +12239,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (failCount > 0)                  toast(`${m}: all angles failed. Check console.`, { tone: "err", duration: 8000 });
   }
 
-  async function handleGenerateEnvRefs(locId, modelKey = "seedream") {
+  // v4.0: `opts.onlyBase` skips the chained detail generation (same pattern
+  // as cast handler — Quick mode generates ONLY the wide plate).
+  async function handleGenerateEnvRefs(locId, modelKey = "seedream", opts = {}) {
     const modelMeta = IMAGE_MODELS[modelKey];
     if (!modelMeta) { toast(`Unknown model: ${modelKey}`, { tone: "err" }); return; }
 
@@ -12226,8 +12314,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       }
 
       // ── STEP 2: detail as edit using wide as reference ───────────────────
-      // Skip if EITHER bucket has it
-      if (!e.refs.user.detail?.dataUrl && !e.refs[modelKey].detail?.dataUrl) {
+      // v4.0: Quick mode short-circuits here. Detail is rarely used in shot
+      // generation — shot.references[] resolution picks wide first, falls back
+      // to detail. Wide alone covers the env's shot-time need.
+      // Skip if EITHER bucket has it OR onlyBase is set
+      if (opts.onlyBase) {
+        // Done — wide is sufficient for the keyframe + reference-to-video paths.
+      } else if (!e.refs.user.detail?.dataUrl && !e.refs[modelKey].detail?.dataUrl) {
         setGPS(true, `Generating <span class="mono">${esc(locId)} · detail</span>`, `${modelMeta.label} · space-locked from wide`, 60);
         try {
           const editSpec = composer.composeEnvironmentReferenceEditPrompt(e, "detail", project);
