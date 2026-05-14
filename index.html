@@ -7864,21 +7864,50 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
  * elevenx/app/storage.js — IndexedDB wrapper for the browser app.
  * One DB, separate stores. Persists across reloads.
  *
- * Schema v1:
- *   - settings    (kv: worker_url, fal_health, cost_total, etc.)
- *   - characters  (cast bible: 4 characters, each with refs[] = approved images)
- *   - environments(2 locations, refs{wide,detail})
- *   - shots       (11 shots, each with keyframes{start,end} + takes[])
- *   - takes       (immutable: blob + metadata sidecar)
- *   - conversations (AI Producer chat — deferred for MVP, schema in place)
+ * Schema v2 (multi-project, since 2026-05-14):
+ *   - projects     (id, display_name, description?, created_at, is_seeded)
+ *   - settings     (kv: worker_url, fal_health, cost_total, active_project_id, ...)
+ *   - characters   (cast bible — project-scoped via row.project_id)
+ *   - environments (locations — project-scoped)
+ *   - shots        (project-scoped)
+ *   - takes        (project-scoped immutable blobs)
+ *   - conversations(project-scoped AI Producer chat history)
+ *
+ * Project scoping model:
+ *   Every row in characters/environments/shots/takes/conversations carries
+ *   a project_id. `Storage.getAll(store)` filters by the currently active
+ *   project; `Storage.getAllRaw(store)` returns everything (used for
+ *   migration + cross-project cascades like delete).
+ *
+ *   `Storage.put(store, row)` injects `project_id` from the active project
+ *   when the row doesn't already carry one. This means existing call sites
+ *   in main.js don't need to learn about projects — they keep using
+ *   getAll/put naturally and get per-project semantics for free.
+ *
+ *   The active project ID lives in the settings store under key
+ *   "active_project_id" and is cached in-memory once read.
+ *
+ * v1 → v2 migration (in onupgradeneeded):
+ *   - Creates the `projects` store.
+ *   - All existing rows in characters/environments/shots/takes/conversations
+ *     get `project_id = "the_standup"` written via a cursor walk.
+ *   - The "the_standup" project row gets inserted with is_seeded:true.
+ *   - settings.active_project_id is set to "the_standup".
+ *
+ *   No data is destroyed. Refreshing a v1 user lands them on their existing
+ *   Standup project, fully populated.
  */
 (() => {
   const NS = (window.ElevenX = window.ElevenX || {});
   const DB_NAME = "elevenx";
-  const DB_VER  = 1;
+  const DB_VER  = 2;
+
+  // The stores that get the project_id filter treatment.
+  const PROJECT_SCOPED = ["characters", "environments", "shots", "takes", "conversations"];
 
   const STORES = {
     settings:     { keyPath: "key" },
+    projects:     { keyPath: "id" },
     characters:   { keyPath: "id" },
     environments: { keyPath: "id" },
     shots:        { keyPath: "id" },
@@ -7886,16 +7915,63 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     conversations:{ keyPath: "id", autoIncrement: true },
   };
 
+  // The bundled seed project. Created in v2 migration AND on first run
+  // if missing (idempotent).
+  const SEEDED_PROJECT = {
+    id: "the_standup",
+    display_name: "The Standup",
+    description: "Episode 1 of the Enliven psychological-safety series. 4 leads, 2 environments, 11 shots.",
+    is_seeded: true,
+    created_at: "2026-05-13",
+  };
+
+  // In-memory cache of active project id. First call to ensureActiveProject()
+  // pulls from settings; everything after reads this. setActiveProject()
+  // updates both.
+  let _activeProjectId = null;
+
   function open() {
     return new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VER);
       req.onerror = () => reject(req.error);
+
       req.onupgradeneeded = (e) => {
         const db = e.target.result;
+        const txn = e.target.transaction;
+        const oldVersion = e.oldVersion;
+
+        // Create any stores that don't yet exist.
         for (const [name, opts] of Object.entries(STORES)) {
           if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, opts);
         }
+
+        // v1 → v2: backfill project_id on every existing row + seed "the_standup".
+        if (oldVersion < 2) {
+          // Mark all existing rows in project-scoped stores as belonging to the_standup.
+          for (const store of PROJECT_SCOPED) {
+            if (!db.objectStoreNames.contains(store)) continue;
+            const os = txn.objectStore(store);
+            const cur = os.openCursor();
+            cur.onsuccess = (ev) => {
+              const c = ev.target.result;
+              if (!c) return;
+              const row = c.value;
+              if (!row.project_id) {
+                row.project_id = "the_standup";
+                c.update(row);
+              }
+              c.continue();
+            };
+          }
+          // Insert the seeded project row (won't collide because v1 had no projects store).
+          const projOs = txn.objectStore("projects");
+          projOs.put(SEEDED_PROJECT);
+          // Set the active project so the first v2 boot doesn't hit "no active project".
+          const settingsOs = txn.objectStore("settings");
+          settingsOs.put({ key: "active_project_id", value: "the_standup", updatedAt: Date.now() });
+        }
       };
+
       req.onsuccess = () => resolve(req.result);
     });
   }
@@ -7911,24 +7987,67 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     });
   }
 
-  // Public API
+  // Resolve the active project id. Reads from cache, falls back to settings.
+  // Returns null only if nothing is set yet (caller should ensureActiveProject).
+  async function getActiveProjectId() {
+    if (_activeProjectId) return _activeProjectId;
+    const db = await open();
+    const r = await promisify(tx(db, "settings").get("active_project_id"));
+    if (r && r.value) {
+      _activeProjectId = r.value;
+      return _activeProjectId;
+    }
+    return null;
+  }
+
+  // ─── Public API ──────────────────────────────────────────────────────
   const Storage = {
     async get(store, key) {
       const db = await open();
       return promisify(tx(db, store).get(key));
     },
+
+    /**
+     * Write a row. For project-scoped stores, injects project_id from the
+     * active project if missing. Pass project_id explicitly to override
+     * (e.g., when seeding rows for a specific project at boot).
+     */
     async put(store, value) {
       const db = await open();
+      if (PROJECT_SCOPED.includes(store) && !value.project_id) {
+        const pid = await getActiveProjectId();
+        if (pid) value = { ...value, project_id: pid };
+      }
       return promisify(tx(db, store, "readwrite").put(value));
     },
+
+    /**
+     * Get all rows. For project-scoped stores, returns ONLY rows in the
+     * active project. For `projects`/`settings`, returns everything.
+     */
     async getAll(store) {
+      const db = await open();
+      const all = await promisify(tx(db, store).getAll());
+      if (!PROJECT_SCOPED.includes(store)) return all;
+      const pid = await getActiveProjectId();
+      if (!pid) return all; // no active project yet → return everything (boot)
+      return all.filter(r => (r.project_id || "the_standup") === pid);
+    },
+
+    /**
+     * Get every row in a store regardless of project. Used by migration
+     * code and the cross-project delete cascade.
+     */
+    async getAllRaw(store) {
       const db = await open();
       return promisify(tx(db, store).getAll());
     },
+
     async delete(store, key) {
       const db = await open();
       return promisify(tx(db, store, "readwrite").delete(key));
     },
+
     async clear(store) {
       const db = await open();
       return promisify(tx(db, store, "readwrite").clear());
@@ -7943,12 +8062,111 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       return Storage.put("settings", { key, value, updatedAt: Date.now() });
     },
 
-    // Seeding: idempotent — only writes if store is empty
+    /**
+     * Seed a project-scoped store. Idempotent at the (store, active project)
+     * level: if THIS project already has rows in this store, skip.
+     *
+     * Important: seed items get `project_id` injected automatically via put().
+     */
     async seed(store, items) {
-      const existing = await Storage.getAll(store);
+      const existing = await Storage.getAll(store); // already project-filtered
       if (existing.length > 0) return { skipped: true, count: existing.length };
       for (const item of items) await Storage.put(store, item);
       return { skipped: false, count: items.length };
+    },
+
+    // ─── Project management ──────────────────────────────────────────────
+    Projects: {
+      /** List every project, ordered by created_at desc. */
+      async list() {
+        const all = await Storage.getAllRaw("projects");
+        return all.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+      },
+      async get(id) {
+        return Storage.get("projects", id);
+      },
+      /** Get the currently active project (full row). */
+      async getActive() {
+        const pid = await getActiveProjectId();
+        if (!pid) return null;
+        return Storage.get("projects", pid);
+      },
+      async getActiveId() {
+        return getActiveProjectId();
+      },
+      /**
+       * Create a new project. `id` is slugified from display_name if absent.
+       * Returns the inserted row.
+       */
+      async create({ id, display_name, description }) {
+        const slug = id || display_name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "_")
+          .replace(/^_+|_+$/g, "")
+          .slice(0, 64)
+          || `project_${Date.now()}`;
+        const existing = await Storage.get("projects", slug);
+        if (existing) throw new Error(`Project "${slug}" already exists`);
+        const row = {
+          id: slug,
+          display_name: display_name || slug,
+          description: description || "",
+          is_seeded: false,
+          created_at: new Date().toISOString().slice(0, 10),
+        };
+        await Storage.put("projects", row);
+        return row;
+      },
+      /** Set active project. Returns the new active id. */
+      async setActive(id) {
+        const row = await Storage.get("projects", id);
+        if (!row) throw new Error(`No such project "${id}"`);
+        await Storage.setSetting("active_project_id", id);
+        _activeProjectId = id;
+        return id;
+      },
+      /**
+       * Delete a project AND every row owned by it across project-scoped
+       * stores. Refuses to delete the active project unless `force:true` is
+       * passed; UI is responsible for switching first.
+       */
+      async delete(id, { force = false } = {}) {
+        const active = await getActiveProjectId();
+        if (id === active && !force) {
+          throw new Error("Cannot delete the active project — switch to another project first.");
+        }
+        // Cascade: drop every row in project-scoped stores owned by this id.
+        for (const store of PROJECT_SCOPED) {
+          const all = await Storage.getAllRaw(store);
+          for (const r of all) {
+            if ((r.project_id || "the_standup") === id) {
+              await Storage.delete(store, r.id);
+            }
+          }
+        }
+        await Storage.delete("projects", id);
+        return { deleted: id };
+      },
+      /** Ensure the seeded "the_standup" project row exists. Idempotent. */
+      async ensureSeeded() {
+        const existing = await Storage.get("projects", SEEDED_PROJECT.id);
+        if (existing) return existing;
+        await Storage.put("projects", SEEDED_PROJECT);
+        return SEEDED_PROJECT;
+      },
+      /** Ensure SOME project is active. Defaults to "the_standup". */
+      async ensureActive() {
+        const cur = await getActiveProjectId();
+        if (cur) {
+          // Validate the cached id still exists (could have been deleted by another tab).
+          const row = await Storage.get("projects", cur);
+          if (row) return cur;
+        }
+        await Storage.Projects.ensureSeeded();
+        await Storage.setSetting("active_project_id", SEEDED_PROJECT.id);
+        _activeProjectId = SEEDED_PROJECT.id;
+        return SEEDED_PROJECT.id;
+      },
     },
   };
 
@@ -8296,6 +8514,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     for (const c of characters) {
       grid.appendChild(buildCastCard(c));
     }
+    // "+ Add character" tile — always present, even on populated grids so
+    // the director can extend the cast at any time. On empty projects this
+    // is the lone tile and reads as the empty-state CTA.
+    grid.appendChild(buildAddTile({
+      kind: "character",
+      empty: characters.length === 0,
+      label: characters.length === 0 ? "Add your first character" : "Add character",
+    }));
   }
 
   function buildCastCard(c) {
@@ -8342,6 +8568,45 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     for (const e of envs) {
       grid.appendChild(buildLocationCard(e));
     }
+    grid.appendChild(buildAddTile({
+      kind: "environment",
+      empty: envs.length === 0,
+      label: envs.length === 0 ? "Add your first environment" : "Add environment",
+    }));
+  }
+
+  // Generic "+ Add" tile used at the end of cast/loc/storyboard grids.
+  // Triggers the right create-modal via data-action.
+  function buildAddTile({ kind, empty, label }) {
+    const el = document.createElement("div");
+    el.className = `cast-card cast-card--add${empty ? " cast-card--add-empty" : ""}`;
+    el.dataset.action = `create-${kind}`;
+    el.style.cssText = `
+      cursor: pointer;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 10px; min-height: 220px;
+      background: ${empty ? "linear-gradient(135deg, #14141a, #0a0a0c)" : "transparent"};
+      border: ${empty ? "1px solid #c9a25a" : "1px dashed #3a3a45"};
+      border-radius: 10px;
+      color: ${empty ? "#c9a25a" : "#6a6a78"};
+      font-size: 13px;
+      transition: all .15s ease;
+    `;
+    el.innerHTML = `
+      <div style="font-size:30px; line-height:1; font-weight:300;">+</div>
+      <div>${esc(label)}</div>
+    `;
+    el.addEventListener("mouseenter", () => {
+      el.style.background = "#14141a";
+      el.style.color = "#c9a25a";
+      el.style.borderColor = "#c9a25a";
+    });
+    el.addEventListener("mouseleave", () => {
+      el.style.background = empty ? "linear-gradient(135deg, #14141a, #0a0a0c)" : "transparent";
+      el.style.color = empty ? "#c9a25a" : "#6a6a78";
+      el.style.borderColor = empty ? "#c9a25a" : "#3a3a45";
+    });
+    return el;
   }
 
   function buildLocationCard(e) {
@@ -8426,6 +8691,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       });
     }
 
+    // Append the "+ Add shot" tile after all shot tiles (or as the lone empty-state tile).
+    // We do this in a second pass so it always lands at the end of the grid.
+    let renderedAny = false;
+
     for (const s of shots) {
       const takes = s.takes || [];
       const approved = takes.find(t => t.status === "approved");
@@ -8477,6 +8746,43 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         </div>
       `;
       grid.appendChild(card);
+      renderedAny = true;
+    }
+
+    // "+ Add shot" tile — same style as cast/loc Add tiles but takes the
+    // .elx-shot grid dimensions. Only show when "all" filter is active or
+    // there are no shots yet (so adding from a filtered view feels intentional).
+    if (activeFilter === "all" || !renderedAny) {
+      const addCard = document.createElement("div");
+      const empty = !renderedAny;
+      addCard.className = `elx-shot elx-shot--add${empty ? " elx-shot--add-empty" : ""}`;
+      addCard.dataset.action = "create-shot";
+      addCard.style.cssText = `
+        cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        background: ${empty ? "linear-gradient(135deg, #14141a, #0a0a0c)" : "transparent"};
+        border: ${empty ? "1px solid #c9a25a" : "1px dashed #3a3a45"};
+        border-radius: 10px;
+        color: ${empty ? "#c9a25a" : "#6a6a78"};
+        transition: all .15s ease;
+      `;
+      addCard.innerHTML = `
+        <div style="display:flex; flex-direction:column; align-items:center; gap:8px;">
+          <div style="font-size:30px; line-height:1; font-weight:300;">+</div>
+          <div style="font-size:13px;">${empty ? "Add your first shot" : "Add shot"}</div>
+        </div>
+      `;
+      addCard.addEventListener("mouseenter", () => {
+        addCard.style.background = "#14141a";
+        addCard.style.color = "#c9a25a";
+        addCard.style.borderColor = "#c9a25a";
+      });
+      addCard.addEventListener("mouseleave", () => {
+        addCard.style.background = empty ? "linear-gradient(135deg, #14141a, #0a0a0c)" : "transparent";
+        addCard.style.color = empty ? "#c9a25a" : "#6a6a78";
+        addCard.style.borderColor = empty ? "#c9a25a" : "#3a3a45";
+      });
+      grid.appendChild(addCard);
     }
   }
 
@@ -9506,6 +9812,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "open-shot-editor") navigateToShot(target.dataset.shotId);
     else if (action === "tree-nav-shot")    navigateToShot(target.dataset.shotId);
     else if (action === "open-connection") showConnectionPanel();
+    else if (action === "create-character")   showCreateCharacterModal();
+    else if (action === "create-environment") showCreateEnvironmentModal();
+    else if (action === "create-shot")        showCreateShotModal();
   });
 
   // ─── Inject missing DOM hooks into mockup ───────────────────────────
@@ -10143,6 +10452,611 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     playNext();
   }
 
+  // ─── Bible authoring modals ─────────────────────────────────────────
+  // Minimal create-row forms so empty projects are usable without
+  // editing YAML. Authoring is intentionally bare-bones for v1 — the
+  // AI Producer chat (Tier 1 backlog) is the eventual front door for
+  // converting briefs into full bibles. These forms cover the manual fallback.
+
+  function openFormModal({ title, formHtml, onSubmit }) {
+    if ($("#elx-form-modal")) return;
+    const panel = document.createElement("div");
+    panel.id = "elx-form-modal";
+    panel.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9000;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px);
+    `;
+    panel.innerHTML = `
+      <form id="elx-form-modal-form" style="background:#14141a; border:1px solid #2a2a35;
+                  border-radius:12px; padding:24px 28px; max-width:560px; width:92%;
+                  font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6); max-height:88vh; overflow:auto;">
+        <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:14px;">
+          <h2 style="margin:0; font-size:16px; font-weight:600;">${esc(title)}</h2>
+          <button type="button" id="elx-form-close"
+                  style="background:none; border:none; color:#9a9aab; font-size:18px;
+                         cursor:pointer; line-height:1; padding:4px 8px;">×</button>
+        </div>
+        ${formHtml}
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:18px; padding-top:14px; border-top:1px solid #2a2a35;">
+          <button type="button" id="elx-form-cancel"
+                  style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
+                         padding:8px 16px; border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+          <button type="submit"
+                  style="background:#c9a25a; color:#14141a; border:none;
+                         padding:8px 16px; border-radius:6px; font-size:12px;
+                         font-weight:600; cursor:pointer;">Save</button>
+        </div>
+      </form>
+    `;
+    document.body.appendChild(panel);
+    const close = () => panel.remove();
+    panel.addEventListener("click", (e) => { if (e.target === panel) close(); });
+    $("#elx-form-close", panel).addEventListener("click", close);
+    $("#elx-form-cancel", panel).addEventListener("click", close);
+    $("#elx-form-modal-form", panel).addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        const formEl = e.currentTarget;
+        const ok = await onSubmit(formEl);
+        if (ok !== false) close();
+      } catch (err) {
+        toast(`Save failed: ${err.message}`, { tone: "err", duration: 7000 });
+      }
+    });
+    return panel;
+  }
+
+  // Slugify display name → IDB id. Falls back to timestamp-based slug.
+  function slugifyId(prefix, displayName) {
+    const slug = String(displayName || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 40);
+    if (!slug) return `${prefix}_${Date.now()}`;
+    return slug;
+  }
+
+  // Split a CSV/newline-separated input into a clean array.
+  function splitList(raw) {
+    if (!raw) return [];
+    return String(raw)
+      .split(/[\n,]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
+
+  function fieldHtml(label, html, help) {
+    return `
+      <div style="margin-bottom:12px;">
+        <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px;
+                      letter-spacing:0.04em; text-transform:uppercase;">${esc(label)}</label>
+        ${html}
+        ${help ? `<div style="font-size:10.5px; color:#6a6a78; margin-top:4px; line-height:1.4;">${esc(help)}</div>` : ""}
+      </div>
+    `;
+  }
+
+  const FIELD_INPUT_STYLE = `width:100%; padding:9px 12px; background:#0a0a0c; color:#e8e8ee;
+                             border:1px solid #2a2a35; border-radius:6px; font-size:13px;
+                             box-sizing:border-box; font-family: inherit;`;
+
+  function showCreateCharacterModal() {
+    const formHtml = `
+      ${fieldHtml("Display name", `<input name="display_name" type="text" required placeholder="e.g. Sarah Chen" style="${FIELD_INPUT_STYLE}">`)}
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        ${fieldHtml("Age", `<input name="age" type="number" min="1" max="120" placeholder="34" style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Nationality", `<input name="nationality" type="text" placeholder="British-Chinese" style="${FIELD_INPUT_STYLE}">`)}
+      </div>
+      ${fieldHtml("Role in story", `<input name="role" type="text" placeholder="lead engineer (sceptical)" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml("Archetype (short)", `<input name="archetype" type="text" placeholder="watchful, deliberate; doesn't speak unless necessary" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml(
+        "Distinctive features",
+        `<textarea name="distinctive_features" rows="3" placeholder="One per line — e.g. tortoiseshell rectangular glasses" style="${FIELD_INPUT_STYLE} resize:vertical;"></textarea>`,
+        "These are what the model uses to keep your character visually distinct from others."
+      )}
+      ${fieldHtml(
+        "Wardrobe color palette",
+        `<input name="palette" type="text" placeholder="charcoal grey, white, indigo" style="${FIELD_INPUT_STYLE}">`,
+        "Comma-separated colors. Used in the cast card swatches and in prompts."
+      )}
+      ${fieldHtml(
+        "Voice note (for Seedance native audio)",
+        `<input name="voice_direction" type="text" placeholder="warm professional, mid-low register, considered" style="${FIELD_INPUT_STYLE}">`,
+        "Seedance reads this when generating native audio. Optional."
+      )}
+      ${fieldHtml(
+        "ElevenLabs voice ID (optional)",
+        `<input name="voice_id" type="text" placeholder="paste from elevenlabs.io/voice-lab" style="${FIELD_INPUT_STYLE} font-family: 'JetBrains Mono', monospace;">`,
+        "Required only if you'll use voice overlay for this character."
+      )}
+    `;
+    openFormModal({
+      title: "Add character",
+      formHtml,
+      onSubmit: async (form) => {
+        const fd = new FormData(form);
+        const display_name = String(fd.get("display_name") || "").trim();
+        if (!display_name) { toast("Display name is required", { tone: "warn" }); return false; }
+        const id = await ensureUniqueId("characters", slugifyId("char", display_name));
+        const row = {
+          id,
+          display_name,
+          identity: {
+            age: Number(fd.get("age")) || null,
+            nationality: String(fd.get("nationality") || "").trim(),
+            role_in_story: String(fd.get("role") || "").trim(),
+            archetype: String(fd.get("archetype") || "").trim(),
+          },
+          physical: {
+            hair: {}, eyes: "", skin: "",
+            distinctive_features: splitList(fd.get("distinctive_features")),
+          },
+          wardrobe: {
+            episode_default: { accessories: [] },
+            color_palette: splitList(fd.get("palette")),
+          },
+          voice: {
+            seedance_native_direction: String(fd.get("voice_direction") || "").trim(),
+            elevenlabs_fallback: {
+              voice_id: String(fd.get("voice_id") || "").trim() || "TBD",
+              stability: 0.5, similarity: 0.75, style: 0.4,
+            },
+            consent_record_id: "TBD",
+          },
+          performance: {},
+          references: { head_on: "", three_quarter: "", full_body: "", extras: [] },
+          never: [],
+          high_risk: false,
+          stability_note: "",
+          refs: { seedream: {}, gpt: {} },
+          chosenModel: null,
+          created_at: new Date().toISOString().slice(0, 10),
+        };
+        await Storage.put("characters", row);
+        toast(`Added "${display_name}"`, { tone: "ok" });
+        await renderCastTab();
+        const cc = $("#elx-cast-count"); if (cc) cc.textContent = (await Storage.getAll("characters")).length;
+      },
+    });
+  }
+
+  function showCreateEnvironmentModal() {
+    const formHtml = `
+      ${fieldHtml("Display name", `<input name="display_name" type="text" required placeholder="e.g. Rooftop Bar" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml("Architecture / type", `<input name="architecture" type="text" placeholder="open-plan loft, exposed brick, double-height windows" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml("Lighting", `<input name="lighting" type="text" placeholder="golden hour, low west sun through tall windows" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml(
+        "Palette",
+        `<input name="palette" type="text" placeholder="amber, pale wood, deep teal" style="${FIELD_INPUT_STYLE}">`,
+        "Comma-separated colors. Drives env-card swatches and prompt color cues."
+      )}
+      ${fieldHtml(
+        "Props",
+        `<textarea name="props" rows="3" placeholder="One per line — e.g. weathered leather sofa, brass floor lamp" style="${FIELD_INPUT_STYLE} resize:vertical;"></textarea>`,
+        "The model occasionally drops props; listing them here lets the composer reinforce them."
+      )}
+      ${fieldHtml("Ambient sound", `<input name="ambient_sound" type="text" placeholder="distant traffic, occasional ice in glass" style="${FIELD_INPUT_STYLE}">`)}
+    `;
+    openFormModal({
+      title: "Add environment",
+      formHtml,
+      onSubmit: async (form) => {
+        const fd = new FormData(form);
+        const display_name = String(fd.get("display_name") || "").trim();
+        if (!display_name) { toast("Display name is required", { tone: "warn" }); return false; }
+        const id = await ensureUniqueId("environments", slugifyId("env", display_name));
+        const row = {
+          id,
+          display_name,
+          architecture: { type: String(fd.get("architecture") || "").trim() },
+          lighting: { description: String(fd.get("lighting") || "").trim() },
+          palette: splitList(fd.get("palette")),
+          props: splitList(fd.get("props")),
+          ambient_sound: String(fd.get("ambient_sound") || "").trim(),
+          continuity_locks: [],
+          refs: { seedream: {}, gpt: {} },
+          chosenModel: null,
+          created_at: new Date().toISOString().slice(0, 10),
+        };
+        await Storage.put("environments", row);
+        toast(`Added "${display_name}"`, { tone: "ok" });
+        await renderLocationTab();
+        const lc = $("#elx-loc-count"); if (lc) lc.textContent = (await Storage.getAll("environments")).length;
+      },
+    });
+  }
+
+  async function showCreateShotModal() {
+    const characters = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const existingShots = await Storage.getAll("shots");
+    const nextShotNumber = (existingShots.reduce((m, s) => Math.max(m, s.shot_number || 0), 0)) + 1;
+
+    const castOptions = characters.length === 0
+      ? `<div style="font-size:12px; color:#9a9aab; padding:8px; background:#0a0a0c; border-radius:6px;">No characters in this project yet — add some first if your shot needs cast in frame.</div>`
+      : characters.map(c => `
+          <label style="display:flex; align-items:center; gap:8px; padding:6px 0; font-size:13px; cursor:pointer;">
+            <input type="checkbox" name="cast_${esc(c.id)}" value="1" style="margin:0;">
+            <span>${esc(c.display_name)}</span>
+            <span style="font-size:11px; color:#6a6a78;">${esc(c.identity?.role_in_story || "")}</span>
+          </label>
+        `).join("");
+
+    const envOptions = environments.length === 0
+      ? `<option value="">— no environments yet —</option>`
+      : `<option value="">— pick one —</option>` + environments.map(e => `<option value="${esc(e.id)}">${esc(e.display_name)}</option>`).join("");
+
+    const formHtml = `
+      <div style="display:grid; grid-template-columns:80px 1fr; gap:10px;">
+        ${fieldHtml("Shot #", `<input name="shot_number" type="number" min="1" value="${nextShotNumber}" required style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Display name", `<input name="display_name" type="text" required placeholder="e.g. Cold open" style="${FIELD_INPUT_STYLE}">`)}
+      </div>
+      ${fieldHtml(
+        "The moment — verb",
+        `<input name="verb" type="text" placeholder="approaches / cuts off / pauses" style="${FIELD_INPUT_STYLE}">`,
+        "One verb that captures the central action. Used in the [Action Sequence] block."
+      )}
+      ${fieldHtml(
+        "The moment — description",
+        `<textarea name="moment_description" rows="2" placeholder="What happens. One or two sentences." style="${FIELD_INPUT_STYLE} resize:vertical;"></textarea>`
+      )}
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        ${fieldHtml(
+          "Camera framing",
+          `<select name="framing" style="${FIELD_INPUT_STYLE}">
+            <option value="wide">wide</option>
+            <option value="medium" selected>medium</option>
+            <option value="medium close-up">medium close-up</option>
+            <option value="close-up">close-up</option>
+            <option value="two-shot">two-shot</option>
+            <option value="over-the-shoulder">over-the-shoulder</option>
+          </select>`
+        )}
+        ${fieldHtml(
+          "Aspect ratio",
+          `<select name="aspect_ratio" style="${FIELD_INPUT_STYLE}">
+            <option value="16:9" selected>16:9 (landscape)</option>
+            <option value="9:16">9:16 (vertical)</option>
+            <option value="1:1">1:1 (square)</option>
+            <option value="2.35:1">2.35:1 (cinemascope)</option>
+          </select>`
+        )}
+      </div>
+      ${fieldHtml(
+        "Location",
+        `<select name="location_id" style="${FIELD_INPUT_STYLE}">${envOptions}</select>`,
+        "Required for image_to_video / reference_to_video generation paths."
+      )}
+      ${fieldHtml(
+        "Cast in frame",
+        `<div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:8px 12px;">${castOptions}</div>`,
+        "Check every character visible in the shot. Off-frame characters can be referenced in the moment description instead."
+      )}
+      ${fieldHtml(
+        "Dialogue (optional)",
+        `<textarea name="dialogue" rows="2" placeholder="Verbatim line(s). Format: Character Name: ...." style="${FIELD_INPUT_STYLE} resize:vertical;"></textarea>`,
+        "One line per dialogue. Prefix with the character display name + colon. Used for native lip-sync."
+      )}
+      <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:10px 12px; font-size:11.5px; color:#9a9aab; margin-top:6px;">
+        Render duration is fixed at <strong style="color:#c9a25a;">15s</strong> per shot — Seedance's full canvas. Cut to taste in your NLE.
+      </div>
+    `;
+    openFormModal({
+      title: "Add shot",
+      formHtml,
+      onSubmit: async (form) => {
+        const fd = new FormData(form);
+        const display_name = String(fd.get("display_name") || "").trim();
+        if (!display_name) { toast("Display name is required", { tone: "warn" }); return false; }
+        const shot_number = Number(fd.get("shot_number")) || nextShotNumber;
+        const id = await ensureUniqueId("shots", slugifyId(`s${String(shot_number).padStart(2,"0")}`, display_name));
+
+        // Compute in/out from shot_number (15s blocks back-to-back)
+        const startSec = (shot_number - 1) * 15;
+        const fmt = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+
+        // Cast in frame from checked boxes
+        const castInFrame = [];
+        for (const c of characters) {
+          if (fd.get(`cast_${c.id}`) === "1") {
+            castInFrame.push({ character_id: c.id, role_in_shot: "in_frame" });
+          }
+        }
+
+        // Parse dialogue lines — "Name: text" format → attach to matching cast member
+        const dialogueRaw = String(fd.get("dialogue") || "").trim();
+        if (dialogueRaw) {
+          for (const line of dialogueRaw.split(/\n+/).map(l => l.trim()).filter(Boolean)) {
+            const colonIdx = line.indexOf(":");
+            if (colonIdx === -1) continue;
+            const speakerName = line.slice(0, colonIdx).trim();
+            const text = line.slice(colonIdx + 1).trim();
+            const speaker = characters.find(c => c.display_name.toLowerCase() === speakerName.toLowerCase());
+            if (speaker) {
+              const entry = castInFrame.find(x => x.character_id === speaker.id);
+              if (entry) entry.dialogue = { en: text };
+              else castInFrame.push({ character_id: speaker.id, role_in_shot: "speaks", dialogue: { en: text } });
+            }
+          }
+        }
+
+        const row = {
+          id,
+          shot_number,
+          display_name,
+          status: "draft",
+          timecode: {
+            in: fmt(startSec),
+            out: fmt(startSec + 15),
+            duration_seconds: 15,
+          },
+          the_moment: {
+            verb: String(fd.get("verb") || "").trim(),
+            description: String(fd.get("moment_description") || "").trim(),
+          },
+          camera: {
+            framing: String(fd.get("framing") || "medium"),
+            aspect_ratio: String(fd.get("aspect_ratio") || "16:9"),
+            movement: "locked",
+            depth: "shallow",
+          },
+          audio: { generate_native: true },
+          location: { location_id: String(fd.get("location_id") || "") || null },
+          cast_in_frame: castInFrame,
+          cast_lockdown_required: castInFrame.length >= 3,
+          generation: { mode: "auto" },
+          prompt_engineering: {},
+          takes: [],
+          keyframes: {},
+          created_at: new Date().toISOString().slice(0, 10),
+        };
+        await Storage.put("shots", row);
+        toast(`Added shot S${String(shot_number).padStart(2,"0")} "${display_name}"`, { tone: "ok" });
+        await renderStoryboard();
+        await adaptLeftTreeShots();
+      },
+    });
+  }
+
+  // Make sure a fresh id doesn't collide. If it does, append _2, _3…
+  async function ensureUniqueId(store, candidate) {
+    let id = candidate;
+    let suffix = 1;
+    // getAllRaw so we don't accidentally allow same id across projects
+    // (we want IDs globally unique within the store for IDB primary key).
+    const all = await Storage.getAllRaw(store);
+    const taken = new Set(all.map(r => r.id));
+    while (taken.has(id)) {
+      suffix += 1;
+      id = `${candidate}_${suffix}`;
+    }
+    return id;
+  }
+
+  // ─── Project picker ─────────────────────────────────────────────────
+  // Multi-project (since 2026-05-14). The v2 mockup's left-sidebar shows
+  // a static "ElevenX / DIRECTOR · v0.4" brand block + a "New series"
+  // icon button (no functionality) + a "SERIES > The Standup" tree row.
+  // We repurpose all three:
+  //   - Brand subline becomes the active project name (clickable → picker).
+  //   - Icon button opens the same picker.
+  //   - The SERIES row reflects the active project; clicking it also opens the picker.
+  async function adaptProjectPicker() {
+    const active = await Storage.Projects.getActive();
+    if (!active) return;
+
+    // 1. Brand block: subline → active project name, whole block clickable.
+    const brandSub = $(".brand__sub");
+    const brand    = $(".brand");
+    if (brandSub) brandSub.textContent = active.display_name.toUpperCase();
+    if (brand) {
+      brand.style.cursor = "pointer";
+      brand.title = "Switch project";
+      brand.addEventListener("click", showProjectPicker);
+    }
+
+    // 2. The "+" icon button next to the brand → also opens the picker
+    //    (showProjectPicker has a "Create new" button inside).
+    const plusBtn = $(".left__header .icon-btn");
+    if (plusBtn) {
+      plusBtn.title = "New project";
+      plusBtn.setAttribute("aria-label", "New project");
+      plusBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        showProjectPicker({ openCreate: true });
+      });
+    }
+
+    // 3. Tree's SERIES row label → active project name.
+    const seriesRow = document.querySelector('[data-tree-row="series"] .label');
+    if (seriesRow) seriesRow.textContent = active.display_name;
+    const seriesParent = document.querySelector('[data-tree-row="series"]');
+    if (seriesParent) {
+      seriesParent.style.cursor = "pointer";
+      seriesParent.addEventListener("click", (e) => {
+        // Don't fight the existing expand/collapse — only open picker on label click.
+        if (e.target.closest(".label")) {
+          e.stopPropagation();
+          showProjectPicker();
+        }
+      });
+    }
+
+    // 4. The "SERIES" section header gets a hint that there can be multiples.
+    const seriesSection = Array.from(document.querySelectorAll(".tree__section"))
+      .find(el => el.textContent.trim() === "SERIES");
+    if (seriesSection) seriesSection.textContent = "PROJECT";
+  }
+
+  function showProjectPicker(opts = {}) {
+    if ($("#elx-proj-picker")) return; // already open
+    const panel = document.createElement("div");
+    panel.id = "elx-proj-picker";
+    panel.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9000;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px);
+    `;
+    panel.innerHTML = `
+      <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
+                  padding:24px 28px; max-width:600px; width:92%;
+                  font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6); max-height:80vh; overflow:auto;">
+        <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:18px;">
+          <h2 style="margin:0; font-size:17px; font-weight:600;">Projects</h2>
+          <button id="elx-proj-close" style="background:none; border:none; color:#9a9aab;
+                  font-size:18px; cursor:pointer; line-height:1; padding:4px 8px;">×</button>
+        </div>
+        <div id="elx-proj-list" style="display:flex; flex-direction:column; gap:8px; margin-bottom:18px;"></div>
+        <div style="border-top:1px solid #2a2a35; padding-top:18px;">
+          <div id="elx-proj-create-toggle" style="display:flex; align-items:center; gap:10px; cursor:pointer; padding:8px 0;">
+            <span style="font-size:18px; color:#c9a25a; line-height:1;">+</span>
+            <span style="font-size:13px; color:#e8e8ee;">New project</span>
+          </div>
+          <div id="elx-proj-create-form" style="display:none; margin-top:10px; padding:14px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px;">
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:6px; letter-spacing:0.04em; text-transform:uppercase;">Project name</label>
+            <input id="elx-proj-name" type="text" placeholder="e.g. The Aftermath"
+                   style="width:100%; padding:9px 12px; background:#14141a; color:#e8e8ee;
+                          border:1px solid #2a2a35; border-radius:6px; font-size:13px;
+                          box-sizing:border-box; margin-bottom:10px;">
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:6px; letter-spacing:0.04em; text-transform:uppercase;">Short description (optional)</label>
+            <textarea id="elx-proj-desc" rows="2" placeholder="Logline or genre note"
+                   style="width:100%; padding:9px 12px; background:#14141a; color:#e8e8ee;
+                          border:1px solid #2a2a35; border-radius:6px; font-size:13px;
+                          font-family: inherit; resize:vertical; box-sizing:border-box; margin-bottom:14px;"></textarea>
+            <div style="display:flex; gap:8px; justify-content:flex-end;">
+              <button id="elx-proj-create-cancel"
+                      style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
+                             padding:8px 16px; border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+              <button id="elx-proj-create-save"
+                      style="background:#c9a25a; color:#14141a; border:none;
+                             padding:8px 16px; border-radius:6px; font-size:12px;
+                             font-weight:600; cursor:pointer;">Create + switch</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    const close = () => panel.remove();
+    panel.addEventListener("click", (e) => { if (e.target === panel) close(); });
+    $("#elx-proj-close", panel).addEventListener("click", close);
+
+    // Render the list
+    renderProjectList(panel);
+
+    // Create form toggle
+    const createToggle = $("#elx-proj-create-toggle", panel);
+    const createForm   = $("#elx-proj-create-form", panel);
+    const openCreate = () => {
+      createForm.style.display = "block";
+      createToggle.style.display = "none";
+      setTimeout(() => $("#elx-proj-name", panel)?.focus(), 50);
+    };
+    createToggle.addEventListener("click", openCreate);
+    if (opts.openCreate) openCreate();
+
+    $("#elx-proj-create-cancel", panel).addEventListener("click", () => {
+      createForm.style.display = "none";
+      createToggle.style.display = "flex";
+    });
+    $("#elx-proj-create-save", panel).addEventListener("click", async () => {
+      const name = $("#elx-proj-name", panel).value.trim();
+      const desc = $("#elx-proj-desc", panel).value.trim();
+      if (!name) {
+        toast("Project name is required", { tone: "warn" });
+        return;
+      }
+      try {
+        const row = await Storage.Projects.create({ display_name: name, description: desc });
+        await Storage.Projects.setActive(row.id);
+        toast(`Created "${row.display_name}" — reloading…`, { tone: "ok" });
+        // Full reload — every render path derives from active project, and a
+        // fresh page is the cleanest way to swap context without stale state.
+        setTimeout(() => window.location.reload(), 600);
+      } catch (err) {
+        toast(`Couldn't create project: ${err.message}`, { tone: "err", duration: 7000 });
+      }
+    });
+  }
+
+  async function renderProjectList(panel) {
+    const wrap = $("#elx-proj-list", panel);
+    if (!wrap) return;
+    const projects = await Storage.Projects.list();
+    const activeId = await Storage.Projects.getActiveId();
+    wrap.innerHTML = projects.map(p => {
+      const isActive = p.id === activeId;
+      return `
+        <div data-proj-id="${esc(p.id)}"
+             style="display:flex; align-items:center; gap:12px; padding:11px 14px;
+                    background:${isActive ? "#1a1a22" : "#0f0f14"};
+                    border:1px solid ${isActive ? "#c9a25a" : "#2a2a35"};
+                    border-radius:8px;
+                    ${isActive ? "" : "cursor:pointer;"}">
+          <div style="flex:1; min-width:0;">
+            <div style="font-size:13px; font-weight:${isActive ? "600" : "500"}; color:#e8e8ee;">
+              ${esc(p.display_name)}
+              ${isActive ? '<span style="font-size:10px; color:#c9a25a; margin-left:8px; letter-spacing:0.06em; text-transform:uppercase;">Active</span>' : ""}
+              ${p.is_seeded ? '<span style="font-size:10px; color:#9a9aab; margin-left:8px; letter-spacing:0.06em; text-transform:uppercase;">Seeded</span>' : ""}
+            </div>
+            ${p.description ? `<div style="font-size:11.5px; color:#9a9aab; margin-top:3px; line-height:1.4;">${esc(p.description)}</div>` : ""}
+            <div style="font-size:10.5px; color:#6a6a78; margin-top:4px;">Created ${esc(p.created_at || "—")}</div>
+          </div>
+          ${isActive ? "" : `
+            <button data-proj-switch="${esc(p.id)}"
+                    style="background:#c9a25a; color:#14141a; border:none;
+                           padding:6px 12px; border-radius:5px; font-size:11px;
+                           font-weight:600; cursor:pointer;">Switch</button>
+          `}
+          ${(isActive || p.is_seeded) ? "" : `
+            <button data-proj-delete="${esc(p.id)}"
+                    title="Delete project"
+                    style="background:none; color:#9a9aab; border:1px solid #2a2a35;
+                           padding:6px 9px; border-radius:5px; font-size:11px;
+                           cursor:pointer;">Delete</button>
+          `}
+        </div>
+      `;
+    }).join("");
+
+    // Wire switch buttons
+    wrap.querySelectorAll("[data-proj-switch]").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.projSwitch;
+        try {
+          await Storage.Projects.setActive(id);
+          toast(`Switching to project…`, { tone: "ok" });
+          setTimeout(() => window.location.reload(), 400);
+        } catch (err) {
+          toast(`Couldn't switch: ${err.message}`, { tone: "err" });
+        }
+      });
+    });
+
+    // Wire delete buttons
+    wrap.querySelectorAll("[data-proj-delete]").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.projDelete;
+        const proj = projects.find(p => p.id === id);
+        if (!confirm(`Delete project "${proj?.display_name || id}" and ALL its cast, environments, shots, and takes? This cannot be undone.`)) return;
+        try {
+          await Storage.Projects.delete(id);
+          toast(`Deleted "${proj?.display_name || id}"`, { tone: "ok" });
+          renderProjectList(panel);
+        } catch (err) {
+          toast(`Couldn't delete: ${err.message}`, { tone: "err", duration: 7000 });
+        }
+      });
+    });
+  }
+
   // Replace the v2 mockup's hardcoded shot rows in the left tree with
   // dynamic rows driven by our seed data — so tree names always match the
   // names on the Storyboard cards. Each row navigates on click.
@@ -10187,8 +11101,19 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // ─── Bootstrap ──────────────────────────────────────────────────────
   async function init() {
     console.log("[ElevenX] init");
-    // Seed Episode 1 if empty
-    if (SEED_DATA) {
+    // Multi-project bootstrap (schema v2): make sure "the_standup" exists as
+    // a project row and is the active project for first-time visitors.
+    // For returning visitors the v1→v2 upgrade in storage.js already did
+    // both of these; this call is a no-op idempotent safety net.
+    await Storage.Projects.ensureSeeded();
+    await Storage.Projects.ensureActive();
+
+    // Seed Episode 1 if THIS project is empty. (Storage.seed is per-active-project.)
+    // We only auto-seed when the active project IS "the_standup" — otherwise
+    // a brand new project would get force-populated with Standup cast which
+    // is not what the user wants.
+    const activeProjectId = await Storage.Projects.getActiveId();
+    if (SEED_DATA && activeProjectId === "the_standup") {
       await Storage.seed("characters",   SEED_DATA.characters);
       await Storage.seed("environments", SEED_DATA.environments);
       await Storage.seed("shots",        SEED_DATA.shots);
@@ -10265,6 +11190,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     adaptScreenThree();
     adaptScreenFour();
     adaptScreenFive();
+    // Project picker: replace static "ElevenX / DIRECTOR" brand with the active
+    // project name and wire the + icon to the create-project flow.
+    await adaptProjectPicker();
     // Hydrate the left tree's shot list from seed data (matches grid names)
     await adaptLeftTreeShots();
 
