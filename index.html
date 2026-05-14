@@ -9310,6 +9310,143 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     });
   }
 
+  // ─── Bulk reference generation across the whole project (v3+) ──────
+  // After a bible import, every character / environment / style asset row
+  // exists but has no images. Rather than make the director click "Generate"
+  // 20+ times, fire one sweep that walks the project and generates every
+  // missing ref. User uploads are NEVER touched — the chained gen handlers
+  // already prefer .refs.user as the anchor and skip slots that have one.
+
+  // Count how many ref slots across the active project still need generation,
+  // and what that costs at the active image model's per-image rate.
+  async function estimateMissingRefs() {
+    const modelKey = ACTIVE_IMAGE_MODEL;
+    const perImg = IMAGE_MODELS[modelKey].cost_per_image_usd;
+    const characters   = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const styleAssets  = await Storage.getAll("assets");
+    let count = 0;
+    const breakdown = { characters: 0, environments: 0, assets: 0 };
+    for (const c of characters) {
+      for (const k of ["head_on", "three_quarter", "full_body"]) {
+        const has = c.refs?.user?.[k]?.dataUrl || c.refs?.[modelKey]?.[k]?.dataUrl;
+        if (!has) { count++; breakdown.characters++; }
+      }
+    }
+    for (const e of environments) {
+      for (const k of ["wide", "detail"]) {
+        const has = e.refs?.user?.[k]?.dataUrl || e.refs?.[modelKey]?.[k]?.dataUrl;
+        if (!has) { count++; breakdown.environments++; }
+      }
+    }
+    for (const a of styleAssets) {
+      const has = a.refs?.user?.primary?.dataUrl || a.refs?.[modelKey]?.primary?.dataUrl;
+      if (!has) { count++; breakdown.assets++; }
+    }
+    return { count, totalCost: count * perImg, breakdown, perImg, modelLabel: IMAGE_MODELS[modelKey].label };
+  }
+
+  // Walk cast → environments → style assets and call the existing per-type
+  // gen handlers. Sequential so we don't hammer the worker rate limits and
+  // so the user sees clear progress in the GPS bar.
+  async function bulkGenerateAllRefs() {
+    if (!State.fal && !State.openai) {
+      toast("Set your Worker URL first.", { tone: "warn" });
+      showConnectionPanel();
+      return { ok: 0, failed: 0, skipped: 0 };
+    }
+    const modelKey = ACTIVE_IMAGE_MODEL;
+    const characters   = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const styleAssets  = await Storage.getAll("assets");
+
+    // Filter to "needs work" — items where at least one slot is still empty.
+    const charsToDo = characters.filter(c => {
+      const have = ["head_on","three_quarter","full_body"].every(k =>
+        c.refs?.user?.[k]?.dataUrl || c.refs?.[modelKey]?.[k]?.dataUrl
+      );
+      return !have;
+    });
+    const envsToDo = environments.filter(e => {
+      const have = ["wide","detail"].every(k =>
+        e.refs?.user?.[k]?.dataUrl || e.refs?.[modelKey]?.[k]?.dataUrl
+      );
+      return !have;
+    });
+    const assetsToDo = styleAssets.filter(a =>
+      !(a.refs?.user?.primary?.dataUrl || a.refs?.[modelKey]?.primary?.dataUrl)
+    );
+
+    const totalItems = charsToDo.length + envsToDo.length + assetsToDo.length;
+    if (totalItems === 0) {
+      toast("Nothing to generate — every ref is either uploaded or already generated.", { tone: "ok" });
+      return { ok: 0, failed: 0, skipped: 0 };
+    }
+
+    let okCount = 0, failedCount = 0;
+    State.batchActive = true;
+    let done = 0;
+
+    const updateGps = (label) => {
+      const pct = totalItems > 0 ? Math.round((done / totalItems) * 100) : 0;
+      setGPS(true, `Auto-generating references`, label, pct);
+    };
+
+    // CHARACTERS — each call chains head_on → 3/4 → full_body internally
+    for (const c of charsToDo) {
+      done++;
+      updateGps(`<span class="mono">${esc(c.display_name)}</span> · cast portraits (${done}/${totalItems})`);
+      try {
+        await handleGenerateCastRefs(c.id, modelKey);
+        okCount++;
+      } catch (err) {
+        console.error(`[bulk-gen] cast ${c.id} failed:`, err);
+        failedCount++;
+      }
+    }
+
+    // ENVIRONMENTS — each call chains wide → detail internally
+    for (const e of envsToDo) {
+      done++;
+      updateGps(`<span class="mono">${esc(e.display_name)}</span> · environment plates (${done}/${totalItems})`);
+      try {
+        await handleGenerateEnvRefs(e.id, modelKey);
+        okCount++;
+      } catch (err) {
+        console.error(`[bulk-gen] env ${e.id} failed:`, err);
+        failedCount++;
+      }
+    }
+
+    // STYLE ASSETS — single image each
+    for (const a of assetsToDo) {
+      done++;
+      updateGps(`<span class="mono">${esc(a.display_name)}</span> · style asset (${done}/${totalItems})`);
+      try {
+        await handleGenerateAsset(a.id);
+        okCount++;
+      } catch (err) {
+        console.error(`[bulk-gen] asset ${a.id} failed:`, err);
+        failedCount++;
+      }
+    }
+
+    State.batchActive = false;
+    setGPS(false);
+
+    if (failedCount === 0) {
+      toast(`✓ Generated all ${okCount} references. Ready to roll Seedance.`, { tone: "ok", duration: 7000 });
+    } else {
+      toast(`Generated ${okCount}/${totalItems}. ${failedCount} failed — check console.`, { tone: "warn", duration: 9000 });
+    }
+
+    return { ok: okCount, failed: failedCount, skipped: totalItems - okCount - failedCount };
+  }
+
+  // Expose for verify + future scripted triggers
+  NS.bulkGenerateAllRefs   = bulkGenerateAllRefs;
+  NS.estimateMissingRefs   = estimateMissingRefs;
+
   // ─── Bible JSON import (v3+) ────────────────────────────────────────
   // Manual bible authoring (cast bibles, environment bibles, shot-by-shot
   // specs) is too much work for a teaser-sized project, let alone a feature.
@@ -9497,6 +9634,17 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (idCollisions.size > 0) {
       warnings.push(`Renamed ${idCollisions.size} id(s) due to collision: ${Array.from(idCollisions).slice(0,3).join(", ")}${idCollisions.size > 3 ? "…" : ""}`);
     }
+
+    // Flag the project for auto-generate on next boot. The flag is read in
+    // init() AFTER the reload; if the flag matches the active project and
+    // is < 60s old, a "Generate all references?" modal pops automatically.
+    // Stored in settings (IDB) so it survives the page reload triggered by
+    // the import button.
+    await Storage.setSetting("auto_gen_pending", {
+      project_id: createdProject.id,
+      requested_at: Date.now(),
+    });
+
     return {
       projectId: createdProject.id,
       projectName: createdProject.display_name,
@@ -9555,6 +9703,117 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
   ]
 }`;
+
+  // After import, init() consumes the auto_gen_pending flag and pops a
+  // confirm modal showing the missing-ref count + estimated cost. The user
+  // picks Generate now (fires bulkGenerateAllRefs sequentially) or Skip
+  // (clears the flag and they generate manually later via the cards' ↑/Generate
+  // buttons). If the worker URL isn't set yet, the modal explains that and
+  // offers a "Connect first" button → reopens the connection panel.
+  async function showAutoGenPostImportModal() {
+    if ($("#elx-autogen-modal")) return;
+    const estimate = await estimateMissingRefs();
+    if (estimate.count === 0) {
+      // Nothing to do — every slot is already filled (e.g., user uploaded refs)
+      return;
+    }
+    const project = await Storage.Projects.getActive();
+    const projectName = project?.display_name || "your project";
+    const workerConnected = !!State.fal || !!State.openai;
+
+    const panel = document.createElement("div");
+    panel.id = "elx-autogen-modal";
+    panel.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.78); z-index: 9200;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px);
+    `;
+    const breakdownLines = [];
+    if (estimate.breakdown.characters > 0) breakdownLines.push(`<li>${estimate.breakdown.characters} cast portrait${estimate.breakdown.characters === 1 ? "" : "s"}</li>`);
+    if (estimate.breakdown.environments > 0) breakdownLines.push(`<li>${estimate.breakdown.environments} environment plate${estimate.breakdown.environments === 1 ? "" : "s"}</li>`);
+    if (estimate.breakdown.assets > 0) breakdownLines.push(`<li>${estimate.breakdown.assets} style asset${estimate.breakdown.assets === 1 ? "" : "s"}</li>`);
+
+    panel.innerHTML = `
+      <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
+                  padding:28px 32px; max-width:560px; width:92%;
+                  font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
+        <h2 style="margin:0 0 6px; font-size:18px; font-weight:600;">Generate references for ${esc(projectName)}?</h2>
+        <p style="margin:0 0 16px; font-size:13px; color:#9a9aab; line-height:1.55;">
+          Your bible has been imported. ElevenX can auto-generate every reference image
+          described in the bible — uploaded refs you've added are never touched and become
+          the identity anchor for derived angles.
+        </p>
+        <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; padding:14px 18px; margin-bottom:18px;">
+          <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
+            <span style="font-size:12px; color:#9a9aab; letter-spacing:0.04em; text-transform:uppercase;">References to generate</span>
+            <span style="font-size:18px; color:#e8e8ee; font-weight:600;">${estimate.count}</span>
+          </div>
+          <ul style="margin:0 0 10px 18px; padding:0; font-size:12.5px; color:#c0c0ce; line-height:1.7;">
+            ${breakdownLines.join("")}
+          </ul>
+          <div style="display:flex; justify-content:space-between; align-items:baseline; padding-top:10px; border-top:1px solid #2a2a35;">
+            <span style="font-size:12px; color:#9a9aab; letter-spacing:0.04em; text-transform:uppercase;">Estimated cost</span>
+            <span style="font-size:16px; color:#c9a25a; font-weight:600;">$${estimate.totalCost.toFixed(2)}</span>
+          </div>
+          <div style="font-size:10.5px; color:#6a6a78; margin-top:4px; line-height:1.4;">
+            ${esc(estimate.modelLabel)} · $${estimate.perImg.toFixed(3)} per image
+          </div>
+        </div>
+        ${workerConnected ? "" : `
+          <div style="background:rgba(251,191,36,0.08); border:1px solid rgba(251,191,36,0.35); border-radius:6px; padding:10px 14px; margin-bottom:14px; font-size:12px; color:#fbbf24; line-height:1.5;">
+            ⚠ Your worker URL isn't set. Connect first to generate references.
+          </div>
+        `}
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          <button id="elx-autogen-skip"
+                  style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
+                         padding:10px 18px; border-radius:6px; font-size:12.5px; cursor:pointer;">Skip — I'll generate manually</button>
+          ${workerConnected ? `
+            <button id="elx-autogen-go"
+                    style="background:#c9a25a; color:#14141a; border:none;
+                           padding:10px 22px; border-radius:6px; font-size:12.5px;
+                           font-weight:600; cursor:pointer;">Generate all (~${estimate.count} images)</button>
+          ` : `
+            <button id="elx-autogen-connect"
+                    style="background:#c9a25a; color:#14141a; border:none;
+                           padding:10px 22px; border-radius:6px; font-size:12.5px;
+                           font-weight:600; cursor:pointer;">Connect worker first</button>
+          `}
+        </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    const close = async () => {
+      // Always clear the flag on close — we don't want this modal coming back
+      // every page load. If the user picked Skip, that's their decision.
+      await Storage.setSetting("auto_gen_pending", null);
+      panel.remove();
+    };
+
+    $("#elx-autogen-skip", panel).addEventListener("click", close);
+    if (workerConnected) {
+      $("#elx-autogen-go", panel).addEventListener("click", async () => {
+        await Storage.setSetting("auto_gen_pending", null);
+        panel.remove();
+        // Fire bulk-gen without blocking — the GPS bar takes over progress UX
+        bulkGenerateAllRefs().catch(err => {
+          console.error("[bulk-gen]", err);
+          toast(`Bulk generation errored: ${err.message}`, { tone: "err", duration: 8000 });
+        });
+      });
+    } else {
+      $("#elx-autogen-connect", panel).addEventListener("click", () => {
+        panel.remove();
+        showConnectionPanel();
+        // Leave the flag set — when the user closes the connection panel,
+        // we'll re-prompt them on the next reload.
+      });
+    }
+  }
+
+  NS.showAutoGenPostImportModal = showAutoGenPostImportModal;
 
   // The import modal — a wide textarea + paste-friendly affordances.
   // Opens as its own overlay (not inside the project picker) because the
@@ -12722,6 +12981,27 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // Show connection panel on first visit
     if (!State.workerUrl) {
       setTimeout(showConnectionPanel, 400);
+    }
+
+    // Post-import auto-gen flow: if the previous page session imported a
+    // bible AND set the auto_gen_pending flag within the last 60 seconds,
+    // pop the "Generate all references?" modal. The 60s freshness check
+    // makes sure stale flags from earlier sessions don't fire — only the
+    // intended one immediately after import.
+    try {
+      const flag = await Storage.getSetting("auto_gen_pending", null);
+      if (flag && flag.project_id === activeProjectId) {
+        const ageSec = (Date.now() - (flag.requested_at || 0)) / 1000;
+        if (ageSec < 60) {
+          // Slight delay so the page paints before the modal lands
+          setTimeout(showAutoGenPostImportModal, 350);
+        } else {
+          // Stale flag — clear it silently
+          await Storage.setSetting("auto_gen_pending", null);
+        }
+      }
+    } catch (err) {
+      console.warn("[auto-gen] flag check failed:", err);
     }
 
     // Hook into the proto-nav so we can re-render screens when they become
