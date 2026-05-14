@@ -8339,12 +8339,22 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       },
       /**
        * Patch an existing project row in place. Allowed keys are the author-surface
-       * fields + description + display_name. id / is_seeded / created_at are immutable.
+       * fields + the Tier 2 strategic-bible fields (theme/audience/tone/visual_rule
+       * /world_rules/reroll_rules) + description + display_name.
+       * id / is_seeded / created_at are immutable.
+       *
+       * Tier 2 fields are stored even though no UI surfaces them yet — the import
+       * path writes them, and the composer can read them when we extend it.
        */
       async update(id, patch) {
         const existing = await Storage.get("projects", id);
         if (!existing) throw new Error(`No such project "${id}"`);
-        const ALLOWED = ["display_name", "description", "medium", "logline", "style_canon", "default_shot_duration_seconds"];
+        const ALLOWED = [
+          "display_name", "description", "medium", "logline",
+          "style_canon", "default_shot_duration_seconds",
+          // Tier 2 strategic bible
+          "theme", "audience", "tone", "visual_rule", "world_rules", "reroll_rules",
+        ];
         const merged = { ...existing };
         for (const k of ALLOWED) {
           if (k in patch) merged[k] = patch[k];
@@ -9297,6 +9307,336 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         toast(`Saved upload for ${a.display_name}`, { tone: "ok" });
         await renderAssetsTab();
       },
+    });
+  }
+
+  // ─── Bible JSON import (v3+) ────────────────────────────────────────
+  // Manual bible authoring (cast bibles, environment bibles, shot-by-shot
+  // specs) is too much work for a teaser-sized project, let alone a feature.
+  // The import path lets a director paste a single structured JSON produced
+  // by their writing-room AI (or a strategic outline tool) and have ElevenX
+  // populate the project + cast + environments + style assets + shots in one
+  // go, then switch to it.
+  //
+  // The expected JSON shape matches the schema documented in
+  // `elevenx/DIRECTOR_PROMPT.md` (and `bible-template.example.json`).
+  //
+  // Returns: { projectId, projectName, charCount, envCount, assetCount, shotCount, warnings }
+
+  async function importBibleJson(jsonText) {
+    let bible;
+    try {
+      bible = (typeof jsonText === "string") ? JSON.parse(jsonText) : jsonText;
+    } catch (err) {
+      throw new Error(`Not valid JSON: ${err.message}`);
+    }
+    if (!bible || typeof bible !== "object") throw new Error("Bible JSON must be an object");
+    if (!bible.project || !bible.project.display_name) {
+      throw new Error("Bible JSON requires project.display_name");
+    }
+
+    const warnings = [];
+
+    // 1. Create the project. If the slugified id collides, retry with _2, _3…
+    const baseId = bible.project.id || slugifyId("proj", bible.project.display_name);
+    let attemptId = baseId;
+    let attempt = 1;
+    let createdProject = null;
+    while (attempt <= 99) {
+      try {
+        createdProject = await Storage.Projects.create({
+          id: attemptId,
+          display_name: attempt === 1 ? bible.project.display_name : `${bible.project.display_name} (${attempt})`,
+          description: bible.project.description || "",
+          medium: bible.project.medium,
+          logline: bible.project.logline,
+          style_canon: bible.project.style_canon,
+          default_shot_duration_seconds: bible.project.default_shot_duration_seconds,
+        });
+        break;
+      } catch (err) {
+        if (String(err.message || "").includes("already exists")) {
+          attempt += 1;
+          attemptId = `${baseId}_${attempt}`;
+        } else {
+          throw err;
+        }
+      }
+    }
+    if (!createdProject) throw new Error("Couldn't find a unique project id after 99 attempts");
+
+    // Patch in the Tier 2 strategic-bible fields (Projects.create doesn't accept them yet).
+    await Storage.Projects.update(createdProject.id, {
+      theme: bible.project.theme,
+      audience: bible.project.audience,
+      tone: bible.project.tone,
+      visual_rule: bible.project.visual_rule,
+      world_rules: bible.project.world_rules,
+      reroll_rules: bible.project.reroll_rules,
+    });
+
+    // 2. Switch to the new project so subsequent Storage.put() calls inject
+    //    the right project_id automatically.
+    await Storage.Projects.setActive(createdProject.id);
+
+    // 3. Characters
+    let charCount = 0;
+    const idCollisions = new Set();
+    for (const c of (bible.characters || [])) {
+      if (!c?.display_name) { warnings.push("skipped character: missing display_name"); continue; }
+      const desired = c.id || slugifyId("char", c.display_name);
+      const charId = await ensureUniqueId("characters", desired);
+      if (charId !== desired) idCollisions.add(`${desired} → ${charId}`);
+      await Storage.put("characters", {
+        id: charId,
+        display_name: c.display_name,
+        identity: c.identity || {},
+        physical: { distinctive_features: [], ...(c.physical || {}) },
+        wardrobe: { color_palette: [], episode_default: {}, ...(c.wardrobe || {}) },
+        voice: c.voice || { elevenlabs_fallback: { voice_id: "TBD", stability: 0.5, similarity: 0.75, style: 0.4 } },
+        performance: c.performance || {},
+        arc: c.arc || {}, // Tier 2 strategic field — stored, not yet rendered
+        references: c.references_paths || {},
+        never: c.never || [],
+        high_risk: !!c.high_risk,
+        stability_note: c.stability_note || "",
+        refs: { user: {}, seedream: {}, gpt: {} },
+        chosenModel: null,
+        created_at: new Date().toISOString().slice(0, 10),
+      });
+      charCount++;
+    }
+
+    // 4. Environments
+    let envCount = 0;
+    for (const e of (bible.environments || [])) {
+      if (!e?.display_name) { warnings.push("skipped environment: missing display_name"); continue; }
+      const desired = e.id || slugifyId("env", e.display_name);
+      const envId = await ensureUniqueId("environments", desired);
+      if (envId !== desired) idCollisions.add(`${desired} → ${envId}`);
+      await Storage.put("environments", {
+        id: envId,
+        display_name: e.display_name,
+        architecture: e.architecture || {},
+        lighting: e.lighting || {},
+        palette: e.palette || [],
+        props: e.props || [],
+        ambient_sound: e.ambient_sound || "",
+        continuity_locks: e.continuity_locks || [],
+        refs: { user: {}, seedream: {}, gpt: {} },
+        chosenModel: null,
+        created_at: new Date().toISOString().slice(0, 10),
+      });
+      envCount++;
+    }
+
+    // 5. Style assets
+    let assetCount = 0;
+    for (const a of (bible.style_assets || [])) {
+      if (!a?.display_name) { warnings.push("skipped style asset: missing display_name"); continue; }
+      const desired = a.id || slugifyId("asset", a.display_name);
+      const assetId = await ensureUniqueId("assets", desired);
+      if (assetId !== desired) idCollisions.add(`${desired} → ${assetId}`);
+      await Storage.put("assets", {
+        id: assetId,
+        display_name: a.display_name,
+        kind: a.kind || "style_frame",
+        description: a.description || "",
+        palette: a.palette || [],
+        refs: { user: {}, seedream: {}, gpt: {} },
+        chosenModel: null,
+        created_at: new Date().toISOString().slice(0, 10),
+      });
+      assetCount++;
+    }
+
+    // 6. Shots — compute contiguous timecodes from each shot's duration
+    let shotCount = 0;
+    const projectDefaultDur = bible.project.default_shot_duration_seconds || 8;
+    let cumulativeStart = 0;
+    const fmt = (t) => `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`;
+    for (const s of (bible.shots || [])) {
+      if (!s?.display_name && s?.shot_number == null) {
+        warnings.push("skipped shot: needs at least display_name or shot_number");
+        continue;
+      }
+      const duration = Math.max(4, Math.min(15, Number(s.duration_seconds) || projectDefaultDur));
+      const shotNumber = s.shot_number || (shotCount + 1);
+      const desired = s.id || slugifyId(`s${String(shotNumber).padStart(2,"0")}`, s.display_name || `shot_${shotNumber}`);
+      const shotId = await ensureUniqueId("shots", desired);
+      if (shotId !== desired) idCollisions.add(`${desired} → ${shotId}`);
+      await Storage.put("shots", {
+        id: shotId,
+        shot_number: shotNumber,
+        display_name: s.display_name || `Shot ${shotNumber}`,
+        status: "draft",
+        timecode: {
+          in: fmt(cumulativeStart),
+          out: fmt(cumulativeStart + duration),
+          duration_seconds: duration,
+        },
+        the_moment: s.the_moment || {},
+        camera: { aspect_ratio: "16:9", framing: "medium", movement: "locked", depth: "shallow", ...(s.camera || {}) },
+        audio: s.audio || { generate_native: true },
+        location: { location_id: s.location_id || s.location?.location_id || null },
+        cast_in_frame: s.cast_in_frame || [],
+        cast_lockdown_required: (s.cast_in_frame || []).length >= 3,
+        generation: s.generation || { mode: "auto" },
+        prompt_engineering: s.prompt_engineering || {},
+        voiceover: s.voiceover || [],
+        references: s.references || [],
+        director_note: s.director_note || "",
+        watch_points: s.watch_points || [],
+        takes: [],
+        keyframes: {},
+        created_at: new Date().toISOString().slice(0, 10),
+      });
+      cumulativeStart += duration;
+      shotCount++;
+    }
+    if (idCollisions.size > 0) {
+      warnings.push(`Renamed ${idCollisions.size} id(s) due to collision: ${Array.from(idCollisions).slice(0,3).join(", ")}${idCollisions.size > 3 ? "…" : ""}`);
+    }
+    return {
+      projectId: createdProject.id,
+      projectName: createdProject.display_name,
+      charCount,
+      envCount,
+      assetCount,
+      shotCount,
+      warnings,
+    };
+  }
+
+  // Minimal example JSON shown in the import modal as a starting point.
+  // The full schema lives in elevenx/DIRECTOR_PROMPT.md — this stub is
+  // just enough to demonstrate the shape and let directors fill in.
+  const BIBLE_JSON_EXAMPLE = `{
+  "project": {
+    "display_name": "Lionn: Night Prowler",
+    "medium": "animated_3d",
+    "logline": "A young prince afraid of his own shadow power must enter a ruined lion kingdom and face the guardians that once protected his throne.",
+    "theme": "Real courage is acting well while afraid.",
+    "audience": "10-14",
+    "tone": ["mythic", "fast", "emotional"],
+    "style_canon": "Premium stylized 3D animated dark-fantasy adventure for ages 10–14. Cinematic but emotionally readable. Moonlit indigo palette, antique gold royal-lion details, violet shadow magic, expressive youthful character animation. No gore. No franchise references.",
+    "visual_rule": "Gold = legacy. Violet = shadow. Lionn's journey is learning to make them work together.",
+    "default_shot_duration_seconds": 6
+  },
+  "characters": [
+    {
+      "display_name": "Lionn",
+      "identity": { "age": 12, "nationality": "fictional", "role_in_story": "the reluctant shadow prince", "archetype": "observant, brave but anxious" },
+      "physical": { "hair": "tousled dark brown", "eyes": "large expressive brown", "skin": "fair", "distinctive_features": ["clawed gauntlets", "torn cape", "royal lion crest at belt"] },
+      "wardrobe": { "color_palette": ["indigo", "violet", "antique gold"] },
+      "voice": { "seedance_native_direction": "young boy hero, brave but gentle" },
+      "arc": { "wound": "...", "false_belief": "...", "truth": "..." },
+      "never": ["never looking older than 14", "never hiding his face under a full mask"],
+      "high_risk": true,
+      "stability_note": "Face must remain visible and emotionally readable."
+    }
+  ],
+  "environments": [
+    { "display_name": "Ruined Lion Courtyard", "architecture": { "type": "royal palace ruin" }, "palette": ["indigo","antique gold","violet"], "ambient_sound": "low wind, distant stone creak" }
+  ],
+  "style_assets": [
+    { "display_name": "Violet Shadow Fog FX", "kind": "fx_sheet", "description": "Violet shadow fog rolling low over cracked stone, lion-shaped wisps in the smoke." }
+  ],
+  "shots": [
+    {
+      "shot_number": 1,
+      "display_name": "The fallen kingdom breathes",
+      "duration_seconds": 5,
+      "the_moment": { "verb": "establishes", "focal_point": "Moonlit ruins of the Lion Courtyard" },
+      "camera": { "framing": "extreme wide", "lens": "24mm", "movement": "slow push-in", "aspect_ratio": "16:9" },
+      "location_id": "ruined_lion_courtyard",
+      "voiceover": [{ "speaker_id": "lionn", "text": "They told me a prince should stand in the light." }],
+      "director_note": "Keep this beautiful, not chaotic."
+    }
+  ]
+}`;
+
+  // The import modal — a wide textarea + paste-friendly affordances.
+  // Opens as its own overlay (not inside the project picker) because the
+  // JSON paste needs room to breathe.
+  function showImportBibleModal() {
+    if ($("#elx-import-bible")) return;
+    const panel = document.createElement("div");
+    panel.id = "elx-import-bible";
+    panel.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9100;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px);
+    `;
+    panel.innerHTML = `
+      <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
+                  padding:24px 28px; max-width:820px; width:94%;
+                  font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6); max-height:92vh; overflow:auto;
+                  display:flex; flex-direction:column;">
+        <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:8px;">
+          <h2 style="margin:0; font-size:17px; font-weight:600;">Import bible JSON</h2>
+          <button id="elx-import-close" style="background:none; border:none; color:#9a9aab; font-size:18px; cursor:pointer; line-height:1; padding:4px 8px;">×</button>
+        </div>
+        <div style="font-size:12px; color:#9a9aab; margin-bottom:14px; line-height:1.55;">
+          Paste a complete bible JSON produced by your director / writing-room AI. ElevenX will create
+          a new project and populate cast, environments, style assets, and shots in one go, then switch
+          to it. The full schema lives in <code style="color:#c9a25a;">elevenx/DIRECTOR_PROMPT.md</code>.
+        </div>
+        <textarea id="elx-import-text" spellcheck="false"
+                  placeholder="Paste the JSON object here…"
+                  style="width:100%; flex:1; min-height:340px; padding:12px 14px;
+                         background:#0a0a0c; color:#e8e8ee;
+                         border:1px solid #2a2a35; border-radius:8px;
+                         font-family: 'JetBrains Mono', SFMono-Regular, Menlo, monospace;
+                         font-size:11.5px; line-height:1.5; resize:vertical;
+                         box-sizing:border-box;"></textarea>
+        <div style="display:flex; gap:8px; justify-content:space-between; align-items:center; margin-top:14px;">
+          <button type="button" id="elx-import-example"
+                  style="background:none; color:#9a9aab; border:1px solid #2a2a35;
+                         padding:8px 14px; border-radius:6px; font-size:11.5px; cursor:pointer;">Paste example</button>
+          <div style="display:flex; gap:8px;">
+            <button type="button" id="elx-import-cancel"
+                    style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
+                           padding:8px 16px; border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+            <button type="button" id="elx-import-go"
+                    style="background:#c9a25a; color:#14141a; border:none;
+                           padding:8px 18px; border-radius:6px; font-size:12px;
+                           font-weight:600; cursor:pointer;">Import + switch</button>
+          </div>
+        </div>
+        <div id="elx-import-status" style="margin-top:10px; font-size:11.5px; color:#9a9aab; min-height:16px;"></div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    const close = () => panel.remove();
+    panel.addEventListener("click", (e) => { if (e.target === panel) close(); });
+    $("#elx-import-close", panel).addEventListener("click", close);
+    $("#elx-import-cancel", panel).addEventListener("click", close);
+    $("#elx-import-example", panel).addEventListener("click", () => {
+      $("#elx-import-text", panel).value = BIBLE_JSON_EXAMPLE;
+    });
+    $("#elx-import-go", panel).addEventListener("click", async () => {
+      const text = $("#elx-import-text", panel).value.trim();
+      const status = $("#elx-import-status", panel);
+      if (!text) { status.textContent = "Paste some JSON first."; status.style.color = "#fbbf24"; return; }
+      status.textContent = "Importing…";
+      status.style.color = "#9a9aab";
+      try {
+        const result = await importBibleJson(text);
+        status.style.color = "#4ade80";
+        const summary = `Imported "${result.projectName}" — ${result.charCount} chars, ${result.envCount} envs, ${result.assetCount} style assets, ${result.shotCount} shots. Reloading…`;
+        status.textContent = summary;
+        if ((result.warnings || []).length > 0) {
+          console.warn("[import] warnings:", result.warnings);
+        }
+        // Full reload — fastest way to pick up the new active project with clean state
+        setTimeout(() => window.location.reload(), 800);
+      } catch (err) {
+        status.style.color = "#f87171";
+        status.textContent = `Import failed: ${err.message}`;
+        console.error("[import]", err);
+      }
     });
   }
 
@@ -11839,9 +12179,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         </div>
         <div id="elx-proj-list" style="display:flex; flex-direction:column; gap:8px; margin-bottom:18px;"></div>
         <div style="border-top:1px solid #2a2a35; padding-top:18px;">
-          <div id="elx-proj-create-toggle" style="display:flex; align-items:center; gap:10px; cursor:pointer; padding:8px 0;">
-            <span style="font-size:18px; color:#c9a25a; line-height:1;">+</span>
-            <span style="font-size:13px; color:#e8e8ee;">New project</span>
+          <div style="display:flex; gap:16px; align-items:center;">
+            <div id="elx-proj-create-toggle" style="display:flex; align-items:center; gap:10px; cursor:pointer; padding:8px 0; flex:1;">
+              <span style="font-size:18px; color:#c9a25a; line-height:1;">+</span>
+              <span style="font-size:13px; color:#e8e8ee;">New project</span>
+            </div>
+            <div id="elx-proj-import-toggle" style="display:flex; align-items:center; gap:10px; cursor:pointer; padding:8px 0;">
+              <span style="font-size:14px; color:#c9a25a; line-height:1;">↓</span>
+              <span style="font-size:13px; color:#e8e8ee;">Import bible JSON</span>
+            </div>
           </div>
           <div id="elx-proj-form" style="display:none; margin-top:10px; padding:16px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px;">
             <input type="hidden" id="elx-proj-edit-id" value="">
@@ -11929,6 +12275,16 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (opts.openCreate) openForm(null);
     // Expose for the edit buttons in renderProjectList
     panel._openEditForm = (row) => openForm(row);
+
+    // Wire the "Import bible JSON" toggle — closes the picker and opens the
+    // import modal (which handles the rest of the flow).
+    const importToggle = $("#elx-proj-import-toggle", panel);
+    if (importToggle) {
+      importToggle.addEventListener("click", () => {
+        panel.remove();
+        showImportBibleModal();
+      });
+    }
 
     $("#elx-proj-form-cancel", panel).addEventListener("click", () => {
       form.style.display = "none";
@@ -12380,6 +12736,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       });
     });
   }
+
+  // Expose import for verify-build + future scripted-import use cases.
+  NS.importBibleJson = importBibleJson;
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
