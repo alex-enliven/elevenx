@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="30e42d11a28a" data-build-time="2026-05-14T21:34:25.416Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"30e42d11a28a",time:"2026-05-14T21:34:25.416Z"};</script>
+<meta name="elevenx-build" content="5d492ae93de8" data-build-time="2026-05-14T21:52:27.208Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"5d492ae93de8",time:"2026-05-14T21:52:27.208Z"};</script>
 
 </head>
-<!-- elevenx-build: 30e42d11a28a @ 2026-05-14T21:34:25.416Z -->
+<!-- elevenx-build: 5d492ae93de8 @ 2026-05-14T21:52:27.208Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -7278,6 +7278,83 @@ function resolveVoiceoverSpeakerName(vo, cast) {
 }
 
 /**
+ * Sanitize a project's style_canon for use in a SPECIFIC character's prompt.
+ *
+ * Style canons are project-wide and often contain character-specific
+ * directives like "Lionn's face must remain visible and emotionally readable."
+ * When rendering ANOTHER character (Fynn, Mira) with that canon, the model
+ * gets told "Lionn's face must be visible" → it renders Lionn → Fynn shows up
+ * as Lionn. This was the root cause of the 2026-05-14 cast-identity collision.
+ *
+ * The sanitizer splits the canon into sentences and drops any that mention a
+ * cast member who isn't the current subject. Sentences referencing the
+ * current character (or no character) are kept.
+ *
+ * @param {string} styleCanon — raw project.style_canon prose
+ * @param {string} currentCharacterName — display_name of the character we're rendering
+ * @param {string[]} allCastNames — display_names of every character in the project
+ * @returns {string} — sanitized canon
+ */
+function sanitizeStyleCanonForCharacter(styleCanon, currentCharacterName, allCastNames) {
+  if (!styleCanon || typeof styleCanon !== "string") return "";
+  if (!allCastNames || allCastNames.length === 0) return styleCanon;
+  const current = String(currentCharacterName || "").trim().toLowerCase();
+  const others = allCastNames
+    .map(n => String(n || "").trim())
+    .filter(n => n && n.toLowerCase() !== current);
+  if (others.length === 0) return styleCanon;
+
+  // Split on sentence boundaries (., !, ?) and newlines. Keep the punctuation
+  // attached by using a positive lookbehind. Also handle em-dash/semicolon
+  // run-ons by splitting on those too.
+  const sentences = styleCanon
+    .split(/(?<=[.!?])\s+|(?<=[;—])\s+|\n+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const kept = sentences.filter(sentence => {
+    const lower = sentence.toLowerCase();
+    // Drop sentence if it mentions ANY other cast member by name.
+    // Match the name as a word (avoid e.g. "lion" inside "Lionel").
+    return !others.some(name => {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const wordRe = new RegExp(`\\b${escaped}\\b`, "i");
+      return wordRe.test(sentence);
+    });
+  });
+
+  return kept.join(" ").trim();
+}
+
+/**
+ * Does this character have ENOUGH visual identity data for the composer to
+ * produce a meaningful per-character prompt? "Meaningful" here means: the
+ * prompt won't reduce to "12-year-old <name>." with empty wardrobe/hair.
+ *
+ * Returns true if ANY of these are populated:
+ *   - physical.distinctive_features[]
+ *   - physical.hair.{color,length,style}
+ *   - physical.eyes / physical.skin / physical.description
+ *   - wardrobe.episode_default.{top,bottom,footwear,description}
+ *   - stability_note (identity lock from rich bible)
+ *
+ * The composer uses this as a hard gate: if false, throw immediately so we
+ * don't spend money producing a near-clone prompt.
+ */
+function characterHasVisualIdentity(character) {
+  if (!character) return false;
+  const phys = character.physical || {};
+  const wrd  = character.wardrobe?.episode_default || character.wardrobe || {};
+  const features = Array.isArray(phys.distinctive_features) ? phys.distinctive_features : [];
+  if (features.some(f => f && String(f).trim())) return true;
+  if (phys.hair?.color || phys.hair?.length || phys.hair?.style) return true;
+  if (phys.eyes || phys.skin || phys.description) return true;
+  if (wrd.top || wrd.bottom || wrd.footwear || wrd.description) return true;
+  if (character.stability_note && String(character.stability_note).trim()) return true;
+  return false;
+}
+
+/**
  * Per-medium rendering spec for the image reference builders (cast, env, asset).
  * The OPENING sentence drives Seedance/GPT-image style hardest — it must
  * match the project's medium or every generated portrait reads photoreal.
@@ -7340,7 +7417,22 @@ function mediumPromptSpec(medium) {
  *                              projects AND ethically problematic when the
  *                              character is a minor.
  */
-function composeCastReferencePrompt(character, angle = "head_on", project) {
+function composeCastReferencePrompt(character, angle = "head_on", project, opts = {}) {
+  // v3.9 DEFENSIVE GATE — refuse to compose when the character has no visual
+  // identity data. Without this check, the prompt reduces to "12-year-old
+  // <name>. hair. Wearing: ." which produces near-clones of whichever
+  // character has more data (typically the hero) or whatever the style anchor
+  // emphasizes. The user just lost $0.04 × 3 generating Fynn-as-Lionn.
+  if (!characterHasVisualIdentity(character)) {
+    const name = character?.display_name || character?.character_id || character?.id || "character";
+    throw new Error(
+      `composeCastReferencePrompt: "${name}" has no visual identity data ` +
+      `(empty physical.distinctive_features, physical.hair, wardrobe.episode_default, AND stability_note). ` +
+      `Generation would produce a near-clone of other cast. ` +
+      `Edit the character to add at least one of: distinctive features, hair, wardrobe, or stability_note.`
+    );
+  }
+
   const id   = character.identity || {};
   const phys = character.physical || {};
   const wrd  = character.wardrobe?.episode_default || {};
@@ -7348,7 +7440,12 @@ function composeCastReferencePrompt(character, angle = "head_on", project) {
   const distinctive = (phys.distinctive_features || []).join(", ");
 
   const medium = (project?.medium || "live_action").trim();
-  const styleCanon = (project?.style_canon || "").trim();
+  // v3.9 STYLE-CANON SANITIZER — strip sentences that name other cast members.
+  // Caller passes opts.allCastNames; absent, the canon is used as-is (back-compat).
+  const rawCanon = (project?.style_canon || "").trim();
+  const styleCanon = opts.allCastNames
+    ? sanitizeStyleCanonForCharacter(rawCanon, character.display_name, opts.allCastNames)
+    : rawCanon;
   const styleSpec = mediumPromptSpec(medium);
 
   const angleClause = {
@@ -7415,7 +7512,15 @@ function composeCastReferencePrompt(character, angle = "head_on", project) {
  *                              language so 3/4 + full_body inherit animation style
  *                              from the head_on anchor.
  */
-function composeCastReferenceEditPrompt(character, angle, project) {
+function composeCastReferenceEditPrompt(character, angle, project, opts = {}) {
+  // Same defensive gate as composeCastReferencePrompt — refuse without identity.
+  if (!characterHasVisualIdentity(character)) {
+    const name = character?.display_name || character?.character_id || character?.id || "character";
+    throw new Error(
+      `composeCastReferenceEditPrompt: "${name}" has no visual identity data. ` +
+      `Edit the character to add wardrobe / distinctive features / stability_note before chaining angles.`
+    );
+  }
   const id   = character.identity || {};
   const phys = character.physical || {};
   const wrd  = character.wardrobe?.episode_default || {};
@@ -7554,6 +7659,8 @@ window.ElevenX.composeSeedance = composeSeedance;
 window.ElevenX.resolveShotDuration = resolveShotDuration;
 window.ElevenX.clampDuration = clampDuration;
 window.ElevenX.resolveVoiceoverSpeakerName = resolveVoiceoverSpeakerName;
+window.ElevenX.sanitizeStyleCanonForCharacter = sanitizeStyleCanonForCharacter;
+window.ElevenX.characterHasVisualIdentity = characterHasVisualIdentity;
 window.ElevenX.composeCastReferencePrompt = composeCastReferencePrompt;
 window.ElevenX.composeCastReferenceEditPrompt = composeCastReferenceEditPrompt;
 window.ElevenX.composeEnvironmentReferenceEditPrompt = composeEnvironmentReferenceEditPrompt;
@@ -9181,6 +9288,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       <div class="cast-card__meta">${meta}</div>
       <div class="cast-card__bottom" style="display:flex; gap:6px;">
         <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}" style="flex:1;">${refCount === 3 ? `Re-roll` : `Generate ${3 - refCount} angle${3-refCount===1?"":"s"}`}</button>
+        <button class="btn btn--sm btn--ghost" data-action="edit-cast" data-char-id="${esc(c.id)}" title="Edit character bible (wardrobe, distinctive features, etc.)">✎</button>
         <button class="btn btn--sm btn--ghost" data-action="upload-cast" data-char-id="${esc(c.id)}" title="Upload pre-drafted images">↑</button>
       </div>
     `;
@@ -10272,6 +10380,105 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   //
   // Strict shape is passed through untouched.
 
+  // Common color names — used to extract palette hints from wardrobe / physical
+  // prose so the model sees explicit color tokens in [Cast Distinctiveness].
+  const COLOR_NAMES = [
+    "indigo", "violet", "purple", "lavender",
+    "gold", "antique gold", "yellow", "amber", "ochre",
+    "red", "crimson", "scarlet", "burgundy", "maroon", "rust",
+    "blue", "navy", "teal", "cyan", "cobalt",
+    "green", "olive", "emerald", "lime", "sage",
+    "orange", "tan", "beige", "cream", "ivory", "khaki",
+    "brown", "chocolate", "sepia", "umber",
+    "black", "charcoal", "graphite", "soot",
+    "white", "snow", "pearl",
+    "grey", "gray", "silver",
+    "pink", "rose", "magenta", "salmon",
+    "bronze", "copper",
+  ];
+  function extractColorsFromText(text) {
+    if (!text || typeof text !== "string") return [];
+    const lower = text.toLowerCase();
+    return COLOR_NAMES.filter(c => lower.includes(c));
+  }
+
+  // Pull physical fields out of either an object (preferred) or a prose string.
+  // The composer reads physical.distinctive_features (array) and
+  // physical.hair.{color,length,style}; everything else is documentation-only.
+  // When physical is a string, dump the whole thing into distinctive_features
+  // as a single entry so the [Characters] block has SOMETHING to render.
+  function extractPhysicalFields(c) {
+    const out = {
+      hair: {},
+      eyes: "",
+      skin: "",
+      distinctive_features: [],
+      description: "",
+    };
+    // physical may be an object, a string, or absent.
+    if (c.physical && typeof c.physical === "object") {
+      out.hair = c.physical.hair || {};
+      out.eyes = c.physical.eyes || "";
+      out.skin = c.physical.skin || "";
+      out.distinctive_features = Array.isArray(c.physical.distinctive_features)
+        ? c.physical.distinctive_features.slice()
+        : [];
+      out.description = c.physical.description || "";
+    } else if (typeof c.physical === "string" && c.physical.trim()) {
+      out.description = c.physical.trim();
+      out.distinctive_features.push(c.physical.trim());
+    }
+    // Some rich bibles put `hair` or `appearance` at the top level
+    if (typeof c.hair === "string" && c.hair.trim()) {
+      out.hair.style = c.hair.trim();
+      out.distinctive_features.push(`hair: ${c.hair.trim()}`);
+    }
+    if (typeof c.appearance === "string" && c.appearance.trim()) {
+      out.distinctive_features.push(c.appearance.trim());
+      if (!out.description) out.description = c.appearance.trim();
+    }
+    // Dedupe + drop empties
+    out.distinctive_features = Array.from(new Set(out.distinctive_features.filter(x => x && String(x).trim())));
+    return out;
+  }
+
+  // Pull wardrobe fields out of either an object or a prose string.
+  // The composer reads wardrobe.episode_default.{top,bottom,footwear} and
+  // wardrobe.color_palette. When wardrobe is a string, put the whole thing
+  // in episode_default.top so the [Wearing: …] clause gets text instead of
+  // an empty period.
+  function extractWardrobeFields(c) {
+    const out = {
+      episode_default: {},
+      color_palette: [],
+    };
+    if (c.wardrobe && typeof c.wardrobe === "object") {
+      out.episode_default = c.wardrobe.episode_default || c.wardrobe || {};
+      out.color_palette = Array.isArray(c.wardrobe.color_palette)
+        ? c.wardrobe.color_palette.slice()
+        : [];
+      // Some authors put color names directly in `wardrobe.colors` / `palette`
+      if (Array.isArray(c.wardrobe.colors)) out.color_palette.push(...c.wardrobe.colors);
+      if (Array.isArray(c.wardrobe.palette)) out.color_palette.push(...c.wardrobe.palette);
+    } else if (typeof c.wardrobe === "string" && c.wardrobe.trim()) {
+      // Whole string lands in `top` so the composer's "Wearing: ..." clause
+      // gets real text. Also extract color hints for [Cast Distinctiveness].
+      out.episode_default = { top: c.wardrobe.trim() };
+      out.color_palette = extractColorsFromText(c.wardrobe);
+    }
+    // Augment palette from physical prose too — directors often describe
+    // outfit colors in the appearance/physical block, not the wardrobe block.
+    if (typeof c.physical === "string") {
+      out.color_palette.push(...extractColorsFromText(c.physical));
+    }
+    if (typeof c.appearance === "string") {
+      out.color_palette.push(...extractColorsFromText(c.appearance));
+    }
+    // Dedupe
+    out.color_palette = Array.from(new Set(out.color_palette.filter(Boolean)));
+    return out;
+  }
+
   // "3D animation" / "live action" / "2D Animation" / "Documentary" → enum
   function normalizeMedium(s) {
     if (!s) return "live_action";
@@ -10542,8 +10749,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           archetype: c.archetype || c.personality || c.role || "",
           role_in_story: c.role || c.role_in_story || "",
         },
-        physical: { distinctive_features: [] },
-        wardrobe: { color_palette: [] },
+        // v3.9: rich bibles often write `physical` and `wardrobe` as PROSE
+        // STRINGS (e.g., "Soot-streaked leather apron"). Previous normalizer
+        // dropped these entirely → composer produced near-identical prompts
+        // for every character → with a style anchor + multi-character canon,
+        // every cast member rendered as the hero. Capture them now.
+        physical: extractPhysicalFields(c),
+        wardrobe: extractWardrobeFields(c),
         voice: {
           seedance_native_direction: c.voice_direction || va?.voice_style?.[id] || "",
           elevenlabs_fallback: { voice_id: "TBD", stability: 0.5, similarity: 0.75, style: 0.4 },
@@ -11829,6 +12041,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // portraits, which is ethically wrong for minors AND off-brief.
     const project = await Storage.Projects.getActive();
 
+    // v3.9: collect all cast display names so the composer can sanitize the
+    // style canon (strip sentences naming OTHER characters — the bug that
+    // made Fynn render as Lionn).
+    const allCast = await Storage.getAll("characters");
+    const allCastNames = allCast.map(x => x.display_name).filter(Boolean);
+    const composerOpts = { allCastNames };
+
     try {
       // ── STEP 1: head_on via text-to-image (no reference) ────────────────
       // User uploads win — if a director has dropped in their own head_on,
@@ -11843,7 +12062,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         const anchorTag = anchorUrl ? "style-anchor-locked" : "text-to-image";
         setGPS(true, `Generating <span class="mono">${esc(charId)} · head_on</span>`, `${modelMeta.label} · ${anchorTag}`, 15);
         try {
-          const promptSpec = composer.composeCastReferencePrompt(c, "head_on", project);
+          const promptSpec = composer.composeCastReferencePrompt(c, "head_on", project, composerOpts);
           // v3.8: route through anchor-aware helper. When project.style_anchor
           // exists, the head_on is generated via the edit endpoint using the
           // anchor as a STYLE reference — every character inherits the project's
@@ -11885,7 +12104,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         setGPS(true, `Generating <span class="mono">${esc(charId)} · ${angle}</span>`,
           `${modelMeta.label} · identity-locked from head_on`, 40);
         try {
-          const editSpec = composer.composeCastReferenceEditPrompt(c, angle, project);
+          const editSpec = composer.composeCastReferenceEditPrompt(c, angle, project, composerOpts);
           let dataUrl, seed, costUsd;
           if (modelKey === "seedream") {
             const result = await State.fal.seedreamEdit({
@@ -12691,6 +12910,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "generate-all-refs")  showAutoGenPostImportModal({ fromManualTrigger: true, surfaceWhenEmpty: true });
     else if (action === "distribute-sheet")   showDistributeMasterSheetModal();
     else if (action === "upload-cast")        showUploadCharacterModal(target.dataset.charId);
+    else if (action === "edit-cast")          showEditCharacterModal(target.dataset.charId);
     else if (action === "upload-env")         showUploadEnvironmentModal(target.dataset.locId);
     else if (action === "upload-asset")       showUploadAssetModal(target.dataset.assetId);
   });
@@ -13572,6 +13792,139 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         const cc = $("#elx-cast-count"); if (cc) cc.textContent = (await Storage.getAll("characters")).length;
       },
     });
+  }
+
+  // v3.9 Edit Character — pre-populated form for fixing existing character data.
+  // Critical recovery path for bibles where the rich-shape normalizer dropped
+  // wardrobe / physical fields (the "Fynn rendered as Lionn" bug). The user
+  // can paste in the missing wardrobe / distinctive features here, save, then
+  // click Re-roll to regenerate with proper identity data.
+  async function showEditCharacterModal(charId) {
+    const c = await Storage.get("characters", charId);
+    if (!c) { toast(`Character ${charId} not found`, { tone: "err" }); return; }
+    const phys = c.physical || {};
+    const wrd  = c.wardrobe?.episode_default || c.wardrobe || {};
+    const voiceFb = c.voice?.elevenlabs_fallback || {};
+    const distinctiveLines = (phys.distinctive_features || []).join("\n");
+    const wardrobeDescription = wrd.top || wrd.description || "";
+    const wardrobeBottom = wrd.bottom || "";
+    const wardrobeFootwear = wrd.footwear || "";
+    const hair = phys.hair || {};
+    const hairText = [hair.color, hair.length, hair.style].filter(Boolean).join(", ");
+
+    const formHtml = `
+      <div style="background:rgba(201,162,90,0.08); border:1px solid rgba(201,162,90,0.30); border-radius:6px; padding:10px 14px; margin-bottom:14px; font-size:11.5px; color:#c8c8d4; line-height:1.55;">
+        Fill in the visual identity fields. The composer refuses to generate without at least one of: distinctive features, hair, wardrobe, or stability_note. <strong style="color:#c9a25a;">After saving, click "Re-roll" on the cast card to regenerate.</strong>
+      </div>
+      ${fieldHtml("Display name", `<input name="display_name" type="text" required value="${esc(c.display_name || "")}" style="${FIELD_INPUT_STYLE}">`)}
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        ${fieldHtml("Age", `<input name="age" type="number" min="1" max="120" value="${esc(c.identity?.age || "")}" style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Nationality", `<input name="nationality" type="text" value="${esc(c.identity?.nationality || "")}" style="${FIELD_INPUT_STYLE}">`)}
+      </div>
+      ${fieldHtml("Role in story", `<input name="role" type="text" value="${esc(c.identity?.role_in_story || "")}" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml("Archetype (short)", `<input name="archetype" type="text" value="${esc(c.identity?.archetype || "")}" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml(
+        "Hair",
+        `<input name="hair" type="text" value="${esc(hairText)}" placeholder="dark brown, tousled, messy" style="${FIELD_INPUT_STYLE}">`,
+        "Color, length, style. Goes into the prompt's hair clause."
+      )}
+      ${fieldHtml(
+        "Distinctive features (one per line)",
+        `<textarea name="distinctive_features" rows="4" placeholder="One per line — e.g.\nSoot-streaked leather apron\nBurned fingertips\nSmall iron pendant" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(distinctiveLines)}</textarea>`,
+        "Critical: these prevent the model from defaulting to a generic 'boy' or the most prominent figure in any style anchor."
+      )}
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
+        ${fieldHtml("Wardrobe — top", `<input name="wardrobe_top" type="text" value="${esc(wardrobeDescription)}" placeholder="Tattered tunic, leather apron" style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Wardrobe — bottom", `<input name="wardrobe_bottom" type="text" value="${esc(wardrobeBottom)}" placeholder="Patched trousers" style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Wardrobe — footwear", `<input name="wardrobe_footwear" type="text" value="${esc(wardrobeFootwear)}" placeholder="Worn boots" style="${FIELD_INPUT_STYLE}">`)}
+      </div>
+      ${fieldHtml(
+        "Wardrobe color palette",
+        `<input name="palette" type="text" value="${esc((c.wardrobe?.color_palette || []).join(", "))}" placeholder="indigo, antique gold, charcoal" style="${FIELD_INPUT_STYLE}">`,
+        "Comma-separated. Shown on card; helps differentiate cast in [Cast Distinctiveness] block."
+      )}
+      ${fieldHtml(
+        "Stability note (identity lock)",
+        `<textarea name="stability_note" rows="3" placeholder="One-line identity anchor that must NEVER drift across generations. e.g., '12-year-old boy with messy sandy-blond hair, soot-streaked apron, nervous energy'" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(c.stability_note || "")}</textarea>`,
+        "Used in [Identity Locks] block when high_risk is true."
+      )}
+      ${fieldHtml(
+        "Never do / never look like",
+        `<textarea name="never" rows="3" placeholder="One per line — e.g.\nnever wearing royal armor\nnever looking older than 14" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc((c.never || []).join("\n"))}</textarea>`,
+        "Anti-patterns. Each line becomes a 'never X' negative cue."
+      )}
+      ${fieldHtml(
+        "Voice direction (Seedance native audio)",
+        `<input name="voice_direction" type="text" value="${esc(c.voice?.seedance_native_direction || "")}" style="${FIELD_INPUT_STYLE}">`
+      )}
+      ${fieldHtml(
+        "ElevenLabs voice ID",
+        `<input name="voice_id" type="text" value="${esc(voiceFb.voice_id || "")}" placeholder="paste from elevenlabs.io/voice-lab" style="${FIELD_INPUT_STYLE} font-family: 'JetBrains Mono', monospace;">`
+      )}
+      <label style="display:flex; align-items:center; gap:8px; margin-top:8px; font-size:12.5px; cursor:pointer;">
+        <input name="high_risk" type="checkbox" ${c.high_risk ? "checked" : ""} style="margin:0;">
+        <span>High risk — emphasize identity lock in every shot's prompt</span>
+      </label>
+    `;
+    openFormModal({
+      title: `Edit ${c.display_name}`,
+      formHtml,
+      onSubmit: async (form) => {
+        const fd = new FormData(form);
+        const updated = {
+          ...c,
+          display_name: String(fd.get("display_name") || c.display_name).trim(),
+          identity: {
+            ...(c.identity || {}),
+            age: Number(fd.get("age")) || null,
+            nationality: String(fd.get("nationality") || "").trim(),
+            role_in_story: String(fd.get("role") || "").trim(),
+            archetype: String(fd.get("archetype") || "").trim(),
+          },
+          physical: {
+            ...(c.physical || {}),
+            hair: parseHairString(String(fd.get("hair") || "")),
+            distinctive_features: splitList(fd.get("distinctive_features")),
+          },
+          wardrobe: {
+            ...(c.wardrobe || {}),
+            episode_default: {
+              ...(c.wardrobe?.episode_default || {}),
+              top: String(fd.get("wardrobe_top") || "").trim(),
+              bottom: String(fd.get("wardrobe_bottom") || "").trim(),
+              footwear: String(fd.get("wardrobe_footwear") || "").trim(),
+            },
+            color_palette: splitList(fd.get("palette")),
+          },
+          voice: {
+            ...(c.voice || {}),
+            seedance_native_direction: String(fd.get("voice_direction") || "").trim(),
+            elevenlabs_fallback: {
+              ...(c.voice?.elevenlabs_fallback || {}),
+              voice_id: String(fd.get("voice_id") || "").trim() || (c.voice?.elevenlabs_fallback?.voice_id || "TBD"),
+            },
+          },
+          stability_note: String(fd.get("stability_note") || "").trim(),
+          never: splitList(fd.get("never")),
+          high_risk: fd.get("high_risk") === "on",
+        };
+        await Storage.put("characters", updated);
+        toast(`Saved "${updated.display_name}". Click Re-roll on the cast card to regenerate.`, { tone: "ok", duration: 8000 });
+        await renderCastTab();
+        await adaptLeftTreeCast();
+      },
+    });
+  }
+
+  // "dark brown, tousled, messy" → { color: "dark brown", length: "tousled", style: "messy" }
+  // Single token → put it in style. Two tokens → color + style.
+  function parseHairString(s) {
+    if (!s || !s.trim()) return {};
+    const parts = s.split(",").map(x => x.trim()).filter(Boolean);
+    if (parts.length === 0) return {};
+    if (parts.length === 1) return { style: parts[0] };
+    if (parts.length === 2) return { color: parts[0], style: parts[1] };
+    return { color: parts[0], length: parts[1], style: parts.slice(2).join(", ") };
   }
 
   function showCreateEnvironmentModal() {
