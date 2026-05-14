@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="2e76072af025" data-build-time="2026-05-14T22:51:16.296Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"2e76072af025",time:"2026-05-14T22:51:16.296Z"};</script>
+<meta name="elevenx-build" content="af94eaae029d" data-build-time="2026-05-14T23:02:03.784Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"af94eaae029d",time:"2026-05-14T23:02:03.784Z"};</script>
 
 </head>
-<!-- elevenx-build: 2e76072af025 @ 2026-05-14T22:51:16.296Z -->
+<!-- elevenx-build: af94eaae029d @ 2026-05-14T23:02:03.784Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -7363,6 +7363,9 @@ function characterHasVisualIdentity(character) {
  * portrait when the project was animated_3d: the cast prompt builder was
  * hardcoded to "Photographic portrait" regardless of medium.
  */
+// Exported for v4.6 keyframe-gen sharpening: the same medium spec drives
+// the keyframe Seedream call, so animated projects don't accidentally
+// generate photoreal keyframes (an ethical + drift issue for minors).
 function mediumPromptSpec(medium) {
   if (medium === "animated_3d") {
     return {
@@ -7661,6 +7664,7 @@ window.ElevenX.clampDuration = clampDuration;
 window.ElevenX.resolveVoiceoverSpeakerName = resolveVoiceoverSpeakerName;
 window.ElevenX.sanitizeStyleCanonForCharacter = sanitizeStyleCanonForCharacter;
 window.ElevenX.characterHasVisualIdentity = characterHasVisualIdentity;
+window.ElevenX.mediumPromptSpec = mediumPromptSpec;
 window.ElevenX.composeCastReferencePrompt = composeCastReferencePrompt;
 window.ElevenX.composeCastReferenceEditPrompt = composeCastReferenceEditPrompt;
 window.ElevenX.composeEnvironmentReferenceEditPrompt = composeEnvironmentReferenceEditPrompt;
@@ -8285,6 +8289,10 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
     composeEnvironmentReferencePrompt:     NS.composeEnvironmentReferencePrompt,
     composeEnvironmentReferenceEditPrompt: NS.composeEnvironmentReferenceEditPrompt,
     clampDuration:                         NS.clampDuration,
+    // v4.6: expose mediumPromptSpec so the keyframe-gen path in main.js
+    // can compose medium-aware prompts (animated projects no longer get a
+    // photoreal "documentary-cinematic" keyframe).
+    mediumPromptSpec:                      NS.mediumPromptSpec,
   };
   NS.modeResolver = {
     resolveMode:    NS.resolveMode,
@@ -10422,6 +10430,271 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
   NS.buildAnchorRecipe = buildAnchorRecipe;
 
+  // ─── Producer prompt template (v4.6) ───────────────────────────────────
+  // Build a copy-paste system prompt for the user's Claude conversation that
+  // will produce ElevenX-conformant shot JSON. The key lever: list the
+  // CURRENT bible's character and environment IDs verbatim so Claude can
+  // never hallucinate IDs from a stale conversation (the failure mode that
+  // produced the Standup-cast leak into the Lionn project on 2026-05-15).
+  //
+  // Failure modes this prompt defends against, each baked in as an explicit
+  // rule:
+  //  • cross-bible character_id refs (audit 2026-05-15)
+  //  • style_canon containing one character's name leaking into others
+  //    (Fynn-as-Lionn forensic 2026-05-12)
+  //  • r2v shots with 4+ named cast → drift
+  //  • shots without focal_point → empty Seedance prompt
+  //  • i2v shots without continuity strategy → keyframe orphan
+  //  • duration outside 4–15s → clamped silently in old code
+  //  • role_in_shot omitted → composer can't pick a speaking anchor
+  function buildProducerPromptText({ project, characters, environments, assets }) {
+    const projName = project?.display_name || "(unnamed project)";
+    const medium  = project?.medium || "live_action";
+    const canon   = project?.style_canon || "";
+    const logline = project?.logline || "";
+    const theme   = project?.theme   || "";
+    const charList = (characters || []).length
+      ? characters.map(c => `  - id: "${c.id}"  display_name: "${c.display_name}"  role: ${c.identity?.role_in_story || "(unspecified)"}`).join("\n")
+      : "  (none yet — define characters in the JSON before referencing them in shots)";
+    const envList = (environments || []).length
+      ? environments.map(e => `  - id: "${e.id}"  display_name: "${e.display_name}"`).join("\n")
+      : "  (none yet — define environments in the JSON before referencing them in shots)";
+    const assetList = (assets || []).length
+      ? assets.map(a => `  - id: "${a.id}"  display_name: "${a.display_name}"  kind: ${a.kind || "style_frame"}`).join("\n")
+      : "  (no style assets yet)";
+    const defaultDur = project?.default_shot_duration_seconds || 6;
+
+    return `You are the ElevenX Producer. Your job: take a story / scene description and return a valid ElevenX shot-list JSON that imports cleanly on the first try, with no wasted Seedance credits.
+
+╔══════════════════════════════════════════════════════════════════════
+║ CURRENT BIBLE — these are the ONLY ids you may reference in shots
+╚══════════════════════════════════════════════════════════════════════
+
+PROJECT:
+  display_name: "${projName}"
+  medium: "${medium}"
+  default_shot_duration_seconds: ${defaultDur}
+  ${logline ? `logline: "${logline}"` : ""}
+  ${theme   ? `theme:   "${theme}"`   : ""}
+  ${canon   ? `style_canon (use as the visual rule for EVERY shot; do not paraphrase, do not add character names):\n    "${canon}"` : ""}
+
+CAST (use these character_ids exactly — do NOT invent new ones, do NOT use display_name in cast_in_frame):
+${charList}
+
+ENVIRONMENTS (use these location_ids exactly):
+${envList}
+
+STYLE ASSETS:
+${assetList}
+
+╔══════════════════════════════════════════════════════════════════════
+║ HARD RULES — violating any of these causes a wasted credit roll
+╚══════════════════════════════════════════════════════════════════════
+
+R1. character_id and location_id MUST come from the lists above. If the
+    story needs someone / somewhere not listed, FIRST add the character /
+    environment to the JSON's "characters" / "environments" arrays with a
+    full entry, then reference its id in shots. NEVER use a display_name
+    where a character_id is required.
+
+R2. EVERY shot needs the_moment.focal_point (one sentence — what the
+    camera sees) AND the_moment.emotional_beat (one sentence — what we
+    feel). Without focal_point the Seedance prompt becomes empty and the
+    take drifts. Treat focal_point as required, not optional.
+
+R3. EVERY shot needs camera.framing (wide / medium wide / medium /
+    medium close-up / close-up / extreme close-up / two-shot /
+    over-the-shoulder / low angle / high angle). The default "medium" is
+    a fallback, not an intent — always set this explicitly.
+
+R4. duration_seconds MUST be between 4 and 15 inclusive. If a beat needs
+    more, split into multiple shots.
+
+R5. generation.mode MUST be exactly one of: "text_to_video",
+    "image_to_video", "reference_to_video". Decision tree:
+      • text_to_video: no named cast in focus (establishing, transitions,
+        crowd shots, abstract beats).
+      • image_to_video: ONE character in focus AND continuity matters
+        (the start frame inherits from a previous shot or a pre-rolled
+        keyframe).
+      • reference_to_video: 2-3 named cast in frame. Max 3 — Seedance
+        drifts at 4+. If a beat needs 4+ named cast, prefer text_to_video
+        with a crowd description and accept identity-soft results.
+
+R6. cast_in_frame[*] needs role_in_shot ∈ {"speaking", "listening",
+    "observing", "transitional", "cut off"} AND an "action" string
+    (what the character is doing during the beat). For "speaking" roles
+    add a dialogue.en string and a delivery_note. Order entries by
+    importance: speaking → listening → observing.
+
+R7. continuity.start_frame_strategy ∈ {"fresh", "inherit_end_of_previous",
+    "manual_upload"}. If "inherit_end_of_previous", set
+    start_image_ref to "<prev_shot_id>:end". For image_to_video shots
+    that aren't inheriting, you must set start_frame_strategy to
+    "manual_upload" (the director will upload a keyframe) — otherwise
+    the shot fails the keyframe gate.
+
+R8. NEVER let one character's identity leak into another's. Each entry
+    in "characters" is independent. Do NOT write "Lionn's face must
+    remain visible" inside Veyr's stability_note — the renderer treats
+    that as Lionn-identity-locking-Veyr.
+
+R9. style_canon is a PROJECT-WIDE rule about look + palette + medium.
+    Keep it free of character names. If a beat requires per-character
+    identity language, put it on that character's entry (physical,
+    distinctive_features, never), NOT in style_canon.
+
+R10. NEVER add markdown fences, prose, "Here's your JSON:", or trailing
+     citations. Output exactly one JSON object. Anything before the
+     opening "{" or after the closing "}" will be stripped, but a
+     malformed body breaks the import.
+
+╔══════════════════════════════════════════════════════════════════════
+║ OUTPUT SHAPE — the JSON object you return
+╚══════════════════════════════════════════════════════════════════════
+
+Return ONE JSON object that matches this schema. Only include arrays you
+actually populate (omit empty arrays to keep the output tight). If the
+director only asks for shots and the bible already has cast +
+environments, return ONLY the "shots" array under the top-level object:
+
+{
+  "shots": [
+    {
+      "id": "ep01_s01_<slug>",
+      "shot_number": 1,
+      "display_name": "Short descriptive name",
+      "duration_seconds": ${defaultDur},
+      "generation": { "mode": "image_to_video" },
+      "the_moment": {
+        "focal_point": "What the camera sees, in one sentence.",
+        "emotional_beat": "What we feel, in one sentence.",
+        "verb": "approaches"
+      },
+      "camera": {
+        "framing": "medium close-up",
+        "lens": "35mm equivalent",
+        "movement": "slow push-in",
+        "depth": "shallow",
+        "aspect_ratio": "16:9"
+      },
+      "location": { "location_id": "<env_id>", "camera_position_note": "where the camera is" },
+      "cast_in_frame": [
+        {
+          "character_id": "<char_id>",
+          "role_in_shot": "speaking",
+          "action": "What this character is doing during the beat.",
+          "dialogue": { "en": "Their line, ending on em-dash if cut off." },
+          "delivery_note": "How the line is delivered."
+        }
+      ],
+      "cast_off_frame": [
+        { "character_id": "<char_id>", "reason": "Why they're in the room but not in frame." }
+      ],
+      "audio": {
+        "generate_native": true,
+        "ambient": "What the ambient bed sounds like.",
+        "score_cue": "none"
+      },
+      "continuity": {
+        "start_frame_strategy": "inherit_end_of_previous",
+        "end_frame_strategy": "match_next_start",
+        "start_image_ref": "<prev_shot_id>:end",
+        "end_image_ref": ""
+      },
+      "watch_points": [
+        { "failure": "What can go wrong", "surgical_fix": "How to fix on re-roll without re-rolling everything" }
+      ]
+    }
+  ]
+}
+
+When the director gives you a story, scene, or beat-list, return ONE
+JSON object only. No commentary. No fences. No trailing text.`;
+  }
+  NS.buildProducerPromptText = buildProducerPromptText;
+
+  // Modal: render the Producer prompt with the live bible baked in + a copy
+  // button. Toolbar entry point on the Storyboard screen.
+  async function showProducerPromptModal() {
+    if ($("#elx-producer-prompt")) return;
+    const project = await Storage.Projects.getActive();
+    if (!project) {
+      toast("Import a bible first — the Producer prompt is templated against the active project.", { tone: "warn" });
+      return;
+    }
+    const characters  = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const assets       = await Storage.getAll("assets");
+    const text = buildProducerPromptText({ project, characters, environments, assets });
+    const panel = document.createElement("div");
+    panel.id = "elx-producer-prompt";
+    panel.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9100;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px);
+    `;
+    panel.innerHTML = `
+      <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
+                  padding:24px 28px; max-width:920px; width:96%;
+                  font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6); max-height:92vh;
+                  overflow:hidden; display:flex; flex-direction:column;">
+        <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:8px;">
+          <h2 style="margin:0; font-size:17px; font-weight:600;">🎬 Producer prompt for ${esc(project.display_name)}</h2>
+          <button id="elx-pp-close" style="background:none; border:none; color:#9a9aab; font-size:18px; cursor:pointer; line-height:1; padding:4px 8px;">×</button>
+        </div>
+        <div style="font-size:12px; color:#9a9aab; margin-bottom:14px; line-height:1.55;">
+          Copy this prompt into your Claude / GPT / etc. conversation as the system message (or paste as the first user message). It bakes in the
+          ${characters.length} character ids, ${environments.length} environment ids, and the project's style_canon, so the model can't invent IDs from a stale
+          conversation. Give the model a story / scene / beat-list as the next message and it should return a JSON shot-list that imports cleanly.
+        </div>
+        <textarea id="elx-pp-text" readonly spellcheck="false"
+                  style="width:100%; flex:1; min-height:420px; padding:12px 14px;
+                         background:#0a0a0c; color:#e8e8ee;
+                         border:1px solid #2a2a35; border-radius:8px;
+                         font-family: 'JetBrains Mono', SFMono-Regular, Menlo, monospace;
+                         font-size:11.5px; line-height:1.5; resize:vertical;
+                         box-sizing:border-box;">${esc(text)}</textarea>
+        <div style="display:flex; gap:8px; justify-content:space-between; align-items:center; margin-top:14px;">
+          <div style="font-size:11px; color:#6a6a78;">${text.length.toLocaleString()} chars · regenerates if you re-import the bible</div>
+          <div style="display:flex; gap:8px;">
+            <button type="button" id="elx-pp-copy"
+                    style="background:#c9a25a; color:#14141a; border:none;
+                           padding:8px 18px; border-radius:6px; font-size:12px;
+                           font-weight:600; cursor:pointer;">📋 Copy prompt</button>
+            <button type="button" id="elx-pp-done"
+                    style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
+                           padding:8px 16px; border-radius:6px; font-size:12px; cursor:pointer;">Done</button>
+          </div>
+        </div>
+        <div id="elx-pp-status" style="margin-top:10px; font-size:11.5px; color:#9a9aab; min-height:16px;"></div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    const close = () => panel.remove();
+    panel.addEventListener("click", (e) => { if (e.target === panel) close(); });
+    $("#elx-pp-close", panel).addEventListener("click", close);
+    $("#elx-pp-done", panel).addEventListener("click", close);
+    $("#elx-pp-copy", panel).addEventListener("click", async () => {
+      const ta = $("#elx-pp-text", panel);
+      const status = $("#elx-pp-status", panel);
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(ta.value);
+        } else {
+          ta.select(); document.execCommand("copy");
+        }
+        status.textContent = "✓ Copied to clipboard. Paste it into Claude as the system message.";
+        status.style.color = "#4ade80";
+      } catch (err) {
+        status.textContent = `Copy failed: ${err.message}. Select all + ⌘C manually.`;
+        status.style.color = "#f87171";
+      }
+    });
+  }
+  NS.showProducerPromptModal = showProducerPromptModal;
+
   // The Anchor Planner modal — the post-import landing.
   async function showAnchorPlannerModal(opts = {}) {
     if ($("#elx-anchor-planner")) return;
@@ -11502,20 +11775,95 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
 
     // 6. Shots — compute contiguous timecodes from each shot's duration
+    //
+    // v4.6: BEFORE persisting shots, validate each one against the bible IDs
+    // we just stored. The historical failure mode (audited 2026-05-15) is
+    // Producer-generated shot JSON that references character_ids from a
+    // DIFFERENT project (e.g. "tom"/"aisha"/"maya" appearing inside a
+    // Lionn import). Without validation those bad refs land in IDB, the
+    // user clicks Roll, generateKeyframeForShot fails with "cast_in_frame
+    // IDs not in current Cast Bible", and credits get wasted on bisecting.
+    //
+    // The validator runs OPEN — it warns but doesn't refuse — so the user
+    // can still edit and recover. Each defective shot gets a `_validation`
+    // object that the Roll path + storyboard rail use to surface the
+    // problem before the Seedance call fires.
     let shotCount = 0;
     const projectDefaultDur = bible.project.default_shot_duration_seconds || 8;
     let cumulativeStart = 0;
     const fmt = (t) => `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`;
+    // Build authoritative ID sets from what was just persisted. We can't trust
+    // bible.characters[*].id because ensureUniqueId may have renamed on
+    // collision; query storage for the truth.
+    const persistedChars = await Storage.getAll("characters");
+    const persistedEnvs  = await Storage.getAll("environments");
+    const persistedAssets = await Storage.getAll("assets");
+    const validCharIds = new Set(persistedChars.map(c => c.id));
+    const validEnvIds  = new Set(persistedEnvs.map(e => e.id));
+    const validAssetIds = new Set(persistedAssets.map(a => a.id));
+    const validationReport = { byShot: [], totals: { unresolvedCast: 0, unresolvedEnv: 0, missingFocal: 0, missingFraming: 0, badDuration: 0, r2vOverflow: 0 } };
     for (const s of (bible.shots || [])) {
       if (!s?.display_name && s?.shot_number == null) {
         warnings.push("skipped shot: needs at least display_name or shot_number");
         continue;
       }
-      const duration = Math.max(4, Math.min(15, Number(s.duration_seconds) || projectDefaultDur));
+      // v4.6: clamp duration if out-of-range and flag it. The user's Producer
+      // prompt should already enforce 4-15s, but if a stale conversation
+      // returns 30s or 1s, surface it rather than silently clamping.
+      const rawDuration = Number(s.duration_seconds);
+      const duration = Math.max(4, Math.min(15, rawDuration || projectDefaultDur));
+      const durationClamped = rawDuration > 0 && (rawDuration < 4 || rawDuration > 15);
       const shotNumber = s.shot_number || (shotCount + 1);
       const desired = s.id || slugifyId(`s${String(shotNumber).padStart(2,"0")}`, s.display_name || `shot_${shotNumber}`);
       const shotId = await ensureUniqueId("shots", desired);
       if (shotId !== desired) idCollisions.add(`${desired} → ${shotId}`);
+
+      // ─── v4.6 per-shot validation ────────────────────────────────────────
+      // Compute defects before persisting so the shot record carries the
+      // diagnosis. Each defect is also pushed to validationReport so the
+      // post-import modal can summarise.
+      const issues = [];
+      // 1. Cast resolution — flag character_ids that don't exist in the bible.
+      const declaredCastIds = (s.cast_in_frame || []).map(c => c.character_id).filter(Boolean);
+      const unresolvedCastIds = declaredCastIds.filter(id => !validCharIds.has(id));
+      if (unresolvedCastIds.length > 0) {
+        issues.push({ kind: "cast_unresolved", detail: unresolvedCastIds });
+        validationReport.totals.unresolvedCast += unresolvedCastIds.length;
+      }
+      // 2. Location resolution — flag location_id that doesn't exist in the bible.
+      const declaredLocId = s.location_id || s.location?.location_id;
+      if (declaredLocId && !validEnvIds.has(declaredLocId)) {
+        issues.push({ kind: "env_unresolved", detail: declaredLocId });
+        validationReport.totals.unresolvedEnv += 1;
+      }
+      // 3. focal_point — the single most important field for prompt assembly.
+      //    Without it, the Seedance prompt becomes "<empty>" and the shot drifts.
+      const focal = s.the_moment?.focal_point;
+      if (!focal || String(focal).trim().length < 5) {
+        issues.push({ kind: "missing_focal", detail: null });
+        validationReport.totals.missingFocal += 1;
+      }
+      // 4. framing — if missing the composer defaults to "medium" which is fine
+      //    technically but loses the Producer's intent. Warn so the user can fix.
+      const framing = s.camera?.framing;
+      if (!framing) {
+        issues.push({ kind: "missing_framing", detail: null });
+        validationReport.totals.missingFraming += 1;
+      }
+      // 5. duration clamped — flag silently-corrected durations.
+      if (durationClamped) {
+        issues.push({ kind: "duration_clamped", detail: { from: rawDuration, to: duration } });
+        validationReport.totals.badDuration += 1;
+      }
+      // 6. r2v with too many cast — Seedance r2v drifts when 4+ named cast
+      //    are in frame. Suggest splitting into t2v or fewer-cast shots.
+      const mode = s.generation?.mode;
+      if (mode === "reference_to_video" && declaredCastIds.length > 3) {
+        issues.push({ kind: "r2v_overflow", detail: declaredCastIds.length });
+        validationReport.totals.r2vOverflow += 1;
+      }
+      validationReport.byShot.push({ shotId, displayName: s.display_name || `Shot ${shotNumber}`, issues });
+
       await Storage.put("shots", {
         id: shotId,
         shot_number: shotNumber,
@@ -11540,6 +11888,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         watch_points: s.watch_points || [],
         takes: [],
         keyframes: {},
+        // v4.6: persist validation on the shot so the storyboard rail / Roll
+        // path can surface it without re-running the validator. `issues` is
+        // [] when the shot is clean.
+        _validation: { issues, validated_at: Date.now() },
         created_at: new Date().toISOString().slice(0, 10),
       });
       cumulativeStart += duration;
@@ -11547,6 +11899,19 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
     if (idCollisions.size > 0) {
       warnings.push(`Renamed ${idCollisions.size} id(s) due to collision: ${Array.from(idCollisions).slice(0,3).join(", ")}${idCollisions.size > 3 ? "…" : ""}`);
+    }
+    // v4.6: summarise validation defects in import warnings so they surface
+    // in the post-import toast / modal.
+    const vt = validationReport.totals;
+    if (vt.unresolvedCast + vt.unresolvedEnv + vt.missingFocal + vt.missingFraming + vt.badDuration + vt.r2vOverflow > 0) {
+      const bits = [];
+      if (vt.unresolvedCast > 0) bits.push(`${vt.unresolvedCast} cast_in_frame id(s) not in bible`);
+      if (vt.unresolvedEnv > 0)  bits.push(`${vt.unresolvedEnv} location_id(s) not in bible`);
+      if (vt.missingFocal > 0)   bits.push(`${vt.missingFocal} shot(s) without focal_point`);
+      if (vt.missingFraming > 0) bits.push(`${vt.missingFraming} shot(s) without camera.framing`);
+      if (vt.badDuration > 0)    bits.push(`${vt.badDuration} duration(s) clamped to 4–15s`);
+      if (vt.r2vOverflow > 0)    bits.push(`${vt.r2vOverflow} r2v shot(s) with >3 cast (drift risk)`);
+      warnings.push(`Shot validation: ${bits.join(", ")}. See Storyboard for ⚠ badges.`);
     }
 
     // Flag the project for auto-generate on next boot. The flag is read in
@@ -12194,12 +12559,20 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         ? `background-image:url('${thumbUrl}'); background-size:cover; background-position:center;`
         : `background: linear-gradient(135deg, #1d1d26 0%, #0a0a0c 100%);`;
 
+      // v4.6: validation badge — surface ⚠ on cards whose shot has open
+      // issues from the import-time validator. Tooltip lists the defects.
+      const issues = (s._validation?.issues || []);
+      const issueBadge = issues.length > 0
+        ? `<span class="elx-shot__warn" title="${esc(issues.map(i => describeShotIssue(i)).join(" · "))}" style="position:absolute; top:8px; left:8px; background:#6a3a25; color:#e4a980; font-size:10px; padding:3px 7px; border-radius:3px; border:1px solid #8a4a30; font-weight:600;">⚠ needs fix</span>`
+        : "";
+
       const card = document.createElement("div");
-      card.className = `elx-shot elx-shot--${status}`;
+      card.className = `elx-shot elx-shot--${status}${issues.length > 0 ? " elx-shot--has-issues" : ""}`;
       card.dataset.shotId = s.id;
       card.innerHTML = `
         <div class="elx-shot__thumb-only" style="${thumbStyle}">
           <span class="mode-pill ${modeClass} elx-shot__mode-corner">${modeShort}</span>
+          ${issueBadge}
           <div class="elx-shot__overlay">
             <span class="elx-shot__num">${esc(shotNum)}</span>
             <span class="elx-shot__name">${esc(s.display_name || s.id)}</span>
@@ -12892,12 +13265,17 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // Generate a still keyframe for a shot via Seedream — uses cast bible refs
   // + scene-aware prompt so the keyframe matches the YAML spec. This is the
   // first step for image_to_video shots; Seedance then animates from it.
-  async function generateKeyframeForShot(shot, castInFrame, environment) {
+  //
+  // v4.6: rewritten to compose a medium-aware, identity-anchored prompt
+  // that pulls in the full bible context (environment continuity_locks,
+  // character.never, character.physical.distinctive_features, project
+  // style_canon + visual_rule, the shot's emotional_beat). The pre-v4.6
+  // prompt was a thin photoreal template — wrong for animated projects and
+  // missing every per-entity identity lock the bible already carries.
+  async function generateKeyframeForShot(shot, castInFrame, environment, project) {
     if (!State.fal) throw new Error("No fal client (set worker URL first)");
-    // For now use the speaking character's three-quarter portrait as the
-    // identity anchor + an edit prompt that describes the scene framing.
-    // This is the simplest cross-bible composition pattern that works
-    // reliably with Seedream v4.5/edit.
+    // Default project lookup so legacy callsites still work
+    if (project == null) project = await Storage.Projects.getActive();
     const speakingChar = castInFrame.find(c => {
       const inShot = (shot.cast_in_frame || []).find(x => x.character_id === c.id);
       return inShot?.role_in_shot === "speaking";
@@ -12923,15 +13301,69 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const moment = shot.the_moment || {};
     const camera = shot.camera || {};
     const envName = environment?.display_name || "the location";
+    const medium  = project?.medium || "live_action";
+    // mediumPromptSpec is exported by composer; use it for medium-correct
+    // quality cues + negatives instead of the hardcoded photoreal phrasing.
+    const styleSpec = composer.mediumPromptSpec
+      ? composer.mediumPromptSpec(medium)
+      : { opening: "Cinematic still, identity-locked.", qualityCues: "", negativeCues: "AI sheen, plastic skin, fisheye, lens flare" };
+
+    // Character identity anchors — distinctive features and never list keep
+    // the model from drifting away from the bible's character identity even
+    // under a scene-composition edit.
+    const distinctiveFeatures = Array.isArray(speakingChar.physical?.distinctive_features)
+      ? speakingChar.physical.distinctive_features.filter(s => s && String(s).trim()).slice(0, 4)
+      : [];
+    const neverList = Array.isArray(speakingChar.never)
+      ? speakingChar.never.filter(s => s && String(s).trim()).slice(0, 4)
+      : [];
+
+    // Environment locks — palette + props + continuity_locks ground the
+    // scene to the bible. Without these the model can render the right
+    // character but in the wrong room.
+    const palette = Array.isArray(environment?.palette)
+      ? environment.palette.filter(s => s && String(s).trim()).slice(0, 5).join(", ")
+      : "";
+    const propsList = Array.isArray(environment?.props)
+      ? environment.props.filter(s => s && String(s).trim()).slice(0, 5).join(", ")
+      : "";
+    const continuityLocks = Array.isArray(environment?.continuity_locks)
+      ? environment.continuity_locks.filter(s => s && String(s).trim()).slice(0, 4)
+      : [];
+
+    // Sanitise project.style_canon against the OTHER cast members so a
+    // line like "Lionn's face must remain visible" doesn't bleed into
+    // Veyr's keyframe. The composer ships this helper as
+    // sanitizeStyleCanonForCharacter; degrade gracefully if absent.
+    const allCastNames = castInFrame.map(c => c.display_name).filter(Boolean);
+    const rawCanon = project?.style_canon || "";
+    let canon = rawCanon;
+    try {
+      if (rawCanon && composer && typeof NS.sanitizeStyleCanonForCharacter === "function") {
+        canon = NS.sanitizeStyleCanonForCharacter(rawCanon, speakingChar.display_name, allCastNames);
+      }
+    } catch { /* keep raw canon on sanitize failure */ }
+
+    // Assemble the prompt. Order matters: identity anchors first
+    // (so the model commits to face/wardrobe before scene composition),
+    // then scene + camera, then style canon, then never/negative.
     const promptText = [
-      `Place this person in a scene: ${camera.framing || "medium shot"} of ${speakingChar.display_name} ${moment.focal_point ? "— " + moment.focal_point : ""}`,
-      `Location: ${envName}.`,
-      environment?.architecture?.type ? `${environment.architecture.type}.` : "",
-      environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}, ${environment.lighting.quality || ""}.` : "",
-      `Lens: ${camera.lens || "35mm equivalent"}. Depth: ${camera.depth || "shallow"}.`,
-      "Photographic still, documentary-cinematic, natural skin texture, subtle film grain.",
-      "The person's face must remain identical to the reference. Identity-locked.",
-      "Negative: AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare.",
+      `${styleSpec.opening}`,
+      `Place this person in a scene: ${camera.framing || "medium shot"} of ${speakingChar.display_name}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
+      moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
+      distinctiveFeatures.length ? `Identity anchors (must be visible): ${distinctiveFeatures.join("; ")}.` : "",
+      `The character's face, hair, and wardrobe must match the reference image exactly. Identity-locked.`,
+      `Location: ${envName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}`,
+      environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}${environment.lighting.quality ? ", " + environment.lighting.quality : ""}.` : "",
+      palette ? `Color palette: ${palette}.` : "",
+      propsList ? `Props visible: ${propsList}.` : "",
+      continuityLocks.length ? `Continuity locks: ${continuityLocks.join("; ")}.` : "",
+      `Camera: ${camera.lens || "35mm equivalent"}, depth ${camera.depth || "shallow"}.`,
+      styleSpec.qualityCues || "",
+      canon ? `Style canon: ${canon}` : "",
+      project?.visual_rule ? `Visual rule: ${project.visual_rule}.` : "",
+      neverList.length ? `Never: ${neverList.join("; ")}.` : "",
+      `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare"}.`,
     ].filter(s => s && s.length > 2).join(" ");
 
     const result = await State.fal.seedreamEdit({
@@ -12948,6 +13380,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     shot.keyframes.startDataUrl = dataUrl;
     shot.keyframes.start_generated_at = Date.now();
     shot.keyframes.start_referenced_char = speakingChar.id;
+    // v4.6: persist the assembled prompt + medium so the user can audit
+    // what landed and the next re-roll can iterate without regenerating
+    // the prompt from scratch.
+    shot.keyframes.prompt = promptText;
+    shot.keyframes.medium = medium;
     await Storage.put("shots", shot);
     await trackCost(0.05, `seedream keyframe ${shot.id}`);
     return dataUrl;
@@ -13165,7 +13602,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       if (!startImage) {
         setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, "seedream-v4.5 · cast-anchored", 30);
         try {
-          startImage = await generateKeyframeForShot(shot, castInFrame, environment);
+          startImage = await generateKeyframeForShot(shot, castInFrame, environment, project);
           toast(`Keyframe ready for ${shot.display_name || shotId}`);
           if (State.activeShotId === shotId) renderShotEditor(shotId);
           renderStoryboard();
@@ -13493,6 +13930,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "batch-gen" || action === "batch-reroll") handleBatch(action, target.dataset.batchTab || "cast", target.dataset.batchModel || ACTIVE_IMAGE_MODEL);
     else if (action === "roll-shot")          handleRollShot(target.dataset.shotId);
     else if (action === "roll-all-pending")   handleRollAllPending();
+    else if (action === "producer-prompt")    showProducerPromptModal();
     else if (action === "finish-play-all")    playSequenceFromIdx(0);
     else if (action === "finish-pause")       $("#elx-finish-video")?.pause();
     else if (action === "finish-score-pick") {
@@ -13584,6 +14022,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             <button class="seg__btn" data-filter="approved">Approved <span class="count"></span></button>
           </div>
           <div class="s3__spacer"></div>
+          <button class="btn btn--sm btn--ghost" data-action="producer-prompt"
+                  title="Copy a Claude system prompt that bakes in the current bible's character + location ids. Paste into your Claude conversation as the system message, then feed it a story / scene description — it returns shot JSON that imports cleanly into ElevenX without cross-bible drift or wasted Seedance credits.">🎬 Producer prompt</button>
           <button class="btn btn--sm" data-action="roll-all-pending">▶ Roll all pending</button>
         </div>
         <div class="shot-grid" id="elx-shot-grid"></div>
@@ -13620,6 +14060,30 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
   }
 
+  // v4.6: translate a validator issue object into a human sentence.
+  // Used by the storyboard card tooltip + the Spec rail banner so both
+  // surface the same description language.
+  function describeShotIssue(issue) {
+    if (!issue) return "";
+    switch (issue.kind) {
+      case "cast_unresolved":
+        return `cast_in_frame ids not in bible: ${(issue.detail || []).join(", ")}`;
+      case "env_unresolved":
+        return `location_id "${issue.detail}" not in bible`;
+      case "missing_focal":
+        return "missing the_moment.focal_point (Seedance prompt will be empty)";
+      case "missing_framing":
+        return "missing camera.framing (composer falls back to 'medium')";
+      case "duration_clamped":
+        return `duration ${issue.detail?.from}s clamped to ${issue.detail?.to}s (must be 4–15s)`;
+      case "r2v_overflow":
+        return `reference_to_video with ${issue.detail} cast in frame (max 3 — Seedance drifts above)`;
+      default:
+        return issue.kind;
+    }
+  }
+  NS.describeShotIssue = describeShotIssue;
+
   // v4.5: populate the storyboard-screen right-rail Spec panel
   // ([data-rail="s3"] [data-rtp="spec"]) from a live shot. The mockup
   // shipped this rail with hardcoded "S05 · The interruption" content that
@@ -13645,18 +14109,20 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const modeShort = { text_to_video:"t2v", image_to_video:"i2v", reference_to_video:"r2v", built_in_resolve:"built-in" }[modeKey] || modeKey;
     const inheritsFromShot = cont.start_image_ref ? String(cont.start_image_ref).split(":")[0] : null;
     const totalCost = (shot.takes || []).reduce((sum, t) => sum + (t.cost_usd || 0), 0);
-    // v4.5: cross-bible mismatch warning. If shot.cast_in_frame references
-    // character ids that don't resolve in the current Cast Bible, surface it
-    // here so the user can fix the shot before rolling.
-    const declaredIds = (shot.cast_in_frame || []).map(c => c.character_id).filter(Boolean);
-    const unresolvedIds = declaredIds.filter(id => !characters.find(x => x.id === id));
-    const mismatchBanner = unresolvedIds.length === declaredIds.length && declaredIds.length > 0
-      ? `<div style="margin-bottom:10px; padding:8px 10px; background:#2a1a14; border:1px solid #6a3a25; border-radius:4px; color:#e4a980; font-size:11px; line-height:1.4;">
-           ⚠ This shot references cast not in the loaded Cast Bible: <span class="mono">${esc(unresolvedIds.join(", "))}</span>. Edit cast_in_frame or re-import the matching bible before rolling.
+    // v4.6: render every validator issue, not just cross-bible. The audit's
+    // failure modes were a mix — cast-unresolved was the most visible but
+    // missing-focal / missing-framing also wreck the Seedance prompt.
+    const issues = shot._validation?.issues || [];
+    const issuesBanner = issues.length > 0
+      ? `<div style="margin-bottom:10px; padding:8px 10px; background:#2a1a14; border:1px solid #6a3a25; border-radius:4px; color:#e4a980; font-size:11px; line-height:1.45;">
+           <div style="font-weight:600; margin-bottom:4px;">⚠ ${issues.length} validation issue${issues.length > 1 ? "s" : ""} — fix before rolling to save credits:</div>
+           <ul style="margin:0; padding-left:18px;">
+             ${issues.map(i => `<li>${esc(describeShotIssue(i))}</li>`).join("")}
+           </ul>
          </div>`
       : "";
     panel.innerHTML = `
-      ${mismatchBanner}
+      ${issuesBanner}
       <div class="spec-row"><span class="k">Shot</span><span class="v mono">${esc(shotNum)} · ${esc(shot.display_name || shot.id)}</span></div>
       <div class="spec-row"><span class="k">Moment</span><span class="v">${esc(moment.focal_point || moment.emotional_beat || "—")}</span></div>
       <div class="spec-row"><span class="k">Mode</span><span class="v"><span class="pill pill--indigo">${esc(modeShort)}</span></span></div>
