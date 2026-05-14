@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="e49948f53973" data-build-time="2026-05-14T22:15:04.080Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"e49948f53973",time:"2026-05-14T22:15:04.080Z"};</script>
+<meta name="elevenx-build" content="1868bce8f139" data-build-time="2026-05-14T22:26:38.342Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"1868bce8f139",time:"2026-05-14T22:26:38.342Z"};</script>
 
 </head>
-<!-- elevenx-build: e49948f53973 @ 2026-05-14T22:15:04.080Z -->
+<!-- elevenx-build: 1868bce8f139 @ 2026-05-14T22:26:38.342Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -12084,6 +12084,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       <div class="cast-card__bottom" style="display:flex; gap:6px;">
         <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}" style="flex:1;">${refCount === 2 ? `Re-roll` : `Generate ${2 - refCount} ref${2-refCount===1?"":"s"}`}</button>
         ${(refCount > 0 && refCount < 2) ? `<button class="btn btn--sm btn--ghost" data-action="reroll-env" data-loc-id="${esc(e.id)}" title="Wipe ALL generated plates and re-roll from scratch (user uploads preserved)">↻</button>` : ""}
+        <button class="btn btn--sm btn--ghost" data-action="edit-env" data-loc-id="${esc(e.id)}" title="Edit environment bible (architecture, lighting, palette, props)">✎</button>
         <button class="btn btn--sm btn--ghost" data-action="upload-env" data-loc-id="${esc(e.id)}" title="Upload pre-drafted plates">↑</button>
       </div>
     `;
@@ -12257,12 +12258,17 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       const moment = shot.the_moment || {};
       const verbProse = moment.verb ? String(moment.verb).replace(/_/g, " ") : "";
       ctxBlock.innerHTML = `
-        <div class="elx-shot-ctx">
+        <div class="elx-shot-ctx" style="position:relative;">
           <span class="elx-shot-ctx__num">S${String(shot.shot_number || "?").padStart(2,"0")}</span>
           <span class="elx-shot-ctx__tc">${esc(shot.timecode?.in || "?")} → ${esc(shot.timecode?.out || "?")} · ${shot.timecode?.duration_seconds || "?"}s</span>
           <span class="elx-shot-ctx__mode">${esc(shot.generation?.mode || "auto")}</span>
           ${verbProse ? `<span class="elx-shot-ctx__verb"><em>${esc(verbProse)}</em></span>` : ""}
           ${moment.focal_point ? `<div class="elx-shot-ctx__focal">${esc(moment.focal_point)}</div>` : ""}
+          <button data-action="edit-shot" data-shot-id="${esc(shot.id)}"
+                  title="Edit shot bible (moment, camera, dialogue, voiceover, references, duration override)"
+                  style="position:absolute; top:6px; right:6px;
+                         background:transparent; color:#9a9aab; border:1px solid #2a2a35;
+                         padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer;">✎ Edit shot</button>
         </div>
       `;
     }
@@ -13427,6 +13433,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "anchor-planner")     showAnchorPlannerModal();
     else if (action === "upload-cast")        showUploadCharacterModal(target.dataset.charId);
     else if (action === "edit-cast")          showEditCharacterModal(target.dataset.charId);
+    else if (action === "edit-env")           showEditEnvironmentModal(target.dataset.locId);
+    else if (action === "edit-shot")          showEditShotModal(target.dataset.shotId);
     else if (action === "upload-env")         showUploadEnvironmentModal(target.dataset.locId);
     else if (action === "upload-asset")       showUploadAssetModal(target.dataset.assetId);
   });
@@ -14491,6 +14499,85 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     });
   }
 
+  // v4.3 Edit Environment — pre-populated form for fixing existing env data.
+  // Parallel to showEditCharacterModal. Architecture / lighting / palette /
+  // props are the composer-readable fields; without them the env reads as
+  // "interior of a space" with no specific identity.
+  async function showEditEnvironmentModal(locId) {
+    const e = await Storage.get("environments", locId);
+    if (!e) { toast(`Environment ${locId} not found`, { tone: "err" }); return; }
+    const a = e.architecture || {};
+    const l = e.lighting || {};
+    const formHtml = `
+      <div style="background:rgba(201,162,90,0.08); border:1px solid rgba(201,162,90,0.30); border-radius:6px; padding:10px 14px; margin-bottom:14px; font-size:11.5px; color:#c8c8d4; line-height:1.55;">
+        Fill in the visual identity fields. After saving, click <strong style="color:#c9a25a;">Re-roll</strong> on the env card to regenerate plates with the updated data.
+      </div>
+      ${fieldHtml("Display name", `<input name="display_name" type="text" required value="${esc(e.display_name || "")}" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml("Architecture / type", `<input name="architecture" type="text" value="${esc(a.type || "")}" placeholder="open-plan loft, exposed brick, double-height windows" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml(
+        "Materials",
+        `<input name="materials" type="text" value="${esc((a.materials || []).join(", "))}" placeholder="cracked stone, broken statues, torn banners" style="${FIELD_INPUT_STYLE}">`,
+        "Comma-separated. Reinforced in [Environment] prompt block."
+      )}
+      ${fieldHtml(
+        "Lighting (description)",
+        `<input name="lighting" type="text" value="${esc(l.description || "")}" placeholder="moonlit indigo, violet fog low across the ground" style="${FIELD_INPUT_STYLE}">`
+      )}
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
+        ${fieldHtml("Lighting source", `<input name="lighting_source" type="text" value="${esc(l.primary_source || "")}" placeholder="moonlight" style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Quality", `<input name="lighting_quality" type="text" value="${esc(l.quality || "")}" placeholder="soft, cool" style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Time of day", `<input name="lighting_time" type="text" value="${esc(l.time_of_day || "")}" placeholder="night" style="${FIELD_INPUT_STYLE}">`)}
+      </div>
+      ${fieldHtml(
+        "Palette",
+        `<input name="palette" type="text" value="${esc((e.palette || []).join(", "))}" placeholder="indigo, antique gold, violet" style="${FIELD_INPUT_STYLE}">`,
+        "Comma-separated colors. Shown on the env card; surfaces in the prompt's [Environment] block."
+      )}
+      ${fieldHtml(
+        "Props (one per line)",
+        `<textarea name="props" rows="3" placeholder="One per line — e.g.\nBroken lion statues\nGold-inlaid columns\nTorn banners" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc((e.props || []).join("\n"))}</textarea>`,
+        "Critical props that MUST appear in shots — the composer reinforces them in [Environment] AND [Negative Prompt]."
+      )}
+      ${fieldHtml("Ambient sound", `<input name="ambient_sound" type="text" value="${esc(e.ambient_sound || "")}" placeholder="low wind, distant stone creak, faint hum" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml(
+        "Continuity locks (one per line)",
+        `<textarea name="continuity_locks" rows="2" placeholder="One per line — e.g.\nmoonlight angle from upper-left\nviolet fog at ankle height" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc((e.continuity_locks || []).join("\n"))}</textarea>`,
+        "Invariants the model must preserve across every shot in this environment."
+      )}
+    `;
+    openFormModal({
+      title: `Edit ${e.display_name}`,
+      formHtml,
+      onSubmit: async (form) => {
+        const fd = new FormData(form);
+        const updated = {
+          ...e,
+          display_name: String(fd.get("display_name") || e.display_name).trim(),
+          architecture: {
+            ...(e.architecture || {}),
+            type: String(fd.get("architecture") || "").trim(),
+            materials: splitList(fd.get("materials")),
+          },
+          lighting: {
+            ...(e.lighting || {}),
+            description: String(fd.get("lighting") || "").trim(),
+            primary_source: String(fd.get("lighting_source") || "").trim(),
+            quality: String(fd.get("lighting_quality") || "").trim(),
+            time_of_day: String(fd.get("lighting_time") || "").trim(),
+          },
+          palette: splitList(fd.get("palette")),
+          props: splitList(fd.get("props")),
+          ambient_sound: String(fd.get("ambient_sound") || "").trim(),
+          continuity_locks: splitList(fd.get("continuity_locks")),
+        };
+        await Storage.put("environments", updated);
+        toast(`Saved "${updated.display_name}". Click Re-roll on the env card to regenerate.`, { tone: "ok", duration: 8000 });
+        await renderLocationTab();
+        await adaptLeftTreeEnvironments();
+      },
+    });
+  }
+
   async function showCreateShotModal() {
     const characters   = await Storage.getAll("characters");
     const environments = await Storage.getAll("environments");
@@ -14726,6 +14813,301 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         toast(`Added shot S${String(shot_number).padStart(2,"0")} "${display_name}"`, { tone: "ok" });
         await renderStoryboard();
         await adaptLeftTreeShots();
+      },
+    });
+  }
+
+  // v4.3 Edit Shot — pre-populated form for fixing imported shot specs.
+  // Mirrors the create form's scalar fields. For arrays (cast_in_frame,
+  // voiceover, references, watch_points) we expose human-readable textarea
+  // edits in known formats — round-trip safe.
+  async function showEditShotModal(shotId) {
+    const s = await Storage.get("shots", shotId);
+    if (!s) { toast(`Shot ${shotId} not found`, { tone: "err" }); return; }
+    const characters   = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const styleAssets  = await Storage.getAll("assets");
+    const project      = await Storage.Projects.getActive();
+    const projectDefaultDuration = project?.default_shot_duration_seconds ?? 8;
+
+    const m = s.the_moment || {};
+    const cam = s.camera || {};
+    const cur = {
+      duration: s.timecode?.duration_seconds_override ?? s.timecode?.duration_seconds ?? projectDefaultDuration,
+    };
+
+    // Serialize voiceover[] back into "speaker: text" lines for editing
+    const voiceoverText = (s.voiceover || [])
+      .map(v => `${v.speaker_id || "narrator"}: ${v.text || ""}`)
+      .join("\n");
+    // Serialize watch_points[] back into "failure → fix" lines
+    const watchPointsText = (s.watch_points || [])
+      .map(w => `${w.failure || ""}${w.surgical_fix ? " → " + w.surgical_fix : ""}`)
+      .filter(Boolean).join("\n");
+    // Serialize cast_in_frame[] dialogue back into "Name: line" format for the existing dialogue textarea
+    const dialogueText = (s.cast_in_frame || [])
+      .filter(c => c.dialogue?.en || (typeof c.dialogue === "string" && c.dialogue))
+      .map(c => {
+        const bible = characters.find(x => x.id === c.character_id);
+        const name = bible?.display_name || c.character_id;
+        const line = c.dialogue?.en || c.dialogue;
+        return `${name}: ${line}`;
+      })
+      .join("\n");
+
+    const FRAMING_OPTIONS = ["wide","medium wide","medium","medium close-up","close-up","extreme close-up","two-shot","over-the-shoulder","low angle","high angle","extreme wide"];
+    const ASPECT_OPTIONS = ["16:9","9:16","1:1","2.35:1","4:3"];
+    const MOVEMENT_OPTIONS = ["locked","slow push-in","slow pull-out","lateral tracking","handheld","slow dolly-in","slow tilt up"];
+
+    // Cast checkboxes — pre-checked when cast_in_frame includes them
+    const inFrameIds = new Set((s.cast_in_frame || []).map(c => c.character_id));
+    const castOptions = characters.length === 0
+      ? `<div style="font-size:12px; color:#9a9aab; padding:8px; background:#0a0a0c; border-radius:6px;">No characters in this project yet.</div>`
+      : characters.map(c => `
+          <label style="display:flex; align-items:center; gap:8px; padding:6px 0; font-size:13px; cursor:pointer;">
+            <input type="checkbox" name="cast_${esc(c.id)}" value="1" ${inFrameIds.has(c.id) ? "checked" : ""} style="margin:0;">
+            <span>${esc(c.display_name)}</span>
+            <span style="font-size:11px; color:#6a6a78;">${esc(c.identity?.role_in_story || c.identity?.archetype || "")}</span>
+          </label>
+        `).join("");
+
+    // Env dropdown
+    const envOptions = `<option value="">— pick one —</option>` +
+      environments.map(e => `<option value="${esc(e.id)}" ${e.id === s.location?.location_id ? "selected" : ""}>${esc(e.display_name)}</option>`).join("");
+
+    // References checkboxes
+    const refSet = new Set((s.references || []).map(r => `${r.kind}:${r.id}`));
+    const refOptions = [];
+    for (const c of characters) refOptions.push({ kind: "character", id: c.id, label: c.display_name, sub: "extra portrait" });
+    for (const e of environments) refOptions.push({ kind: "environment", id: e.id, label: e.display_name, sub: "extra env plate" });
+    for (const a of styleAssets) refOptions.push({ kind: "asset", id: a.id, label: a.display_name, sub: a.kind || "style asset" });
+    const refOptionsHtml = refOptions.length === 0
+      ? `<div style="font-size:11.5px; color:#9a9aab; padding:8px; background:#0a0a0c; border-radius:6px;">No additional refs available yet.</div>`
+      : refOptions.map(r => {
+        const key = `${r.kind}:${r.id}`;
+        return `
+          <label style="display:flex; align-items:center; gap:8px; padding:5px 0; font-size:12.5px; cursor:pointer;">
+            <input type="checkbox" name="ref_${esc(r.kind)}_${esc(r.id)}" value="1" ${refSet.has(key) ? "checked" : ""} style="margin:0;">
+            <span>${esc(r.label)}</span>
+            <span style="font-size:10.5px; color:#6a6a78;">· ${esc(r.sub)}</span>
+          </label>
+        `;
+      }).join("");
+
+    const voSpeakerSelect = `<option value="narrator">Narrator (off-screen)</option>` +
+      characters.map(c => `<option value="${esc(c.id)}">${esc(c.display_name)}</option>`).join("");
+
+    const formHtml = `
+      <div style="background:rgba(201,162,90,0.08); border:1px solid rgba(201,162,90,0.30); border-radius:6px; padding:10px 14px; margin-bottom:14px; font-size:11.5px; color:#c8c8d4; line-height:1.55;">
+        Edit any field below. <strong style="color:#c9a25a;">Existing takes are preserved.</strong> Click <strong style="color:#c9a25a;">Roll Seedance</strong> on the storyboard card after saving to roll with the updated spec.
+      </div>
+      <div style="display:grid; grid-template-columns:80px 1fr; gap:10px;">
+        ${fieldHtml("Shot #", `<input name="shot_number" type="number" min="1" value="${esc(s.shot_number || 1)}" required style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Display name", `<input name="display_name" type="text" required value="${esc(s.display_name || "")}" style="${FIELD_INPUT_STYLE}">`)}
+      </div>
+      ${fieldHtml(
+        "The moment — verb",
+        `<input name="verb" type="text" value="${esc(m.verb || "")}" placeholder="approaches / cuts off / pauses" style="${FIELD_INPUT_STYLE}">`
+      )}
+      ${fieldHtml(
+        "The moment — focal point",
+        `<input name="focal_point" type="text" value="${esc(m.focal_point || "")}" placeholder="Moonlit ruins of the Lion Courtyard" style="${FIELD_INPUT_STYLE}">`
+      )}
+      ${fieldHtml(
+        "The moment — description",
+        `<textarea name="moment_description" rows="2" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(m.description || "")}</textarea>`
+      )}
+      ${fieldHtml(
+        "Emotional beat",
+        `<input name="emotional_beat" type="text" value="${esc(m.emotional_beat || "")}" placeholder="thesis shot / fear lands / etc." style="${FIELD_INPUT_STYLE}">`
+      )}
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
+        ${fieldHtml(
+          "Camera framing",
+          `<select name="framing" style="${FIELD_INPUT_STYLE}">${FRAMING_OPTIONS.map(o => `<option value="${esc(o)}" ${o === cam.framing ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`
+        )}
+        ${fieldHtml(
+          "Aspect ratio",
+          `<select name="aspect_ratio" style="${FIELD_INPUT_STYLE}">${ASPECT_OPTIONS.map(o => `<option value="${esc(o)}" ${o === cam.aspect_ratio ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`
+        )}
+        ${fieldHtml(
+          "Camera movement",
+          `<select name="movement" style="${FIELD_INPUT_STYLE}">${MOVEMENT_OPTIONS.map(o => `<option value="${esc(o)}" ${o === cam.movement ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`
+        )}
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        ${fieldHtml("Lens (mm)", `<input name="lens" type="text" value="${esc(cam.lens || "")}" placeholder="35mm / 24mm / 50mm" style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml("Depth of field", `<input name="depth" type="text" value="${esc(cam.depth || "")}" placeholder="shallow / deep" style="${FIELD_INPUT_STYLE}">`)}
+      </div>
+      ${fieldHtml(
+        "Location",
+        `<select name="location_id" style="${FIELD_INPUT_STYLE}">${envOptions}</select>`,
+        "Primary environment. Used as the [Environment] block in the composer."
+      )}
+      ${fieldHtml(
+        "Cast in frame",
+        `<div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:8px 12px;">${castOptions}</div>`,
+        "Check every character visible in the shot."
+      )}
+      ${fieldHtml(
+        "Dialogue (in-frame, optional)",
+        `<textarea name="dialogue" rows="3" placeholder="Name: line one\nOther Name: line two" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(dialogueText)}</textarea>`,
+        `Format: "Character Name: line". Routes to the cast member in cast_in_frame; native lip-sync.`
+      )}
+
+      <div style="margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
+        <div style="font-size:11px; color:#c9a25a; letter-spacing:0.04em; text-transform:uppercase; font-weight:600; margin-bottom:8px;">Voiceover (off-screen)</div>
+        ${fieldHtml(
+          "VO lines",
+          `<textarea name="voiceover_lines" rows="3" placeholder="speaker_id: line text\nnarrator: Once, there was a kingdom..." style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(voiceoverText)}</textarea>`,
+          `Format: "speaker_id: text". Use "narrator" for off-screen narration; use a cast character's id to mark them as VO speaker (without being in frame).`
+        )}
+        <div style="font-size:10.5px; color:#6a6a78; margin-top:4px;">Available speaker_ids: narrator, ${characters.map(c => c.id).join(", ")}</div>
+      </div>
+
+      <div style="margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
+        <div style="font-size:11px; color:#c9a25a; letter-spacing:0.04em; text-transform:uppercase; font-weight:600; margin-bottom:8px;">Additional references</div>
+        <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:8px 12px; max-height:160px; overflow-y:auto;">${refOptionsHtml}</div>
+        <div style="font-size:10.5px; color:#6a6a78; margin-top:4px;">Reference-to-video mode attaches these as extra ref images.</div>
+      </div>
+
+      <div style="margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
+        ${fieldHtml("Audio ambient", `<input name="audio_ambient" type="text" value="${esc(s.audio?.ambient || "")}" placeholder="Low wind, distant stone creak" style="${FIELD_INPUT_STYLE}">`)}
+        ${fieldHtml(
+          "Director note",
+          `<textarea name="director_note" rows="2" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(s.director_note || "")}</textarea>`,
+          "Goes in [Director Note] block at the prompt's tail (high autoregressive attention)."
+        )}
+        ${fieldHtml(
+          "Watch points (one per line: 'failure → surgical fix')",
+          `<textarea name="watch_points" rows="3" placeholder="One per line — e.g.\nshadow looks evil → soften FX, add gold highlights\nface hidden → re-roll if Lionn's face isn't readable" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(watchPointsText)}</textarea>`,
+          "Format: 'failure → surgical_fix'. Goes in [Known Failure Modes] block."
+        )}
+        ${fieldHtml(
+          `Render duration (seconds)`,
+          `<input name="duration_override" type="number" min="4" max="15" value="${esc(cur.duration)}" style="${FIELD_INPUT_STYLE}">`,
+          `Project default: ${projectDefaultDuration}s. Range 4–15 (Seedance limits).`
+        )}
+      </div>
+    `;
+    openFormModal({
+      title: `Edit shot S${String(s.shot_number || "?").padStart(2,"0")}`,
+      formHtml,
+      onSubmit: async (form) => {
+        const fd = new FormData(form);
+        const display_name = String(fd.get("display_name") || s.display_name).trim();
+        if (!display_name) { toast("Display name is required", { tone: "warn" }); return false; }
+        const shot_number = Number(fd.get("shot_number")) || s.shot_number;
+        const duration = Math.max(4, Math.min(15, Number(fd.get("duration_override")) || projectDefaultDuration));
+
+        // Re-compute in/out from shot_number using new duration
+        const startSec = (shot_number - 1) * duration;
+        const fmt = (t) => `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`;
+
+        // Parse cast_in_frame from checkboxes
+        const castInFrame = [];
+        for (const c of characters) {
+          if (fd.get(`cast_${c.id}`) === "1") {
+            castInFrame.push({ character_id: c.id, role_in_shot: "in_frame" });
+          }
+        }
+        // Parse dialogue → attach to cast members
+        const dialogueRaw = String(fd.get("dialogue") || "").trim();
+        if (dialogueRaw) {
+          for (const line of dialogueRaw.split(/\n+/).map(l => l.trim()).filter(Boolean)) {
+            const colonIdx = line.indexOf(":");
+            if (colonIdx === -1) continue;
+            const speakerName = line.slice(0, colonIdx).trim();
+            const text = line.slice(colonIdx + 1).trim();
+            const speaker = characters.find(c => c.display_name.toLowerCase() === speakerName.toLowerCase());
+            if (speaker) {
+              const entry = castInFrame.find(x => x.character_id === speaker.id);
+              if (entry) { entry.dialogue = { en: text }; entry.role_in_shot = "speaks"; }
+              else castInFrame.push({ character_id: speaker.id, role_in_shot: "speaks", dialogue: { en: text } });
+            }
+          }
+        }
+
+        // Parse voiceover textarea → array
+        const voiceover = [];
+        const voRaw = String(fd.get("voiceover_lines") || "").trim();
+        if (voRaw) {
+          for (const line of voRaw.split(/\n+/).map(l => l.trim()).filter(Boolean)) {
+            const colonIdx = line.indexOf(":");
+            if (colonIdx === -1) continue;
+            const speaker = line.slice(0, colonIdx).trim();
+            const text = line.slice(colonIdx + 1).trim();
+            if (!text) continue;
+            voiceover.push({ speaker_id: speaker || "narrator", text });
+          }
+        }
+
+        // Parse references checkboxes
+        const references = [];
+        for (const r of refOptions) {
+          if (fd.get(`ref_${r.kind}_${r.id}`) === "1") {
+            references.push({ kind: r.kind, id: r.id, role: "support" });
+          }
+        }
+
+        // Parse watch_points textarea
+        const watch_points = [];
+        const wpRaw = String(fd.get("watch_points") || "").trim();
+        if (wpRaw) {
+          for (const line of wpRaw.split(/\n+/).map(l => l.trim()).filter(Boolean)) {
+            const arrowIdx = line.search(/[→=]/);
+            if (arrowIdx === -1) { watch_points.push({ failure: line, surgical_fix: "" }); continue; }
+            const failure = line.slice(0, arrowIdx).trim();
+            const fix = line.slice(arrowIdx + 1).replace(/^[>\s]+/, "").trim();
+            watch_points.push({ failure, surgical_fix: fix });
+          }
+        }
+
+        const updated = {
+          ...s,
+          shot_number,
+          display_name,
+          timecode: {
+            ...(s.timecode || {}),
+            in: fmt(startSec),
+            out: fmt(startSec + duration),
+            duration_seconds: duration,
+          },
+          the_moment: {
+            ...(s.the_moment || {}),
+            verb: String(fd.get("verb") || "").trim(),
+            focal_point: String(fd.get("focal_point") || "").trim(),
+            description: String(fd.get("moment_description") || "").trim(),
+            emotional_beat: String(fd.get("emotional_beat") || "").trim(),
+          },
+          camera: {
+            framing: String(fd.get("framing") || "medium"),
+            aspect_ratio: String(fd.get("aspect_ratio") || "16:9"),
+            movement: String(fd.get("movement") || "locked"),
+            lens: String(fd.get("lens") || "").trim(),
+            depth: String(fd.get("depth") || "").trim() || "shallow",
+          },
+          audio: {
+            ...(s.audio || {}),
+            ambient: String(fd.get("audio_ambient") || "").trim(),
+            generate_native: true,
+          },
+          location: { location_id: String(fd.get("location_id") || "") || null },
+          cast_in_frame: castInFrame,
+          cast_lockdown_required: castInFrame.length >= 3,
+          voiceover,
+          references,
+          director_note: String(fd.get("director_note") || "").trim(),
+          watch_points,
+        };
+        await Storage.put("shots", updated);
+        toast(`Saved shot S${String(shot_number).padStart(2,"0")} "${display_name}"`, { tone: "ok", duration: 6000 });
+        await renderStoryboard();
+        await adaptLeftTreeShots();
+        // If shot editor is currently showing this shot, re-render the rail
+        if (State.activeShotId === s.id) {
+          renderShotEditor(s.id);
+        }
       },
     });
   }
@@ -15457,6 +15839,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   NS.handleRerollCastRefs = handleRerollCastRefs;
   NS.handleRerollEnvRefs  = handleRerollEnvRefs;
   NS.handleRerollAsset    = handleRerollAsset;
+  // v4.3: expose edit modals so verify can confirm they're wired
+  NS.showEditCharacterModal   = showEditCharacterModal;
+  NS.showEditEnvironmentModal = showEditEnvironmentModal;
+  NS.showEditShotModal        = showEditShotModal;
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
