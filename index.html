@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="af94eaae029d" data-build-time="2026-05-14T23:02:03.784Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"af94eaae029d",time:"2026-05-14T23:02:03.784Z"};</script>
+<meta name="elevenx-build" content="d035f9ee6622" data-build-time="2026-05-14T23:25:29.522Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"d035f9ee6622",time:"2026-05-14T23:25:29.522Z"};</script>
 
 </head>
-<!-- elevenx-build: af94eaae029d @ 2026-05-14T23:02:03.784Z -->
+<!-- elevenx-build: d035f9ee6622 @ 2026-05-14T23:25:29.522Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9084,6 +9084,24 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
                       font-family: 'JetBrains Mono', monospace; box-sizing:border-box;
                       -webkit-text-security: disc; text-security: disc;">
         <div id="elx-saved-indicator" style="display:none; margin-top:10px; font-size:11px; color:#4ade80; line-height:1.5;"></div>
+
+        <!-- v4.7: dry-run toggle. Lets directors iterate on shot specs / Producer
+             prompts without burning Seedance credits. When ON, handleRollShot
+             composes the full prompt, logs it to console, fakes a take, and skips
+             both Seedream (keyframe) and Seedance API calls. trackCost is also
+             skipped so the cost ticker doesn't drift. -->
+        <div style="margin-top:18px; padding:12px 14px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px;">
+          <label style="display:flex; align-items:center; gap:10px; cursor:pointer; user-select:none;">
+            <input id="elx-dryrun-toggle" type="checkbox" style="width:14px; height:14px; cursor:pointer;">
+            <div style="flex:1;">
+              <div style="font-size:12.5px; color:#e8e8ee; font-weight:600;">🧪 Dry-run mode</div>
+              <div style="font-size:11px; color:#9a9aab; margin-top:2px; line-height:1.4;">
+                Compose the Seedance prompt + log to console, but don't fire the API. Useful for iterating on the Producer prompt or shot spec without spending credits. Toggling re-applies on the next Roll click.
+              </div>
+            </div>
+          </label>
+        </div>
+
         <div id="elx-conn-status" style="margin-top:14px; font-size:12px; color:#9a9aab; min-height:18px;"></div>
         <div style="margin-top:20px; display:flex; gap:8px; justify-content:space-between; align-items:center; flex-wrap:wrap;">
           <button id="elx-conn-clear" style="padding:8px 14px; background:transparent; color:#9a9aab; border:1px solid #2a2a35; border-radius:6px; font-size:11.5px; cursor:pointer;" title="Wipe both saved credentials">Clear saved</button>
@@ -9117,6 +9135,21 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (savedBits.length > 0) {
       savedIndicator.style.display = "block";
       savedIndicator.innerHTML = `✓ Already saved: ${savedBits.join(" · ")}`;
+    }
+
+    // v4.7: hydrate + persist the dry-run toggle. Stored in localStorage so it
+    // survives reloads but is local to this browser (matching the credential
+    // storage strategy in v3.6).
+    const dryrunToggle = $("#elx-dryrun-toggle", panel);
+    if (dryrunToggle) {
+      dryrunToggle.checked = !!State.dryRun;
+      dryrunToggle.addEventListener("change", () => {
+        State.dryRun = !!dryrunToggle.checked;
+        try { localStorage.setItem("elx.dryRun", State.dryRun ? "1" : "0"); } catch {}
+        toast(State.dryRun
+          ? "🧪 Dry-run ON — rolls will compose the prompt but not call Seedance."
+          : "Dry-run OFF — rolls will hit Seedance again.");
+      });
     }
 
     input.focus();
@@ -11862,6 +11895,38 @@ JSON object only. No commentary. No fences. No trailing text.`;
         issues.push({ kind: "r2v_overflow", detail: declaredCastIds.length });
         validationReport.totals.r2vOverflow += 1;
       }
+      // 7. (v4.7) emotional_beat — paired with focal_point in the keyframe
+      //    prompt. Without it the prompt loses expression direction.
+      const eBeat = s.the_moment?.emotional_beat;
+      if (!eBeat || String(eBeat).trim().length < 5) {
+        issues.push({ kind: "missing_emotional_beat", detail: null });
+        validationReport.totals.missingEmotional = (validationReport.totals.missingEmotional || 0) + 1;
+      }
+      // 8. (v4.7) role_in_shot — when cast_in_frame is populated, at least
+      //    one entry should have a role_in_shot (speaking / listening /
+      //    observing / transitional / cut off). Composer + keyframe-gen
+      //    both look for role_in_shot === "speaking" to pick the anchor.
+      if (declaredCastIds.length > 0) {
+        const anyRole = (s.cast_in_frame || []).some(c => c.role_in_shot && String(c.role_in_shot).trim());
+        if (!anyRole) {
+          issues.push({ kind: "missing_role_in_shot", detail: null });
+          validationReport.totals.missingRole = (validationReport.totals.missingRole || 0) + 1;
+        }
+      }
+      // 9. (v4.7) i2v orphan — image_to_video shot with no continuity
+      //    inheritance AND no manual_upload strategy. Either we need a
+      //    prior shot's end frame or an explicit "user will upload" plan
+      //    — otherwise the keyframe gate fails at roll time.
+      if (mode === "image_to_video") {
+        const strat = s.continuity?.start_frame_strategy;
+        const inherits = strat === "inherit_end_of_previous";
+        const manual   = strat === "manual_upload";
+        const hasInheritedRef = !!s.continuity?.start_image_ref;
+        if (!inherits && !manual && !hasInheritedRef) {
+          issues.push({ kind: "i2v_orphan", detail: strat || "<unset>" });
+          validationReport.totals.i2vOrphan = (validationReport.totals.i2vOrphan || 0) + 1;
+        }
+      }
       validationReport.byShot.push({ shotId, displayName: s.display_name || `Shot ${shotNumber}`, issues });
 
       await Storage.put("shots", {
@@ -11900,10 +11965,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (idCollisions.size > 0) {
       warnings.push(`Renamed ${idCollisions.size} id(s) due to collision: ${Array.from(idCollisions).slice(0,3).join(", ")}${idCollisions.size > 3 ? "…" : ""}`);
     }
-    // v4.6: summarise validation defects in import warnings so they surface
-    // in the post-import toast / modal.
+    // v4.6 (extended in v4.7): summarise validation defects in import warnings
+    // so they surface in the post-import toast / modal.
     const vt = validationReport.totals;
-    if (vt.unresolvedCast + vt.unresolvedEnv + vt.missingFocal + vt.missingFraming + vt.badDuration + vt.r2vOverflow > 0) {
+    const totalIssues = vt.unresolvedCast + vt.unresolvedEnv + vt.missingFocal + vt.missingFraming
+                      + vt.badDuration + vt.r2vOverflow
+                      + (vt.missingEmotional || 0) + (vt.missingRole || 0) + (vt.i2vOrphan || 0);
+    if (totalIssues > 0) {
       const bits = [];
       if (vt.unresolvedCast > 0) bits.push(`${vt.unresolvedCast} cast_in_frame id(s) not in bible`);
       if (vt.unresolvedEnv > 0)  bits.push(`${vt.unresolvedEnv} location_id(s) not in bible`);
@@ -11911,6 +11979,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (vt.missingFraming > 0) bits.push(`${vt.missingFraming} shot(s) without camera.framing`);
       if (vt.badDuration > 0)    bits.push(`${vt.badDuration} duration(s) clamped to 4–15s`);
       if (vt.r2vOverflow > 0)    bits.push(`${vt.r2vOverflow} r2v shot(s) with >3 cast (drift risk)`);
+      if (vt.missingEmotional)   bits.push(`${vt.missingEmotional} shot(s) without emotional_beat`);
+      if (vt.missingRole)        bits.push(`${vt.missingRole} shot(s) with cast but no role_in_shot`);
+      if (vt.i2vOrphan)          bits.push(`${vt.i2vOrphan} i2v shot(s) orphaned (no inherit + no manual_upload)`);
       warnings.push(`Shot validation: ${bits.join(", ")}. See Storyboard for ⚠ badges.`);
     }
 
@@ -13366,6 +13437,25 @@ JSON object only. No commentary. No fences. No trailing text.`;
       `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare"}.`,
     ].filter(s => s && s.length > 2).join(" ");
 
+    // v4.7: dry-run short-circuit. Log the keyframe prompt + the source
+    // character ref, persist the prompt onto the shot for audit, return a
+    // placeholder dataURL so composeSeedance(image_to_video) doesn't fail
+    // its assets.startImageUrl gate. No Seedream API call, no trackCost.
+    if (State.dryRun) {
+      console.group(`[dry-run · keyframe] ${shot.id || "<shot>"} · referencing ${speakingChar.display_name || speakingChar.id}`);
+      console.log("keyframe prompt:", promptText);
+      console.log("source ref URL (first 80 chars):", String(charRef).slice(0, 80) + "…");
+      console.groupEnd();
+      shot.keyframes = shot.keyframes || {};
+      shot.keyframes.prompt = promptText;
+      shot.keyframes.medium = medium;
+      shot.keyframes.dryRun = true;
+      shot.keyframes.start_referenced_char = speakingChar.id;
+      await Storage.put("shots", shot);
+      // 1x1 transparent PNG — satisfies the truthiness gate without rendering.
+      return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+    }
+
     const result = await State.fal.seedreamEdit({
       prompt: promptText,
       image_urls: [charRef],
@@ -13521,14 +13611,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
   async function handleRollAllPending() {
     if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
     const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
-    const pending = shots.filter(s => {
+    const pendingAll = shots.filter(s => {
       // Skip title cards / built-in-resolve shots that have no API call
       if (s.generation?.mode === "built_in_resolve") return false;
       return !(s.takes || []).some(t => t.status === "approved");
     });
-    if (pending.length === 0) { toast("Every shot already has an approved take."); return; }
+    if (pendingAll.length === 0) { toast("Every shot already has an approved take."); return; }
+    // v4.7: separate the shots that would waste credits if rolled into a
+    // "blocked" bucket. We still display them in the confirm dialog so the
+    // user knows the total scope, but the batch loop skips them and the
+    // cost forecast excludes them.
+    const pending = pendingAll.filter(s => !shotHasCriticalIssues(s));
+    const blocked = pendingAll.filter(s => shotHasCriticalIssues(s));
 
-    // Cost preview
+    // Cost preview — only count what we'll actually roll
     const totalCost = pending.reduce((sum, s) => sum + ((s.timecode?.duration_seconds || 0) * 0.30), 0);
     // Plus keyframe gen for image_to_video shots that lack one (~$0.05 each)
     const keyframesNeeded = pending.filter(s =>
@@ -13536,9 +13632,19 @@ JSON object only. No commentary. No fences. No trailing text.`;
     ).length;
     const keyframeCost = keyframesNeeded * 0.05;
     const grandTotal = totalCost + keyframeCost;
+    if (pending.length === 0) {
+      toast(
+        `Nothing to roll — all ${pendingAll.length} pending shot(s) have critical validation issues. Fix the ⚠ badges first.`,
+        { tone: "warn", duration: 8000 }
+      );
+      return;
+    }
+    const blockedLine = blocked.length > 0
+      ? `\n⚠ ${blocked.length} shot${blocked.length===1?"":"s"} SKIPPED (critical validation issues — fix the ⚠ badges first):\n  ${blocked.slice(0, 5).map(s => "• " + (s.display_name || s.id)).join("\n  ")}${blocked.length > 5 ? `\n  …and ${blocked.length - 5} more` : ""}\n`
+      : "";
     if (!confirm(
-      `Roll all ${pending.length} pending shot${pending.length===1?"":"s"} sequentially.\n\n` +
-      `Estimated Seedance cost: $${totalCost.toFixed(2)}\n` +
+      `Roll ${pending.length} pending shot${pending.length===1?"":"s"} sequentially.\n${blockedLine}` +
+      `\nEstimated Seedance cost: $${totalCost.toFixed(2)}\n` +
       `Estimated keyframe cost: $${keyframeCost.toFixed(2)} (${keyframesNeeded} keyframes)\n` +
       `Total: $${grandTotal.toFixed(2)}\n\n` +
       `Continuity chaining is automatic between consecutive shots.\n\nProceed?`
@@ -13561,7 +13667,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
     }
     State.batchActive = false;
     setGPS(false);
-    toast(`Batch complete · ${completed}/${pending.length} shots rolled.`);
+    const skippedSuffix = blocked.length > 0
+      ? ` · ${blocked.length} skipped (validation issues)`
+      : "";
+    toast(`Batch complete · ${completed}/${pending.length} shots rolled${skippedSuffix}.`);
   }
 
   async function handleRollShot(shotId) {
@@ -13576,6 +13685,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // so the user sees an accurate panel after a click (without having to
     // hover) and during the rolling state. No-op if the panel isn't mounted.
     renderStoryboardSpecRail(shot);
+    // v4.7: critical-issue gate — refuse to fire Seedance on shots whose
+    // validator stamped them with issues that guarantee a wasted credit
+    // (cast/env unresolved, missing focal, i2v orphan). Surface the exact
+    // defect list so the user knows what to fix in the bible.
+    const critical = criticalIssuesOf(shot);
+    if (critical.length > 0) {
+      const lines = critical.map(i => "  • " + describeShotIssue(i)).join("\n");
+      toast(
+        `Roll blocked for ${shot.display_name || shotId} — would waste a Seedance credit.\nFix these issues first:\n${lines}`,
+        { tone: "warn", duration: 9000 }
+      );
+      console.warn(`[roll-gate] ${shotId} blocked:`, critical);
+      return;
+    }
 
     const castInFrame = (shot.cast_in_frame || []).map(c => characters.find(x => x.id === c.character_id)).filter(Boolean);
     const environment = envs.find(x => x.id === shot.location?.location_id);
@@ -13706,6 +13829,25 @@ JSON object only. No commentary. No fences. No trailing text.`;
       typeof composed.body.duration === "number" ? composed.body.duration : 8,
       "standard", resolved.mode === "image_to_video" ? "image" : resolved.mode === "reference_to_video" ? "reference" : "text"
     );
+
+    // v4.7: dry-run early-return. After composing the full prompt + cost
+    // estimate, dump everything to console and fake-complete instead of
+    // calling Seedance. trackCost is NOT invoked so the cost ticker stays
+    // honest. The shot gets a "dry_run" pseudo-take so the user can see it
+    // landed in their session without burning credits.
+    if (State.dryRun) {
+      console.group(`[dry-run] ${shotId} · ${resolved.mode} · est ${fmtUsd(estCost)}`);
+      console.log("composed.prompt:", composed.prompt);
+      console.log("composed.body:", composed.body);
+      console.log("castInFrame:", castInFrame.map(c => c.id || c.display_name));
+      console.log("environment:", environment?.id || environment?.display_name || "(none)");
+      console.log("assets:", assets);
+      console.groupEnd();
+      toast(`🧪 Dry-run · ${shot.display_name || shotId} · ${resolved.mode} · est ${fmtUsd(estCost)} (not fired). Prompt logged to console.`, { duration: 6000 });
+      State.activeJobs--;
+      setGPS(false);
+      return;
+    }
 
     setGPS(true, `Rolling Seedance · <span class="mono">${esc(shotId)}</span>`, `${resolved.mode} · est ${fmtUsd(estCost)}`, 5);
 
@@ -14060,6 +14202,24 @@ JSON object only. No commentary. No fences. No trailing text.`;
     }
   }
 
+  // v4.7: which validator issue kinds make a Seedance roll a guaranteed
+  // waste of credits? Critical = cannot produce a usable take regardless
+  // of how good the rest of the bible is. Soft = the take will fire but
+  // will drift / be sub-optimal.
+  const CRITICAL_VALIDATION_KINDS = new Set([
+    "cast_unresolved",  // composer can't anchor identity
+    "env_unresolved",   // composer can't anchor scene
+    "missing_focal",    // composeSeedance produces empty body
+    "i2v_orphan",       // i2v with no inheritance + no manual keyframe path
+  ]);
+  function shotHasCriticalIssues(shot) {
+    return (shot?._validation?.issues || []).some(i => CRITICAL_VALIDATION_KINDS.has(i.kind));
+  }
+  function criticalIssuesOf(shot) {
+    return (shot?._validation?.issues || []).filter(i => CRITICAL_VALIDATION_KINDS.has(i.kind));
+  }
+  NS.shotHasCriticalIssues = shotHasCriticalIssues;
+
   // v4.6: translate a validator issue object into a human sentence.
   // Used by the storyboard card tooltip + the Spec rail banner so both
   // surface the same description language.
@@ -14078,6 +14238,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
         return `duration ${issue.detail?.from}s clamped to ${issue.detail?.to}s (must be 4–15s)`;
       case "r2v_overflow":
         return `reference_to_video with ${issue.detail} cast in frame (max 3 — Seedance drifts above)`;
+      // v4.7 additional checks
+      case "missing_emotional_beat":
+        return "missing the_moment.emotional_beat (keyframe prompt loses expression direction)";
+      case "missing_role_in_shot":
+        return "cast_in_frame entries lack role_in_shot (composer can't pick speaking anchor)";
+      case "i2v_orphan":
+        return "image_to_video without inherited keyframe or 'manual_upload' continuity (will fail keyframe gate)";
       default:
         return issue.kind;
     }
@@ -14300,6 +14467,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (!block || !shot) return;
     // Try to compose a preview prompt; gracefully degrade if anything's missing
     let prompt = "";
+    let resolvedMode = "text_to_video";
     try {
       // Resolve project + extras so the preview matches what'll actually be sent.
       const project    = await Storage.Projects.getActive();
@@ -14317,7 +14485,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // this; the preview path forgot to, hence the
       // "(Could not preview prompt: composeSeedance: unknown mode 'auto')" bug.
       const rawMode = shot.generation?.mode;
-      let resolvedMode = rawMode;
+      resolvedMode = rawMode;
       if (!rawMode || rawMode === "auto") {
         const decision = NS.modeResolver?.resolveMode(shot, {
           previousShotHasApprovedTake: false,
@@ -14335,9 +14503,31 @@ JSON object only. No commentary. No fences. No trailing text.`;
     } catch (err) {
       prompt = `(Could not preview prompt: ${err.message})`;
     }
+    // v4.7: surface validator issues + cost estimate prominently above the
+    // prompt body, then OPEN the <details> by default so directors see the
+    // assembled prompt without an extra click. Iterating before rolling is
+    // the highest-leverage anti-waste move.
+    const issues = shot._validation?.issues || [];
+    const critical = issues.filter(i => CRITICAL_VALIDATION_KINDS.has(i.kind));
+    const soft     = issues.filter(i => !CRITICAL_VALIDATION_KINDS.has(i.kind));
+    const dur = shot.timecode?.duration_seconds || 8;
+    const costEstimate = (dur * 0.30) + (resolvedMode === "image_to_video" && !shot.keyframes?.startDataUrl ? 0.05 : 0);
+    const issuesBlock = critical.length + soft.length > 0
+      ? `<div style="margin:0 0 10px; padding:10px 12px; background:#1a1014; border:1px solid ${critical.length ? "#8a3a30" : "#6a4a25"}; border-radius:6px; font-size:11px; line-height:1.5; color:${critical.length ? "#f8a890" : "#e4a980"};">
+           <div style="font-weight:600; margin-bottom:4px;">${critical.length > 0 ? `⛔ ${critical.length} CRITICAL issue${critical.length > 1 ? "s" : ""} — Roll is blocked until fixed:` : `⚠ ${soft.length} soft issue${soft.length > 1 ? "s" : ""} (will roll, but take may drift):`}</div>
+           <ul style="margin:0; padding-left:18px;">
+             ${[...critical, ...soft].map(i => `<li>${esc(describeShotIssue(i))}</li>`).join("")}
+           </ul>
+         </div>`
+      : "";
     block.innerHTML = `
-      <details class="elx-prompt">
-        <summary class="elx-prompt__summary">▸ Preview the prompt that will be sent to Seedance (${prompt.length.toLocaleString()} chars)</summary>
+      ${issuesBlock}
+      <div style="margin:0 0 8px; padding:8px 12px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#9a9aab;">
+        <span>Resolved mode: <span class="mono" style="color:#c9a25a;">${esc(resolvedMode)}</span> · ${dur}s duration · prompt ${prompt.length.toLocaleString()} chars</span>
+        <span>Est. roll cost: <span class="mono" style="color:#c9a25a;">${fmtUsd(costEstimate)}</span>${State.dryRun ? ` · <span style="color:#4ade80;">🧪 dry-run on</span>` : ""}</span>
+      </div>
+      <details class="elx-prompt" open>
+        <summary class="elx-prompt__summary">▾ Composed Seedance prompt (auditable before Roll fires)</summary>
         <pre class="elx-prompt__pre">${esc(prompt)}</pre>
         <div class="elx-prompt__note">This preview uses current shot spec + active model defaults. The actual prompt sent will be regenerated at roll time with any keyframe context.</div>
       </details>
@@ -16323,6 +16513,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
     State.workerUrl    = await loadCredential("worker_url", null);
     State.elevenKey    = await loadCredential("eleven_key", null);
     State.costSpentUsd = (await Storage.getSetting("cost_total", 0)) || 0;
+    // v4.7: hydrate dry-run preference from localStorage. Default OFF.
+    try { State.dryRun = localStorage.getItem("elx.dryRun") === "1"; }
+    catch { State.dryRun = false; }
     if (State.workerUrl) {
       State.fal    = new FalClient({ workerUrl: State.workerUrl, onLog: m => console.log("[fal]", m) });
       State.openai = new OpenAIClient({ workerUrl: State.workerUrl, onLog: m => console.log("[openai]", m) });
