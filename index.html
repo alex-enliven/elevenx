@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="ad05cf65f44e" data-build-time="2026-05-14T20:18:09.488Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"ad05cf65f44e",time:"2026-05-14T20:18:09.488Z"};</script>
+<meta name="elevenx-build" content="6c48557f9ba8" data-build-time="2026-05-14T20:34:45.185Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"6c48557f9ba8",time:"2026-05-14T20:34:45.185Z"};</script>
 
 </head>
-<!-- elevenx-build: ad05cf65f44e @ 2026-05-14T20:18:09.488Z -->
+<!-- elevenx-build: 6c48557f9ba8 @ 2026-05-14T20:34:45.185Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9889,12 +9889,121 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // Expose for verify + future scripted use
   NS.normalizeImportedBible = normalizeImportedBible;
 
+  // ─── LLM-output-tolerant JSON extraction (v3.3) ──────────────────────
+  // Directors paste bibles produced by LLMs (Claude, GPT, etc.). Those models
+  // often emit common debris around the JSON object:
+  //   • ```json fences at top and bottom
+  //   • "Here is your JSON:" preamble
+  //   • Trailing markdown citations like `[1]: https://...`
+  //   • Trailing summary text "I hope this helps!"
+  //   • Footnotes
+  // JSON.parse rejects ALL of this. Brace-balancing extraction finds the
+  // first `{`, walks to its matching `}` (string-aware so braces inside
+  // strings don't confuse the count), and returns just that substring.
+  //
+  // Returns { cleaned: string, droppedPrefixChars, droppedSuffixChars, fenceStripped }
+  function extractJsonObject(text) {
+    if (typeof text !== "string") return { cleaned: text, droppedPrefixChars: 0, droppedSuffixChars: 0, fenceStripped: false };
+    let s = text.replace(/^﻿/, ""); // strip BOM
+    const originalLength = s.length;
+    let fenceStripped = false;
+
+    // Strip leading ```json or ``` fence
+    const leadFence = s.match(/^\s*```(?:json|JSON)?\s*\n?/);
+    if (leadFence) {
+      s = s.slice(leadFence[0].length);
+      fenceStripped = true;
+    }
+    // Strip trailing ``` fence
+    const trailFence = s.match(/\n?\s*```\s*$/);
+    if (trailFence) {
+      s = s.slice(0, s.length - trailFence[0].length);
+      fenceStripped = true;
+    }
+    s = s.trim();
+
+    // Find first {
+    const start = s.indexOf("{");
+    if (start === -1) {
+      // No JSON object — return as-is, let parser produce the error
+      return { cleaned: s, droppedPrefixChars: 0, droppedSuffixChars: 0, fenceStripped };
+    }
+
+    // Walk from start, tracking brace depth. Strings can contain { and } —
+    // skip over them. Handle escapes inside strings.
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let endPos = -1;
+    for (let i = start; i < s.length; i++) {
+      const ch = s[i];
+      if (escape) { escape = false; continue; }
+      if (inString) {
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') { inString = false; }
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === "{") { depth++; }
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) { endPos = i; break; }
+      }
+    }
+    if (endPos === -1) {
+      // Unbalanced — return what we have and let parser error normally
+      return { cleaned: s, droppedPrefixChars: start, droppedSuffixChars: 0, fenceStripped };
+    }
+    const cleaned = s.slice(start, endPos + 1);
+    const droppedSuffixChars = s.length - (endPos + 1);
+    return {
+      cleaned,
+      droppedPrefixChars: start,
+      droppedSuffixChars,
+      fenceStripped,
+    };
+  }
+
+  // Improve a JSON parse error message with line/column context.
+  function formatJsonParseError(err, source) {
+    const msg = String(err?.message || err);
+    // Try to pull "position N" out of the message and show surrounding text
+    const posMatch = msg.match(/position\s+(\d+)/i);
+    if (!posMatch || !source) return msg;
+    const pos = parseInt(posMatch[1], 10);
+    const before = source.slice(Math.max(0, pos - 60), pos);
+    const after  = source.slice(pos, Math.min(source.length, pos + 60));
+    return `${msg}\nContext: ...${before}〉HERE〈${after}...`;
+  }
+
+  NS.extractJsonObject = extractJsonObject;
+
   async function importBibleJson(jsonText) {
     let raw;
-    try {
-      raw = (typeof jsonText === "string") ? JSON.parse(jsonText) : jsonText;
-    } catch (err) {
-      throw new Error(`Not valid JSON: ${err.message}`);
+    let extractionWarning = null;
+    if (typeof jsonText === "string") {
+      // Strip LLM debris (code fences, trailing markdown citations, prefixes)
+      // before JSON.parse.
+      const extracted = extractJsonObject(jsonText);
+      try {
+        raw = JSON.parse(extracted.cleaned);
+      } catch (err) {
+        const detailed = formatJsonParseError(err, extracted.cleaned);
+        throw new Error(`Not valid JSON: ${detailed}`);
+      }
+      // Report what we cleaned, so the user can verify the importer didn't
+      // discard something they wanted.
+      const droppedTotal = extracted.droppedPrefixChars + extracted.droppedSuffixChars;
+      if (droppedTotal > 0 || extracted.fenceStripped) {
+        const bits = [];
+        if (extracted.fenceStripped) bits.push("markdown fences");
+        if (extracted.droppedPrefixChars > 0) bits.push(`${extracted.droppedPrefixChars} chars before JSON`);
+        if (extracted.droppedSuffixChars > 0) bits.push(`${extracted.droppedSuffixChars} chars after JSON`);
+        extractionWarning = `Cleaned LLM debris: ${bits.join(", ")}`;
+        console.log(`[import] ${extractionWarning}`);
+      }
+    } else {
+      raw = jsonText;
     }
     if (!raw || typeof raw !== "object") throw new Error("Bible JSON must be an object");
 
@@ -9908,7 +10017,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       throw new Error("Bible JSON requires project.display_name (after normalization)");
     }
 
-    const warnings = [];
+    const warnings = extractionWarning ? [extractionWarning] : [];
 
     // 1. Create the project. If the slugified id collides, retry with _2, _3…
     const baseId = bible.project.id || slugifyId("proj", bible.project.display_name);
@@ -10320,16 +10429,22 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       try {
         const result = await importBibleJson(text);
         status.style.color = "#4ade80";
-        const summary = `Imported "${result.projectName}" — ${result.charCount} chars, ${result.envCount} envs, ${result.assetCount} style assets, ${result.shotCount} shots. Reloading…`;
+        const warnings = result.warnings || [];
+        const cleaningNote = warnings.find(w => w.startsWith("Cleaned LLM debris"));
+        const otherWarnings = warnings.filter(w => !w.startsWith("Cleaned LLM debris"));
+        let summary = `Imported "${result.projectName}" — ${result.charCount} chars, ${result.envCount} envs, ${result.assetCount} style assets, ${result.shotCount} shots.`;
+        if (cleaningNote) summary += `\n${cleaningNote}.`;
+        if (otherWarnings.length > 0) summary += `\n${otherWarnings.length} other warning(s) — see console.`;
+        summary += " Reloading…";
         status.textContent = summary;
-        if ((result.warnings || []).length > 0) {
-          console.warn("[import] warnings:", result.warnings);
-        }
+        status.style.whiteSpace = "pre-line";
+        if (warnings.length > 0) console.warn("[import] warnings:", warnings);
         // Full reload — fastest way to pick up the new active project with clean state
-        setTimeout(() => window.location.reload(), 800);
+        setTimeout(() => window.location.reload(), 1200);
       } catch (err) {
         status.style.color = "#f87171";
         status.textContent = `Import failed: ${err.message}`;
+        status.style.whiteSpace = "pre-line";
         console.error("[import]", err);
       }
     });
