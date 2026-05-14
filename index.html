@@ -9534,16 +9534,373 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   //
   // Returns: { projectId, projectName, charCount, envCount, assetCount, shotCount, warnings }
 
+  // ─── Bible shape normalization (v3.2) ────────────────────────────────
+  // Directors produce richer bibles than the strict importer schema —
+  // nested under elevenx_project_fields / creative_bible / cast_bible /
+  // location_bible / teaser. The normalizer detects that shape and
+  // translates it into the strict { project, characters, environments,
+  // style_assets, shots } shape importBibleJson needs.
+  //
+  // Strict shape is passed through untouched.
+
+  // "3D animation" / "live action" / "2D Animation" / "Documentary" → enum
+  function normalizeMedium(s) {
+    if (!s) return "live_action";
+    const t = String(s).toLowerCase().trim();
+    if (/3\s*-?\s*d|three.?d|animated_3d/.test(t) && t.includes("anim")) return "animated_3d";
+    if (/2\s*-?\s*d|two.?d|animated_2d/.test(t) && t.includes("anim")) return "animated_2d";
+    if (t.includes("documentary")) return "documentary";
+    if (t.includes("anim")) return "animated_3d"; // default for any "animation"
+    return "live_action";
+  }
+
+  // "ruined_lion_courtyard" → "Ruined Lion Courtyard"
+  function snakeToTitleCase(s) {
+    return String(s || "").split(/[_\s]+/).filter(Boolean)
+      .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ");
+  }
+
+  // Tone can be a string, an object with .primary, or an array. Normalize → array.
+  function normalizeTone(tone) {
+    if (!tone) return [];
+    if (Array.isArray(tone)) return tone.map(t => String(t).trim()).filter(Boolean);
+    if (typeof tone === "string") return tone.split(/[,;\/]+/).map(t => t.trim()).filter(Boolean);
+    if (typeof tone === "object") {
+      // Prefer .primary; pull comma-separated values out
+      const primary = tone.primary || tone.tone || "";
+      return normalizeTone(primary);
+    }
+    return [];
+  }
+
+  // Collect world rules from creative_bible.world.world_logic + tone.avoid +
+  // any explicit rules arrays. Returns string[].
+  function gatherWorldRules(cb, sdr) {
+    const rules = [];
+    if (cb?.world?.world_logic) rules.push(String(cb.world.world_logic).trim());
+    if (cb?.tone?.age_range_guidance) rules.push(`Age tone: ${String(cb.tone.age_range_guidance).trim()}`);
+    if (Array.isArray(cb?.tone?.avoid)) {
+      for (const a of cb.tone.avoid) if (a) rules.push(`Avoid: ${String(a).trim()}`);
+    } else if (typeof cb?.tone?.avoid === "string" && cb.tone.avoid.trim()) {
+      rules.push(`Avoid: ${cb.tone.avoid.trim()}`);
+    }
+    if (Array.isArray(sdr?.shot_design_rules)) {
+      for (const r of sdr.shot_design_rules) if (r) rules.push(String(r).trim());
+    }
+    return rules;
+  }
+
+  // Parse "cinematic 24mm · extreme wide establishing shot · slow push-in · deep depth · 16:9"
+  // → { framing, lens, depth, movement, aspect_ratio }
+  function parseCameraGrammar(str) {
+    if (!str) return { framing: "medium", aspect_ratio: "16:9", movement: "locked", depth: "shallow" };
+    const tokens = String(str).split(/[·•|]/).map(t => t.trim()).filter(Boolean);
+    const out = { framing: null, lens: null, depth: null, movement: null, aspect_ratio: null };
+    const FRAMING_TERMS = [
+      "extreme wide", "very wide", "wide establishing", "wide", "medium wide",
+      "medium close-up", "medium close up", "close-up", "extreme close-up",
+      "two-shot", "three-shot", "over-the-shoulder", "low-angle reveal", "low angle",
+      "high angle", "hero shot", "medium hero shot", "establishing shot", "medium"
+    ];
+    const MOVEMENT_TERMS = [
+      "slow push-in", "fast push-in", "push-in", "slow pull-out", "pull-out",
+      "lateral tracking", "tracking", "handheld", "slow dolly-in", "dolly-in",
+      "dolly", "static frame with slight breathing motion", "static", "locked",
+      "slow tilt up", "tilt up", "tilt down", "slow push",
+    ];
+    const DEPTH_TERMS = ["shallow depth", "deep depth", "shallow", "deep"];
+    const matchAny = (tok, list) => list.find(term => tok.toLowerCase().includes(term));
+
+    for (const tok of tokens) {
+      const lower = tok.toLowerCase();
+      // lens — "24mm", "35mm", etc.
+      const lensMatch = lower.match(/(\d+(?:\.\d+)?\s*mm)/);
+      if (lensMatch && !out.lens) out.lens = lensMatch[1];
+      // aspect ratio — "16:9", "2.35:1", "9:16", "1:1"
+      const arMatch = tok.match(/(\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?)/);
+      if (arMatch && !out.aspect_ratio) out.aspect_ratio = arMatch[1].replace(/\s+/g, "");
+      // framing
+      if (!out.framing) {
+        const f = matchAny(lower, FRAMING_TERMS);
+        if (f) out.framing = f;
+      }
+      // movement
+      if (!out.movement) {
+        const m = matchAny(lower, MOVEMENT_TERMS);
+        if (m) out.movement = m;
+      }
+      // depth
+      if (!out.depth) {
+        const d = matchAny(lower, DEPTH_TERMS);
+        if (d) out.depth = d.replace(/\s+depth$/, "");
+      }
+    }
+    return {
+      framing: out.framing || "medium",
+      lens: out.lens || "35mm",
+      depth: out.depth || "shallow",
+      movement: out.movement || "locked",
+      aspect_ratio: out.aspect_ratio || "16:9",
+    };
+  }
+
+  // dialogue: [{ speaker, line, delivery }] split into:
+  //   - in-frame dialogue (speaker is in cast_in_frame AND delivery doesn't say "voiceover")
+  //   - voiceover (everything else)
+  // characters[] is the resolved roster (so we can resolve display_name → id).
+  function splitDialogueAndVoiceover(dialogueArr, castInFrameNames, characters) {
+    const inFrameSet = new Set((castInFrameNames || []).map(n => String(n).toLowerCase()));
+    const dialogueMap = new Map(); // character_id → { line, delivery }
+    const voiceover = [];
+    for (const d of (dialogueArr || [])) {
+      if (!d?.speaker || !d?.line) continue;
+      const speakerName = String(d.speaker).trim();
+      const speakerLower = speakerName.toLowerCase();
+      const delivery = String(d.delivery || "");
+      const isVO = /voice\s*over|voiceover|\bvo\b/i.test(delivery) || !inFrameSet.has(speakerLower);
+      // Resolve speaker_id by name match
+      const matched = characters.find(c => (c.display_name || "").toLowerCase() === speakerLower);
+      const speakerId = matched?.id || speakerLower.replace(/[^a-z0-9]+/g, "_");
+      if (isVO) {
+        voiceover.push({ speaker_id: speakerId, text: d.line, delivery_note: delivery });
+      } else {
+        dialogueMap.set(speakerId, { line: d.line, delivery });
+      }
+    }
+    return { dialogueMap, voiceover };
+  }
+
+  // Map cast_in_frame string array → object array. Resolves names to character ids.
+  function mapCastInFrame(stringArr, characters, dialogueMap) {
+    const out = [];
+    for (const name of (stringArr || [])) {
+      const lower = String(name).toLowerCase().trim();
+      // Skip non-character entries like "Hollow Guard silhouettes", "two Hollow Guards"
+      const matched = characters.find(c =>
+        (c.display_name || "").toLowerCase() === lower
+        || (c.id || "").toLowerCase() === lower.replace(/[^a-z0-9]+/g, "_")
+      );
+      if (!matched) continue;
+      const entry = { character_id: matched.id, role_in_shot: "in_frame" };
+      const dlg = dialogueMap.get(matched.id);
+      if (dlg) {
+        entry.role_in_shot = "speaks";
+        entry.dialogue = { en: dlg.line };
+        if (dlg.delivery) entry.delivery_note = dlg.delivery;
+      }
+      out.push(entry);
+    }
+    return out;
+  }
+
+  // Map reference_assets[] strings → references[] objects with kind detection.
+  // charIds / envIds / assetIds are Sets of slugified ids.
+  function mapReferenceAssets(refArr, charIds, envIds, assetIds) {
+    const out = [];
+    for (const refId of (refArr || [])) {
+      if (!refId) continue;
+      const id = String(refId).toLowerCase();
+      // Try exact match first
+      if (charIds.has(id)) { out.push({ kind: "character", id, role: "support" }); continue; }
+      if (envIds.has(id))  { out.push({ kind: "environment", id, role: "support" }); continue; }
+      if (assetIds.has(id)){ out.push({ kind: "asset", id, role: "support" }); continue; }
+      // Fuzzy match — does any known id appear as a substring of refId?
+      let foundKind = null, foundId = null;
+      for (const cid of charIds) { if (id.includes(cid)) { foundKind = "character"; foundId = cid; break; } }
+      if (!foundKind) for (const eid of envIds)  { if (id.includes(eid))  { foundKind = "environment"; foundId = eid; break; } }
+      if (!foundKind) for (const aid of assetIds){ if (id.includes(aid))  { foundKind = "asset"; foundId = aid; break; } }
+      if (foundKind) out.push({ kind: foundKind, id: foundId, role: "support" });
+      // else: silently drop — the asset stub creation pass already covered all unmatched refs
+    }
+    return out;
+  }
+
+  // Auto-create style asset stubs for reference_assets ids that don't match any cast/env.
+  // Heuristic kind detection from naming convention (e.g., "..._fx_sheet_v01" → fx_sheet).
+  function deriveStyleAssetsFromShots(shots, charIds, envIds) {
+    const seen = new Map(); // id → { display_name, kind }
+    for (const s of (shots || [])) {
+      for (const ref of (s.reference_assets || [])) {
+        const id = String(ref).toLowerCase();
+        if (seen.has(id)) continue;
+        let matchesCast = charIds.has(id) || Array.from(charIds).some(cid => id.includes(cid));
+        if (matchesCast) continue;
+        let matchesEnv = envIds.has(id) || Array.from(envIds).some(eid => id.includes(eid));
+        if (matchesEnv) continue;
+        // It's a style asset
+        const lower = id;
+        let kind = "style_frame";
+        if (lower.includes("fx") || lower.includes("shadow_fx") || lower.includes("atmosphere")) kind = "fx_sheet";
+        else if (lower.includes("ui") || lower.includes("typography") || lower.includes("hud")) kind = "ui_sheet";
+        else if (lower.includes("prop") || lower.includes("weapon") || lower.includes("blade")) kind = "prop";
+        else if (lower.includes("moodboard") || lower.includes("mood")) kind = "moodboard";
+        seen.set(id, {
+          display_name: snakeToTitleCase(id.replace(/^golden_/, "").replace(/_v\d+$/, "").replace(/_sheet$/, "")),
+          kind,
+        });
+      }
+    }
+    return Array.from(seen.entries()).map(([id, info]) => ({
+      id, display_name: info.display_name, kind: info.kind, description: "",
+    }));
+  }
+
+  function normalizeImportedBible(raw) {
+    if (!raw || typeof raw !== "object") return raw;
+    // Strict shape check — pass through untouched
+    const looksRich = !!(raw.elevenx_project_fields || raw.cast_bible || raw.creative_bible || raw.teaser?.shots);
+    const looksStrict = !!(raw.project && raw.project.display_name && (Array.isArray(raw.characters) || Array.isArray(raw.shots)));
+    if (looksStrict && !looksRich) return raw;
+    if (!looksRich) return raw; // unknown shape — let the strict validator yell at it
+
+    const ep = raw.elevenx_project_fields || {};
+    const cb = raw.creative_bible || {};
+    const qc = raw.quality_control || {};
+    const sdr = raw.seedance_2_0_prompting_rules || {};
+    const teaser = raw.teaser || {};
+    const va = raw.voice_and_audio_plan || {};
+
+    // PROJECT
+    const project = {
+      display_name: ep.project_name || raw.project_name || "Untitled",
+      logline: ep.logline || cb.director_statement || "",
+      medium: normalizeMedium(ep.medium),
+      audience: ep.audience || cb?.tone?.age_range_guidance || "",
+      default_shot_duration_seconds: Number(ep.default_shot_duration_seconds) || Number(teaser.default_duration_seconds) || 8,
+      style_canon: ep.style_canon || sdr.global_style_prefix || "",
+      description: ep.description || "",
+      theme: cb.theme || "",
+      tone: normalizeTone(cb.tone),
+      visual_rule: cb.visual_rule || "",
+      world_rules: gatherWorldRules(cb, sdr),
+      reroll_rules: Array.isArray(qc.global_reroll_rules) ? qc.global_reroll_rules : [],
+    };
+
+    // CHARACTERS — cast_bible{} → array. Hero gets arc fields wired from creative_bible.
+    const heroLikeRoles = ["hero", "protagonist", "lead"];
+    const characters = Object.entries(raw.cast_bible || {}).map(([id, c]) => {
+      const isHero = heroLikeRoles.some(r => String(c.role || "").toLowerCase().includes(r));
+      const arcStr = (typeof c.arc === "string") ? c.arc : null;
+      const arcObj = (typeof c.arc === "object" && c.arc) ? c.arc : null;
+      const composedArc = {
+        wound: isHero ? (cb.hero_wound || arcObj?.wound || "") : (arcObj?.wound || ""),
+        false_belief: isHero ? (cb.hero_lie || arcObj?.false_belief || "") : (arcObj?.false_belief || ""),
+        truth: isHero ? (cb.hero_truth || arcObj?.truth || "") : (arcObj?.truth || ""),
+        outer_wish: arcObj?.outer_wish || "",
+        inner_need: arcObj?.inner_need || "",
+        arc_expression: arcStr || arcObj?.arc_expression || "",
+      };
+      return {
+        id,
+        display_name: c.display_name || snakeToTitleCase(id),
+        identity: {
+          age: Number(c.age) || null,
+          nationality: "",
+          role_in_story: c.role || "",
+          archetype: c.personality || "",
+        },
+        physical: { distinctive_features: [] },
+        wardrobe: { color_palette: [] },
+        voice: {
+          seedance_native_direction: c.voice_direction || va?.voice_style?.[id] || "",
+          elevenlabs_fallback: { voice_id: "TBD", stability: 0.5, similarity: 0.75, style: 0.4 },
+        },
+        performance: { arc_expression: composedArc.arc_expression },
+        arc: composedArc,
+        never: Array.isArray(c.must_not) ? c.must_not : [],
+        high_risk: isHero || heroLikeRoles.some(() => false) || !!c.identity_lock,
+        stability_note: c.identity_lock || "",
+      };
+    });
+
+    // ENVIRONMENTS — location_bible{} → array
+    const environments = Object.entries(raw.location_bible || {}).map(([id, e]) => ({
+      id,
+      display_name: snakeToTitleCase(id),
+      architecture: { type: e.identity_lock || "" },
+      lighting: { description: e.lighting || "" },
+      palette: [],
+      props: [],
+      ambient_sound: "",
+      continuity_locks: [],
+    }));
+
+    // STYLE ASSETS — auto-generate stubs from shot reference_assets that don't match cast/env
+    const charIds = new Set(characters.map(c => c.id));
+    const envIds  = new Set(environments.map(e => e.id));
+    const style_assets = deriveStyleAssetsFromShots(teaser.shots || [], charIds, envIds);
+    const assetIds = new Set(style_assets.map(a => a.id));
+
+    // SHOTS — teaser.shots → strict shape
+    const shots = (teaser.shots || []).map((s, idx) => {
+      const camera = parseCameraGrammar(s.camera_grammar || "");
+      // Parse "S01" → shot_number 1
+      const shotNumMatch = String(s.id || "").match(/(\d+)/);
+      const shotNumber = shotNumMatch ? parseInt(shotNumMatch[1], 10) : idx + 1;
+      // Dialogue + voiceover split
+      const { dialogueMap, voiceover } = splitDialogueAndVoiceover(s.dialogue || [], s.cast_in_frame || [], characters);
+      // cast_in_frame string array → object array (filter to known characters)
+      const castInFrame = mapCastInFrame(s.cast_in_frame || [], characters, dialogueMap);
+      // references[] from reference_assets[]
+      const references = mapReferenceAssets(s.reference_assets || [], charIds, envIds, assetIds);
+      // Pick the first environment as the primary location
+      const primaryEnv = references.find(r => r.kind === "environment");
+      return {
+        shot_number: shotNumber,
+        display_name: s.title || s.id || `Shot ${shotNumber}`,
+        duration_seconds: Number(s.duration_seconds) || project.default_shot_duration_seconds,
+        the_moment: {
+          verb: "", // not captured separately in rich shape — could extract from title
+          focal_point: "",
+          description: s.moment || "",
+          emotional_beat: "",
+        },
+        camera,
+        audio: { generate_native: true, ambient: s.audio_direction || "" },
+        location_id: primaryEnv?.id || null,
+        cast_in_frame: castInFrame,
+        voiceover,
+        references,
+        director_note: s.continuity || s.fallback_simplified_version
+          ? [s.continuity, s.fallback_simplified_version ? `Fallback: ${s.fallback_simplified_version}` : null].filter(Boolean).join(" ")
+          : "",
+        watch_points: Array.isArray(s.reroll_if)
+          ? s.reroll_if.map(r => ({ failure: String(r), surgical_fix: "" }))
+          : [],
+        prompt_engineering: {
+          negative_prompt_additions: s.negative_prompt || "",
+          // Preserve the director-authored Seedance prompt — when set, the composer
+          // can opt to use it directly. (Future feature: prompt_override surfacing.)
+          prompt_override: s.seedance_prompt || "",
+        },
+        generation: { mode: s.mode || "auto" },
+      };
+    });
+
+    return { project, characters, environments, style_assets, shots };
+  }
+
+  // Expose for verify + future scripted use
+  NS.normalizeImportedBible = normalizeImportedBible;
+
   async function importBibleJson(jsonText) {
-    let bible;
+    let raw;
     try {
-      bible = (typeof jsonText === "string") ? JSON.parse(jsonText) : jsonText;
+      raw = (typeof jsonText === "string") ? JSON.parse(jsonText) : jsonText;
     } catch (err) {
       throw new Error(`Not valid JSON: ${err.message}`);
     }
-    if (!bible || typeof bible !== "object") throw new Error("Bible JSON must be an object");
+    if (!raw || typeof raw !== "object") throw new Error("Bible JSON must be an object");
+
+    // v3.2: normalize rich-shape bibles into the strict shape before importing.
+    // Director-produced bibles often nest under elevenx_project_fields /
+    // creative_bible / cast_bible / location_bible / teaser. The normalizer
+    // is idempotent on strict-shape input.
+    const bible = normalizeImportedBible(raw);
+
     if (!bible.project || !bible.project.display_name) {
-      throw new Error("Bible JSON requires project.display_name");
+      throw new Error("Bible JSON requires project.display_name (after normalization)");
     }
 
     const warnings = [];
