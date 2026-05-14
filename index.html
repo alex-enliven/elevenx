@@ -4140,7 +4140,12 @@ a { color: inherit; text-decoration: none; }
 .take.is-rejected .take__status-text { color: #f87171; }
 </style>
 
+
+<meta name="elevenx-build" content="ad05cf65f44e" data-build-time="2026-05-14T20:18:09.488Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"ad05cf65f44e",time:"2026-05-14T20:18:09.488Z"};</script>
+
 </head>
+<!-- elevenx-build: ad05cf65f44e @ 2026-05-14T20:18:09.488Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11748,7 +11753,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // Shows: brief description, cast in frame with their action+dialogue, camera,
   // audio direction, watch points. Falls back to mockup content if no shot selected.
   function renderShotEditorRail(shot, cast, environment) {
-    const rail = $("#right-rail .right__body") || $(".right__body");
+    // CRITICAL: target the s4 rail body specifically. The v2 mockup has FIVE
+    // .right__body elements (one per screen, toggled by display:none). The
+    // generic `$('.right__body')` selector grabs the first one — data-rail="s1"
+    // (AI Producer) — which is invisible on s4. Writing to it means our new
+    // sections render into a hidden DOM node while the visible s4 rail keeps
+    // showing the original mockup's hardcoded Standup content.
+    const rail = $('[data-rail="s4"]');
     if (!rail || !shot) return;
 
     const m = shot.the_moment || {};
@@ -11894,9 +11905,27 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       const chars      = await Storage.getAll("characters");
       const shotRefs   = Array.isArray(shot.references) ? shot.references : [];
       const extraAssets = resolveExtraAssets(shotRefs, { characters: chars, environments: envs, assets: allAssets });
+
+      // CRITICAL: `composeSeedance` doesn't accept `"auto"` as a mode — that's
+      // a UI sentinel meaning "let modeResolver decide". The import path sets
+      // generation.mode = "auto" by default, so we must resolve to a concrete
+      // mode (text_to_video / image_to_video / reference_to_video) before
+      // composing the preview. The roll path (handleRollShot) already does
+      // this; the preview path forgot to, hence the
+      // "(Could not preview prompt: composeSeedance: unknown mode 'auto')" bug.
+      const rawMode = shot.generation?.mode;
+      let resolvedMode = rawMode;
+      if (!rawMode || rawMode === "auto") {
+        const decision = NS.modeResolver?.resolveMode(shot, {
+          previousShotHasApprovedTake: false,
+          currentShotHasKeyframe: !!shot.keyframes?.startDataUrl,
+        });
+        resolvedMode = decision?.mode || "text_to_video";
+      }
+
       const composed = composer.composeSeedance({
         shot, cast, environment, project,
-        mode: shot.generation?.mode || "text_to_video",
+        mode: resolvedMode,
         assets: { extraAssets },
       });
       prompt = composed.prompt;
@@ -13239,6 +13268,23 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     s4: "Shot Editor",
     s5: "Finish",
   };
+  // Right-rail title defaults per screen. When the user navigates between
+  // screens, the shared #right-title element gets the per-screen default so
+  // it doesn't carry forward a previously-selected entity's name (e.g., the
+  // shot editor leaving "Aisha Bello · S04" on screen when the user goes
+  // back to Cast & Locations). Individual handlers (renderShotEditor) can
+  // still override the title once a specific entity is selected.
+  const RAIL_TITLES = {
+    s1: "Conversation history",
+    s2: "Bible details",
+    s3: "Storyboard",
+    s4: "Shot details",
+    s5: "Finish",
+  };
+  function resetRailTitle(screen) {
+    const railTitle = document.getElementById("right-title");
+    if (railTitle) railTitle.textContent = RAIL_TITLES[screen] || "Workspace";
+  }
   async function adaptBreadcrumb(activeScreen = "s2") {
     const crumb = document.getElementById("crumb");
     if (!crumb) return;
@@ -13478,10 +13524,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       t.addEventListener("click", () => {
         const sid = t.dataset.screen;
         adaptBreadcrumb(sid).catch(() => {});
+        resetRailTitle(sid);
         if (sid === "s3") renderStoryboard();
         else if (sid === "s5") renderFinishScreen();
       });
     });
+    // Reset rail title on first paint too — the v2 mockup starts with
+    // "Conversation history" hardcoded, which is right for s1 but stale
+    // after any screen switch back without our reset.
+    resetRailTitle("s1");
   }
 
   // Expose import for verify-build + future scripted-import use cases.
