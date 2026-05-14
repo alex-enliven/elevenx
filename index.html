@@ -6583,13 +6583,20 @@ const GLOBAL_NEGATIVE =
  *   - mindstudio.ai's timeline-prompting article
  *
  * Section order (each section is a [Label] block, separated by blank lines):
- *   [Aesthetic]       visual style + grade language
- *   [Storyline]       narrative context (why this shot matters)
- *   [Characters]      cast in frame, who they are, what they do
- *   [Environment]     location with critical props named
- *   [Action Sequence] beat-by-beat with internal timecodes + SFX callouts
- *   [Production Brief] camera + lens + lighting + duration + aspect
- *   [Negative Prompt] anti-patterns + repeat critical props "MUST be visible"
+ *   [Reference Images Attached]  labels for any refs (when reference_to_video)
+ *   [Style Canon]      project-level prose canon (since v3 — 2026-05-14)
+ *   [Aesthetic]        visual style + grade language (medium-aware since v3)
+ *   [Storyline]        narrative context (why this shot matters)
+ *   [Characters]       cast in frame, who they are, what they do
+ *   [Off-Frame]        characters present but not in this shot's frame
+ *   [Environment]      location with critical props named
+ *   [Action Sequence]  beat-by-beat with internal timecodes + SFX callouts
+ *   [Dialogue]         in-frame speakers (native lip-sync)
+ *   [Voiceover]        off-screen VO (audio overlaid post-hoc — not native)
+ *   [Production Brief] camera + lens + lighting + duration + aspect (medium-aware)
+ *   [Cast Distinctiveness] / [Identity Locks] / [Anti-Patterns]
+ *   [Known Failure Modes]
+ *   [Negative Prompt]  anti-patterns + repeat critical props "MUST be visible"
  *
  * Critical Seedance behavior we counter-engineer:
  *   • Missing props → repeat prop names in Action Sequence + Negative
@@ -6601,17 +6608,23 @@ const GLOBAL_NEGATIVE =
  * @param {object} input.shot       — parsed shot.yaml (flat, after normalization)
  * @param {object[]} input.cast     — resolved character bible entries (only those in this shot)
  * @param {object} input.environment — resolved environment bible entry for shot.location.location_id
+ * @param {object} [input.project]  — project row (medium, style_canon, default_shot_duration_seconds)
+ *                                    Defaults to live_action / 15s when absent for back-compat.
  * @param {object} [input.series]   — parent series.yaml (style bible)
  * @param {object} [input.episode]  — parent episode.yaml (audio plan, director vision)
  * @param {string} input.mode       — "text_to_video" | "image_to_video" | "reference_to_video"
- * @param {object} [input.assets]   — { startImageUrl, endImageUrl, referenceImageUrls[] }
+ * @param {object} [input.assets]   — { startImageUrl, endImageUrl, referenceImageUrls[],
+ *                                      extraAssets[] }  extraAssets are non-character refs:
+ *                                      [{ kind: "asset"|"environment", display_name, dataUrl, role }]
  * @returns {{ prompt: string, body: object, attachmentsUsed: object }}
  */
-function composeSeedance({ shot, cast, environment, series, episode, mode, assets }) {
+function composeSeedance({ shot, cast, environment, project, series, episode, mode, assets }) {
   if (!shot) throw new Error("composeSeedance: shot is required");
   if (!mode) throw new Error("composeSeedance: mode is required");
   cast = cast || [];
   assets = assets || {};
+  project = project || {};
+  const medium = project.medium || "live_action";
 
   // Collect "critical props" — environment props that MUST appear; we'll
   // repeat them in the action sequence + name them in the negative prompt.
@@ -6619,18 +6632,57 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
 
   const blocks = [];
 
-  // ── [Aesthetic] — visual + grade language ────────────────────────────
+  // ── [Style Canon] — project-level prose (v3) ─────────────────────────
+  // Authored by the director on the project. Seedance respects long-form
+  // style cues when placed early — and the canon lets a single sentence
+  // ("Premium stylized 3D animated dark-fantasy adventure for ages 10–14...")
+  // pin every shot to the same world.
+  if (project.style_canon && String(project.style_canon).trim()) {
+    blocks.push(`[Style Canon] ${String(project.style_canon).trim()}`);
+  }
+
+  // ── [Aesthetic] — visual + grade language, medium-aware (v3) ─────────
+  // The hard-coded "documentary-cinematic realism" line is wrong for
+  // animation. Each medium gets a different baseline; series style_bible
+  // tweaks ride on top. Animation skips the "film grain / skin texture"
+  // language entirely because those are live-action cues that nudge
+  // Seedance toward photo-real output.
   const style = series?.style_bible?.visual_grammar || {};
   const grade = series?.style_bible?.color_grade || {};
-  const aesthetic = [
-    "Documentary-cinematic realism",
-    style.lens_feel || "35mm equivalent lens, slight shallow depth",
-    "natural skin texture, subtle film grain, no over-smoothing",
-    grade.shadows ? `${grade.shadows} shadows` : null,
-    grade.midtones ? `${grade.midtones} midtones` : null,
-    "soft warm skin tones, slight green-cyan lift",
-  ].filter(Boolean).join(". ") + ".";
-  blocks.push(`[Aesthetic] ${aesthetic}`);
+  let aestheticParts;
+  if (medium === "animated_3d") {
+    aestheticParts = [
+      "Premium stylized 3D animation",
+      "expressive character animation with readable acting",
+      "polished PBR materials with stylized shading",
+      "cinematic staging and lighting",
+      "no photo-real skin pores, no live-action lens artifacts",
+    ];
+  } else if (medium === "animated_2d") {
+    aestheticParts = [
+      "Stylized 2D animation",
+      "clean linework with painterly shading",
+      "expressive limited-frame animation",
+      "no 3D depth tells, no photo-real rendering",
+    ];
+  } else if (medium === "documentary") {
+    aestheticParts = [
+      "Observational documentary realism",
+      "available light, no theatrical staging",
+      "subtle camera presence (handheld or locked)",
+      "natural skin texture, subtle grain",
+    ];
+  } else {
+    aestheticParts = [
+      "Documentary-cinematic realism",
+      style.lens_feel || "35mm equivalent lens, slight shallow depth",
+      "natural skin texture, subtle film grain, no over-smoothing",
+      grade.shadows ? `${grade.shadows} shadows` : null,
+      grade.midtones ? `${grade.midtones} midtones` : null,
+      "soft warm skin tones, slight green-cyan lift",
+    ];
+  }
+  blocks.push(`[Aesthetic] ${aestheticParts.filter(Boolean).join(". ")}.`);
 
   // ── [Storyline] — narrative context ──────────────────────────────────
   const m = shot.the_moment || {};
@@ -6699,14 +6751,18 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
   // with internal timecodes for the action progression. SFX callouts are
   // FRONT-LOADED to avoid the "silence at start" failure mode.
   //
-  // dur is the RENDER duration (clamped to Seedance policy floor of 15s),
-  // not the editorial duration in the YAML. The internal beat timecodes
-  // must match what Seedance actually generates, otherwise the prompt
-  // says "0-3s beat" while the body asks for 15s and the model gets
+  // dur is the RENDER duration. v3 resolution order:
+  //   1. shot.timecode.duration_seconds_override  (explicit per-shot)
+  //   2. shot.timecode.duration_seconds           (authored shot duration)
+  //   3. project.default_shot_duration_seconds    (per-project default)
+  //   4. 8                                        (safe last-resort fallback)
+  // Then clamped to Seedance's [4, 15] hard range. The internal beat
+  // timecodes must match what Seedance actually generates, otherwise the
+  // prompt says "0-3s beat" while the body asks for 15s and the model gets
   // confused mid-clip.
-  const rawDur = shot.timecode?.duration_seconds;
-  const dur = clampDuration(rawDur);
-  const safeDur = (typeof dur === "number") ? dur : 15;
+  const rawDur = resolveShotDuration(shot, project);
+  const dur = clampDuration(rawDur, project);
+  const safeDur = (typeof dur === "number") ? dur : 8;
   const camera = shot.camera || {};
   const audio = shot.audio || {};
   const actionBeat = composeActionBeat({ shot, cast, environment, criticalProps, camera, audio, duration: safeDur });
@@ -6726,8 +6782,31 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
     blocks.push(`[Dialogue] Delivered with native lip-sync, normal speaking pace:\n${dialogueLines.join("\n")}`);
   }
 
+  // ── [Voiceover] — off-screen narration (v3) ──────────────────────────
+  // VO is NOT generated by Seedance — we overlay it with ElevenLabs v3
+  // post-hoc. But the model needs to know VO is planned so it (a) leaves
+  // audible space (not packing the clip with dialogue or loud SFX over
+  // the VO timeline) and (b) doesn't render the speaker visually when
+  // they're not in cast_in_frame.
+  const voiceover = Array.isArray(shot.voiceover) ? shot.voiceover : [];
+  if (voiceover.length > 0) {
+    const lines = voiceover.map(v => {
+      const speakerName = resolveVoiceoverSpeakerName(v, cast);
+      const timing = (v.start_at_seconds != null) ? ` (starts at ${v.start_at_seconds}s)` : "";
+      return `${speakerName}${timing}: "${String(v.text || "").trim()}"`;
+    }).filter(Boolean);
+    if (lines.length > 0) {
+      blocks.push(
+        `[Voiceover] These lines will be overlaid as VOICE-OVER post-production — do NOT render a visible speaker for them. Leave audible space for the VO timeline. Keep native audio limited to ambient + SFX:\n${lines.join("\n")}`
+      );
+    }
+  }
+
   // ── [Production Brief] — camera + lens + lighting + duration ─────────
-  const prodParts = [
+  // Medium-aware (v3): live_action keeps "practical lighting / handheld breath"
+  // realism cues. Animation strips those (they nudge Seedance toward photo-real
+  // output) and adds animation-appropriate language instead.
+  const prodCore = [
     camera.framing ? `${camera.framing}` : "medium shot",
     camera.lens ? `${camera.lens}` : "35mm equivalent",
     camera.depth ? `${camera.depth} depth of field` : null,
@@ -6735,9 +6814,25 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
     `aspect ${camera.aspect_ratio || "16:9"}`,
     `${safeDur} seconds`,
     `720p`,
-    "practical lighting only — no studio kit",
-    "handheld breath but no jitter (unless explicitly directed otherwise)",
-  ].filter(Boolean);
+  ];
+  let prodTail;
+  if (medium === "animated_3d" || medium === "animated_2d") {
+    prodTail = [
+      "stylized lighting matched to the project style canon",
+      "controlled camera (no live-action handheld unless explicitly directed)",
+    ];
+  } else if (medium === "documentary") {
+    prodTail = [
+      "available light only",
+      "subtle observational camera presence",
+    ];
+  } else {
+    prodTail = [
+      "practical lighting only — no studio kit",
+      "handheld breath but no jitter (unless explicitly directed otherwise)",
+    ];
+  }
+  const prodParts = [...prodCore, ...prodTail].filter(Boolean);
   blocks.push(`[Production Brief] ${prodParts.join(", ")}.`);
 
   // ── Cast lockdown / anti-patterns / watch-points ─────────────────────
@@ -6788,6 +6883,10 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
   blocks.push(`[Negative Prompt] ${negative}`);
 
   // ── Reference labelling (only for reference_to_video) ────────────────
+  // The caller provides assets.referenceImageUrls (the actual image URLs
+  // attached to the API call, in order). We label each one. The first
+  // labels go to cast portraits (cycling angles), then any remaining slots
+  // go to assets.extraAssets[] (style frames / props / env wides etc.).
   if (mode === "reference_to_video" && (assets.referenceImageUrls?.length || 0) > 0) {
     const refs = assets.referenceImageUrls;
     const labels = [];
@@ -6804,6 +6903,18 @@ function composeSeedance({ shot, cast, environment, series, episode, mode, asset
           idx++;
         }
       }
+    }
+    // Now label any extraAssets passed by the caller (style frames, props,
+    // environment wides). These represent the v3 multi-asset references[]
+    // array — they're appended AFTER cast portraits so the model binds
+    // identities first.
+    for (const a of (assets.extraAssets || [])) {
+      if (idx >= refs.length) break;
+      const kindLabel = a.kind === "asset"
+        ? `${a.kind_subtype || "style asset"}`
+        : a.kind === "environment" ? "environment plate" : "reference";
+      labels.push(`Image ${idx + 1}: ${a.display_name || a.id || "reference"} — ${kindLabel}${a.role ? ` (${a.role})` : ""}`);
+      idx++;
     }
     if (labels.length > 0) {
       // Prepend reference labels at the very top so the model binds refs first
@@ -7021,22 +7132,68 @@ function formatCastCanon(c, shot) {
 }
 
 /**
- * Seedance accepts integer 4..15 OR "auto". We floor at 15 by policy:
- * Seedance 2.0's expressive headroom (held silences, exhale-then-speak,
- * micro-reactions) only shows up when given the full canvas. Short renders
- * waste ~80% of the model's per-shot capability. Editorial cuts happen
- * downstream in the NLE via FCPXML, not at generation time — always
- * generate long, cut short. To deliberately request a shorter render,
- * pass "auto" or override via shot.prompt_engineering.seedance_param_overrides.duration.
+ * Resolve a shot's render duration with project-default fallback.
+ *
+ * Yesterday's policy floored at 15s globally for "The Standup" — but the
+ * Lionn teaser averages 5-7s per shot and a 15s floor would push the
+ * total runtime from 60s to 165s. v3 moves the policy to per-project:
+ * each project sets default_shot_duration_seconds (Standup keeps 15,
+ * Lionn defaults to 6 for teasers).
+ *
+ * Resolution order:
+ *   1. shot.timecode.duration_seconds_override  (explicit per-shot)
+ *   2. shot.timecode.duration_seconds           (authored shot duration)
+ *   3. project.default_shot_duration_seconds    (per-project default)
+ *   4. 8                                        (safe last-resort fallback)
  */
-function clampDuration(d) {
+function resolveShotDuration(shot, project) {
+  const override = shot?.timecode?.duration_seconds_override;
+  if (override != null && override !== "") return override;
+  const authored = shot?.timecode?.duration_seconds;
+  if (authored != null && authored !== "") return authored;
+  const projectDefault = project?.default_shot_duration_seconds;
+  if (projectDefault != null && projectDefault !== "") return projectDefault;
+  return 8;
+}
+
+/**
+ * Seedance accepts integer 4..15 OR "auto". Clamp to that hard range.
+ *
+ * The per-project policy floor (e.g., Standup's 15s) is captured in
+ * project.default_shot_duration_seconds — clampDuration just enforces
+ * the Seedance API's own limits and coerces strings/floats. If a project
+ * asks for 30s (above ceiling), we clamp to 15. If a shot override asks
+ * for 2s (below floor), we clamp to 4.
+ */
+function clampDuration(d, project) {
   if (d === "auto") return "auto";
-  if (d == null) return 15;
+  if (d == null) {
+    // Last-resort fallback — use project default if present, else 8.
+    return Number(project?.default_shot_duration_seconds) || 8;
+  }
   const n = Math.round(Number(d));
-  if (Number.isNaN(n)) return 15;
-  if (n < 15) return 15;     // policy floor — give the model its full canvas
-  if (n > 15) return 15;     // Seedance API ceiling
+  if (Number.isNaN(n)) return Number(project?.default_shot_duration_seconds) || 8;
+  if (n < 4) return 4;   // Seedance hard minimum
+  if (n > 15) return 15; // Seedance hard maximum
   return n;
+}
+
+/**
+ * Resolve a voiceover entry's speaker into a human-readable name.
+ * speaker_id can be a character_id (lookup against cast) or the literal
+ * "narrator" / "vo" / "off_screen" placeholders.
+ */
+function resolveVoiceoverSpeakerName(vo, cast) {
+  if (!vo) return "Narrator";
+  const id = String(vo.speaker_id || "").trim().toLowerCase();
+  if (!id || id === "narrator" || id === "vo" || id === "off_screen") return "Narrator";
+  const match = (cast || []).find(c =>
+    (c.character_id || c.id || "").toLowerCase() === id
+    || (c.display_name || "").toLowerCase() === id
+  );
+  if (match) return match.display_name || match.character_id || match.id;
+  // Fallback: prettify the id
+  return id.split(/[_\s]+/).map(s => s.charAt(0).toUpperCase() + s.slice(1)).join(" ");
 }
 
 /**
@@ -7215,7 +7372,9 @@ function composeEnvironmentReferencePrompt(environment, kind = "wide") {
 
 /* === auto-exposed to ElevenX namespace === */
 window.ElevenX.composeSeedance = composeSeedance;
+window.ElevenX.resolveShotDuration = resolveShotDuration;
 window.ElevenX.clampDuration = clampDuration;
+window.ElevenX.resolveVoiceoverSpeakerName = resolveVoiceoverSpeakerName;
 window.ElevenX.composeCastReferencePrompt = composeCastReferencePrompt;
 window.ElevenX.composeCastReferenceEditPrompt = composeCastReferenceEditPrompt;
 window.ElevenX.composeEnvironmentReferenceEditPrompt = composeEnvironmentReferenceEditPrompt;
@@ -7864,12 +8023,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
  * elevenx/app/storage.js — IndexedDB wrapper for the browser app.
  * One DB, separate stores. Persists across reloads.
  *
- * Schema v2 (multi-project, since 2026-05-14):
- *   - projects     (id, display_name, description?, created_at, is_seeded)
+ * Schema v3 (Tier 1 author surface, since 2026-05-14):
+ *   - projects     (id, display_name, description?, medium, logline?, style_canon?,
+ *                   default_shot_duration_seconds, created_at, is_seeded)
  *   - settings     (kv: worker_url, fal_health, cost_total, active_project_id, ...)
  *   - characters   (cast bible — project-scoped via row.project_id)
  *   - environments (locations — project-scoped)
- *   - shots        (project-scoped)
+ *   - assets       (style frames / props / FX sheets — project-scoped)
+ *   - shots        (project-scoped; gains optional voiceover[] + references[]
+ *                   + timecode.duration_seconds_override)
  *   - takes        (project-scoped immutable blobs)
  *   - conversations(project-scoped AI Producer chat history)
  *
@@ -7900,29 +8062,44 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 (() => {
   const NS = (window.ElevenX = window.ElevenX || {});
   const DB_NAME = "elevenx";
-  const DB_VER  = 2;
+  const DB_VER  = 3;
 
   // The stores that get the project_id filter treatment.
-  const PROJECT_SCOPED = ["characters", "environments", "shots", "takes", "conversations"];
+  const PROJECT_SCOPED = ["characters", "environments", "assets", "shots", "takes", "conversations"];
 
   const STORES = {
     settings:     { keyPath: "key" },
     projects:     { keyPath: "id" },
     characters:   { keyPath: "id" },
     environments: { keyPath: "id" },
+    assets:       { keyPath: "id" },   // v3: style frames, props, FX sheets
     shots:        { keyPath: "id" },
     takes:        { keyPath: "id" },
     conversations:{ keyPath: "id", autoIncrement: true },
   };
 
   // The bundled seed project. Created in v2 migration AND on first run
-  // if missing (idempotent).
+  // if missing (idempotent). v3 added medium + default_shot_duration_seconds.
   const SEEDED_PROJECT = {
     id: "the_standup",
     display_name: "The Standup",
     description: "Episode 1 of the Enliven psychological-safety series. 4 leads, 2 environments, 11 shots.",
     is_seeded: true,
     created_at: "2026-05-13",
+    medium: "live_action",
+    logline: "Four colleagues at a Monday standup. Aisha makes a proposal. Tom cuts her off. Maya watches. The room misses the moment that mattered.",
+    style_canon: "Modern workplace drama, observational tone. Practical lighting from windows + overhead office fluorescents. Naturalistic performance — no theatrical reactions. Mid-2020s European corporate environment: glass meeting pods, laptops open, coffee cups. Cinematic 35mm camera, locked-off framings (no handheld unless explicitly directed). Audio is grounded: HVAC hum, distant office sounds, clear dialogue. Emotional beats are subtext — what people DON'T say carries the scene.",
+    default_shot_duration_seconds: 15,
+  };
+
+  // Sensible defaults applied to legacy v1/v2 project rows during the v3 upgrade.
+  // Standup gets its own bespoke values above; any other v1/v2 project gets
+  // these baseline values so the composer has something to read.
+  const V3_LEGACY_PROJECT_DEFAULTS = {
+    medium: "live_action",
+    logline: "",
+    style_canon: "",
+    default_shot_duration_seconds: 15, // preserve historical behavior — yesterday's policy floor
   };
 
   // In-memory cache of active project id. First call to ensureActiveProject()
@@ -7948,6 +8125,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         // v1 → v2: backfill project_id on every existing row + seed "the_standup".
         if (oldVersion < 2) {
           // Mark all existing rows in project-scoped stores as belonging to the_standup.
+          // Note: at the v1→v2 step, the v2 `PROJECT_SCOPED` list (which already
+          // includes the v3 `assets` store) is fine to iterate — assets just
+          // doesn't have rows yet at the v1 boundary.
           for (const store of PROJECT_SCOPED) {
             if (!db.objectStoreNames.contains(store)) continue;
             const os = txn.objectStore(store);
@@ -7969,6 +8149,30 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           // Set the active project so the first v2 boot doesn't hit "no active project".
           const settingsOs = txn.objectStore("settings");
           settingsOs.put({ key: "active_project_id", value: "the_standup", updatedAt: Date.now() });
+        }
+
+        // v2 → v3: every existing project row gets the new author-surface fields
+        // (medium / logline / style_canon / default_shot_duration_seconds). The
+        // Standup row is patched to its bespoke values; everyone else gets the
+        // legacy defaults so the composer has non-null reads.
+        if (oldVersion < 3) {
+          const projOs = txn.objectStore("projects");
+          const cur = projOs.openCursor();
+          cur.onsuccess = (ev) => {
+            const c = ev.target.result;
+            if (!c) return;
+            const row = c.value;
+            let dirty = false;
+            const target = (row.id === SEEDED_PROJECT.id) ? SEEDED_PROJECT : V3_LEGACY_PROJECT_DEFAULTS;
+            for (const k of ["medium", "logline", "style_canon", "default_shot_duration_seconds"]) {
+              if (row[k] === undefined || row[k] === null) {
+                row[k] = target[k];
+                dirty = true;
+              }
+            }
+            if (dirty) c.update(row);
+            c.continue();
+          };
         }
       };
 
@@ -8097,8 +8301,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       /**
        * Create a new project. `id` is slugified from display_name if absent.
        * Returns the inserted row.
+       *
+       * Author-surface fields (medium, logline, style_canon, default_shot_duration_seconds)
+       * are optional and fall back to sane defaults so the composer has
+       * non-null reads. The defaults intentionally differ from Standup's so
+       * a freshly-created project doesn't inherit Standup's specifics:
+       *   - medium: "live_action" (most users start here; switch to animated_3d for Lionn)
+       *   - default_shot_duration_seconds: 8 (a teaser-friendly mid-range)
        */
-      async create({ id, display_name, description }) {
+      async create({ id, display_name, description, medium, logline, style_canon, default_shot_duration_seconds }) {
         const slug = id || display_name
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, "_")
@@ -8111,11 +8322,34 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           id: slug,
           display_name: display_name || slug,
           description: description || "",
+          medium: medium || "live_action",
+          logline: logline || "",
+          style_canon: style_canon || "",
+          default_shot_duration_seconds: Number(default_shot_duration_seconds) || 8,
           is_seeded: false,
           created_at: new Date().toISOString().slice(0, 10),
         };
         await Storage.put("projects", row);
         return row;
+      },
+      /**
+       * Patch an existing project row in place. Allowed keys are the author-surface
+       * fields + description + display_name. id / is_seeded / created_at are immutable.
+       */
+      async update(id, patch) {
+        const existing = await Storage.get("projects", id);
+        if (!existing) throw new Error(`No such project "${id}"`);
+        const ALLOWED = ["display_name", "description", "medium", "logline", "style_canon", "default_shot_duration_seconds"];
+        const merged = { ...existing };
+        for (const k of ALLOWED) {
+          if (k in patch) merged[k] = patch[k];
+        }
+        // Coerce numbers
+        if (merged.default_shot_duration_seconds != null) {
+          merged.default_shot_duration_seconds = Number(merged.default_shot_duration_seconds) || existing.default_shot_duration_seconds || 8;
+        }
+        await Storage.put("projects", merged);
+        return merged;
       },
       /** Set active project. Returns the new active id. */
       async setActive(id) {
@@ -8282,6 +8516,41 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       }
       await Storage.put(storeName, { ...seed, ...preserved });
     }
+  }
+
+  // v3: resolve the shot.references[] array into a list of asset descriptors
+  // the composer + roll path can use. Each ref is either a character
+  // (extra portrait), an environment (extra plate beyond shot.location), or
+  // an asset (style frame / prop / FX sheet).
+  //
+  // Returns: [{ kind, kind_subtype, id, display_name, dataUrl, role }, ...]
+  function resolveExtraAssets(shotRefs, { characters, environments, assets }) {
+    const out = [];
+    for (const r of (shotRefs || [])) {
+      if (!r || !r.kind || !r.id) continue;
+      if (r.kind === "character") {
+        const c = characters.find(x => x.id === r.id);
+        if (!c) continue;
+        // Pick the first available ref image as the rep portrait
+        const url = refUrlFor(c, "three_quarter") || refUrlFor(c, "head_on") || refUrlFor(c, "full_body");
+        out.push({ kind: "character", id: c.id, display_name: c.display_name, dataUrl: url, role: r.role || "support" });
+      } else if (r.kind === "environment") {
+        const e = environments.find(x => x.id === r.id);
+        if (!e) continue;
+        const refs = e.refs?.[ACTIVE_IMAGE_MODEL] || e.refs?.seedream || {};
+        const url = refs.wide?.dataUrl || refs.detail?.dataUrl || null;
+        out.push({ kind: "environment", id: e.id, display_name: e.display_name, dataUrl: url, role: r.role || "support" });
+      } else if (r.kind === "asset") {
+        const a = assets.find(x => x.id === r.id);
+        if (!a) continue;
+        const url = a.refs?.[ACTIVE_IMAGE_MODEL]?.primary?.dataUrl
+                 || a.refs?.seedream?.primary?.dataUrl
+                 || a.refs?.gpt?.primary?.dataUrl
+                 || null;
+        out.push({ kind: "asset", kind_subtype: a.kind, id: a.id, display_name: a.display_name, dataUrl: url, role: r.role || "support" });
+      }
+    }
+    return out;
   }
 
   // Resolve a single ref URL for a character or environment given an
@@ -8573,6 +8842,153 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       empty: envs.length === 0,
       label: envs.length === 0 ? "Add your first environment" : "Add environment",
     }));
+  }
+
+  // ─── Style Assets (v3) ──────────────────────────────────────────────
+  // Non-character, non-environment references: style frames, props,
+  // FX sheets, UI sheets. Each asset has a `kind` subtype and a single
+  // primary image (no chained 3-angle pattern).
+  const ASSET_KINDS = [
+    { value: "style_frame", label: "Style frame" },
+    { value: "fx_sheet",    label: "FX / atmosphere" },
+    { value: "prop",        label: "Prop / weapon" },
+    { value: "ui_sheet",    label: "UI / typography" },
+    { value: "moodboard",   label: "Moodboard" },
+  ];
+
+  async function renderAssetsTab() {
+    const assets = await Storage.getAll("assets");
+    const grid = $("#elx-asset-grid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    for (const a of assets) {
+      grid.appendChild(buildAssetCard(a));
+    }
+    grid.appendChild(buildAddTile({
+      kind: "asset",
+      empty: assets.length === 0,
+      label: assets.length === 0 ? "Add your first style asset" : "Add style asset",
+    }));
+    const ac = $("#elx-asset-count"); if (ac) ac.textContent = assets.length;
+  }
+
+  function buildAssetCard(a) {
+    const url = a.refs?.[ACTIVE_IMAGE_MODEL]?.primary?.dataUrl
+             || a.refs?.seedream?.primary?.dataUrl
+             || a.refs?.gpt?.primary?.dataUrl
+             || null;
+    const kindLabel = (ASSET_KINDS.find(k => k.value === a.kind)?.label) || a.kind || "asset";
+    const hasRef = !!url;
+    const card = document.createElement("div");
+    card.className = `cast-card cast-card--asset cast-card--${ACTIVE_IMAGE_MODEL}`;
+    card.dataset.id = a.id;
+    card.innerHTML = `
+      <div class="cast-card__portrait" style="${url ? `background-image:url('${url}'); background-size:cover; background-position:center;` : ''}">
+        ${url ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(a.id).toUpperCase()}</div>`}
+        <span class="cast-card__hero-label">${esc(kindLabel)}</span>
+      </div>
+      <div class="cast-card__name">${esc(a.display_name)}</div>
+      <div class="cast-card__role">${esc(a.description || kindLabel)}</div>
+      <div class="cast-card__palette">${(a.palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
+      <div class="cast-card__meta">${hasRef ? '<span style="color:#4ade80">ready</span>' : '<span style="color:#9a9aab">no image yet</span>'}</div>
+      <div class="cast-card__bottom">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-asset" data-asset-id="${esc(a.id)}">${hasRef ? "Re-roll" : "Generate"}</button>
+      </div>
+    `;
+    return card;
+  }
+
+  function showCreateAssetModal() {
+    const kindOptions = ASSET_KINDS.map(k => `<option value="${esc(k.value)}">${esc(k.label)}</option>`).join("");
+    const formHtml = `
+      ${fieldHtml("Display name", `<input name="display_name" type="text" required placeholder="e.g. Violet Shadow Fog FX" style="${FIELD_INPUT_STYLE}">`)}
+      ${fieldHtml(
+        "Kind",
+        `<select name="kind" style="${FIELD_INPUT_STYLE}">${kindOptions}</select>`,
+        "Drives the prompt template — fx_sheet emphasizes atmosphere, prop emphasizes the object on neutral ground, style_frame is a full-frame mood reference."
+      )}
+      ${fieldHtml(
+        "Description / prompt seed",
+        `<textarea name="description" rows="4" placeholder="Detailed visual description used when generating this asset. Example: 'Violet shadow fog rolling low over cracked stone, lion-shaped wisps in the smoke, moonlit indigo palette, antique gold rim light, painterly stylized 3D animated dark-fantasy look.'" style="${FIELD_INPUT_STYLE} resize:vertical;"></textarea>`,
+        "This is the primary content of the generation prompt for this asset, combined with the project's style canon."
+      )}
+      ${fieldHtml(
+        "Palette (optional)",
+        `<input name="palette" type="text" placeholder="violet, indigo, antique gold" style="${FIELD_INPUT_STYLE}">`,
+        "Comma-separated. Shown as swatches on the card."
+      )}
+    `;
+    openFormModal({
+      title: "Add style asset",
+      formHtml,
+      onSubmit: async (form) => {
+        const fd = new FormData(form);
+        const display_name = String(fd.get("display_name") || "").trim();
+        if (!display_name) { toast("Display name is required", { tone: "warn" }); return false; }
+        const id = await ensureUniqueId("assets", slugifyId("asset", display_name));
+        const row = {
+          id,
+          display_name,
+          kind: String(fd.get("kind") || "style_frame"),
+          description: String(fd.get("description") || "").trim(),
+          palette: splitList(fd.get("palette")),
+          refs: { seedream: {}, gpt: {} },
+          chosenModel: null,
+          created_at: new Date().toISOString().slice(0, 10),
+        };
+        await Storage.put("assets", row);
+        toast(`Added "${display_name}"`, { tone: "ok" });
+        await renderAssetsTab();
+      },
+    });
+  }
+
+  // Generate the single primary image for a style asset. Uses the project's
+  // style canon as the prefix + the asset's description. Defaults to GPT
+  // Image 2 (the ACTIVE_IMAGE_MODEL), Seedream as fallback.
+  async function handleGenerateAsset(assetId) {
+    if (!State.fal && !State.openai) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
+    const asset = await Storage.get("assets", assetId);
+    if (!asset) return;
+    const project = await Storage.Projects.getActive();
+    const styleCanon = (project?.style_canon || "").trim();
+
+    const prompt = [
+      styleCanon ? `[Style Canon] ${styleCanon}` : null,
+      `[Subject] ${asset.description || asset.display_name}.`,
+      asset.palette?.length ? `[Palette] ${asset.palette.join(", ")}.` : null,
+      `[Format] Single still image, full-frame composition suitable as a reference. ${asset.kind === "prop" ? "Object isolated on neutral or contextually appropriate ground." : "Mood-forward, fully composed scene."}`,
+    ].filter(Boolean).join("\n\n");
+
+    setGPS(true, `Generating style asset <span class="mono">${esc(asset.display_name)}</span>`, "gpt-image-2 · style-canon-anchored", 30);
+    try {
+      let dataUrl, model;
+      if (ACTIVE_IMAGE_MODEL === "gpt" && State.openai) {
+        const result = await State.openai.imageGenerate({ prompt, size: "1024x1024", quality: "medium" });
+        dataUrl = result.dataUrl;
+        model = "gpt";
+      } else if (State.fal) {
+        const result = await State.fal.seedreamTextToImage({ prompt });
+        dataUrl = result.dataUrl;
+        model = "seedream";
+      } else {
+        throw new Error("No image client available — set Worker URL");
+      }
+      asset.refs = asset.refs || { seedream: {}, gpt: {} };
+      asset.refs[model] = asset.refs[model] || {};
+      asset.refs[model].primary = { dataUrl, generatedAt: Date.now() };
+      asset.chosenModel = model;
+      await Storage.put("assets", asset);
+      const costGuess = model === "gpt" ? 0.042 : 0.05;
+      await trackCost(costGuess, `asset ${assetId}`);
+      toast(`Generated "${asset.display_name}"`, { tone: "ok" });
+      await renderAssetsTab();
+    } catch (err) {
+      toast(`Asset gen failed: ${err.message}`, { tone: "err", duration: 8000 });
+      console.error(err);
+    } finally {
+      setGPS(false);
+    }
   }
 
   // Generic "+ Add" tile used at the end of cast/loc/storyboard grids.
@@ -9385,28 +9801,63 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (!shot) return;
     const take = (shot.takes || []).find(t => t.id === takeId);
     if (!take) return;
-    // Find the speaking character + their voice id
-    const dialogueLines = (shot.cast_in_frame || [])
-      .map(c => ({ id: c.character_id, line: c.dialogue?.en || (typeof c.dialogue === "string" ? c.dialogue : ""), deliveryNote: c.delivery_note }))
-      .filter(d => d.line && d.line.trim());
-    if (dialogueLines.length === 0) {
-      toast("This shot has no dialogue lines — nothing to overlay.", { tone: "warn" });
+
+    // v3: unified line list — in-frame dialogue takes priority (native lip-sync
+    // beats post-hoc overlay when both could work), then off-screen voiceover.
+    // Each line carries { source, speakerId, text, deliveryNote }.
+    const inFrameLines = (shot.cast_in_frame || [])
+      .map(c => ({
+        source: "dialogue",
+        speakerId: c.character_id,
+        text: c.dialogue?.en || (typeof c.dialogue === "string" ? c.dialogue : ""),
+        deliveryNote: c.delivery_note || null,
+      }))
+      .filter(d => d.text && d.text.trim());
+    const voiceoverLines = (shot.voiceover || [])
+      .map(v => ({
+        source: "voiceover",
+        speakerId: v.speaker_id || "narrator",
+        text: String(v.text || "").trim(),
+        deliveryNote: v.delivery_note || null,
+      }))
+      .filter(d => d.text);
+    const allLines = [...inFrameLines, ...voiceoverLines];
+    if (allLines.length === 0) {
+      toast("This shot has no dialogue or voiceover lines — nothing to overlay.", { tone: "warn" });
       return;
     }
-    // Single-speaker shot: use that character's voice id. Multi-speaker:
-    // generate one at a time (use the first for MVP; expand later).
+    const firstLine = allLines[0];
+
+    // Resolve voice id. For cast speakers, look up the bible. For "narrator"
+    // or any unknown id, prompt the director — there's no character row to
+    // hang a voice_id off, so we store the inputted id on the shot itself.
     const characters = await Storage.getAll("characters");
-    const firstLine  = dialogueLines[0];
-    const character  = characters.find(c => c.id === firstLine.id);
-    const voiceId    = character?.voice?.elevenlabs_fallback?.voice_id;
+    const character  = characters.find(c => c.id === firstLine.speakerId);
+    const isNarrator = !character;  // VO with no matching cast row → narrator
+    const speakerDisplay = character?.display_name || (firstLine.speakerId === "narrator" ? "Narrator" : firstLine.speakerId);
+
+    let voiceId = character?.voice?.elevenlabs_fallback?.voice_id;
+    // Narrator lookups: keep a per-shot fallback in shot.voiceover[].voice_id
+    // so the director doesn't have to re-paste the id every roll.
+    if (isNarrator) {
+      const voEntry = (shot.voiceover || []).find(v => (v.speaker_id || "narrator") === firstLine.speakerId);
+      voiceId = voEntry?.voice_id || voiceId;
+    }
     if (!voiceId || voiceId === "TBD" || voiceId === "") {
       const enteredVoiceId = prompt(
-        `${character?.display_name || firstLine.id}'s voice ID isn't set in the cast bible (voice.elevenlabs_fallback.voice_id is "${voiceId || "missing"}").\n\nPaste an ElevenLabs voice ID to use for this take:`,
+        `${speakerDisplay}'s voice ID isn't set ${isNarrator ? "for this voiceover" : "in the cast bible (voice.elevenlabs_fallback.voice_id)"}.\n\nPaste an ElevenLabs voice ID to use:`,
         ""
       );
       if (!enteredVoiceId) return;
-      // Save it back to the character for future use
-      if (character) {
+      // Save back to the right place so future rolls don't re-prompt
+      if (isNarrator) {
+        shot.voiceover = (shot.voiceover || []).map(v =>
+          (v.speaker_id || "narrator") === firstLine.speakerId
+            ? { ...v, voice_id: enteredVoiceId.trim() }
+            : v
+        );
+        await Storage.put("shots", shot);
+      } else if (character) {
         character.voice = character.voice || {};
         character.voice.elevenlabs_fallback = character.voice.elevenlabs_fallback || {};
         character.voice.elevenlabs_fallback.voice_id = enteredVoiceId.trim();
@@ -9416,9 +9867,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
 
     State.activeJobs++;
-    setGPS(true, `Generating v3 overlay for <span class="mono">${esc(shotId)}</span>`, `${character.display_name} · ${firstLine.line.length} chars`, 30);
+    setGPS(true, `Generating v3 overlay for <span class="mono">${esc(shotId)}</span>`, `${speakerDisplay} · ${firstLine.source} · ${firstLine.text.length} chars`, 30);
     try {
-      const voice_settings = {
+      const voice_settings = isNarrator ? {
+        stability: 0.5, similarity_boost: 0.75, style: 0.4, use_speaker_boost: true,
+      } : {
         stability:        character.voice.elevenlabs_fallback.stability ?? 0.5,
         similarity_boost: character.voice.elevenlabs_fallback.similarity ?? 0.75,
         style:            character.voice.elevenlabs_fallback.style ?? 0.5,
@@ -9426,24 +9879,27 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       };
       const result = await State.eleven.textToSpeech({
         voice_id: voiceId,
-        text: firstLine.line,
+        text: firstLine.text,
         voice_settings,
       });
-      // Persist on the take
+      // Persist on the take. The schema now carries `source` so the UI can
+      // show "VO" vs "lip-sync" badges later.
       take.audioOverlay = {
         dataUrl: result.dataUrl,
-        characterId: firstLine.id,
+        characterId: firstLine.speakerId,
+        speakerDisplay,
+        source: firstLine.source,                 // "dialogue" | "voiceover"
         voiceId,
         modelId: result.model_id,
-        text: firstLine.line,
+        text: firstLine.text,
         deliveryNote: firstLine.deliveryNote || null,
         byteSize: result.byteSize,
         cost_usd: result.cost_usd_estimated,
         generated_at: Date.now(),
       };
       await Storage.put("shots", shot);
-      await trackCost(result.cost_usd_estimated || 0, `elevenlabs v3 ${shotId}/${character.display_name}`);
-      toast(`Voice overlay ready (${character.display_name})`);
+      await trackCost(result.cost_usd_estimated || 0, `elevenlabs v3 ${shotId}/${speakerDisplay}`);
+      toast(`${firstLine.source === "voiceover" ? "Voiceover" : "Voice overlay"} ready (${speakerDisplay})`);
       if (State.activeShotId === shotId) renderShotEditor(shotId);
     } catch (err) {
       console.error("[eleven]", err);
@@ -9510,9 +9966,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (!shot) return;
     const characters = await Storage.getAll("characters");
     const envs       = await Storage.getAll("environments");
+    const allAssets  = await Storage.getAll("assets");
+    const project    = await Storage.Projects.getActive();
 
     const castInFrame = (shot.cast_in_frame || []).map(c => characters.find(x => x.id === c.character_id)).filter(Boolean);
     const environment = envs.find(x => x.id === shot.location?.location_id);
+    // v3 multi-asset references — style frames / props / extra environments
+    // the director attached beyond the primary location + cast_in_frame.
+    const shotRefs = Array.isArray(shot.references) ? shot.references : [];
+    const extraAssets = resolveExtraAssets(shotRefs, { characters, environments: envs, assets: allAssets });
 
     // Resolve mode
     const previousShot = shot.shot_number ? (await Storage.getAll("shots")).find(x => x.shot_number === shot.shot_number - 1) : null;
@@ -9559,14 +10021,24 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         }
         if (assets.referenceImageUrls.length >= 9) break;
       }
+      // v3: append extra-asset dataUrls AFTER cast portraits (identity locks first).
+      const extrasWithUrls = extraAssets.filter(a => a.dataUrl);
+      for (const a of extrasWithUrls) {
+        if (assets.referenceImageUrls.length >= 9) break;
+        assets.referenceImageUrls.push(a.dataUrl);
+      }
       if (assets.referenceImageUrls.length === 0) {
-        toast("Reference-to-video needs cast refs first. Generate them in the Cast tab.", { tone: "warn" });
+        toast("Reference-to-video needs cast refs or extra references first. Generate them in the Cast / Style Assets tabs.", { tone: "warn" });
         return;
       }
     }
+    // Surface the labeled extras to the composer so it can write a clear
+    // [Reference Images Attached] block even when extras have no actual
+    // image yet (the composer will skip unlabeled slots gracefully).
+    assets.extraAssets = extraAssets;
 
     const composed = composer.composeSeedance({
-      shot, cast: castInFrame, environment, mode: resolved.mode, assets,
+      shot, cast: castInFrame, environment, project, mode: resolved.mode, assets,
     });
 
     State.activeJobs++;
@@ -9815,6 +10287,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "create-character")   showCreateCharacterModal();
     else if (action === "create-environment") showCreateEnvironmentModal();
     else if (action === "create-shot")        showCreateShotModal();
+    else if (action === "create-asset")       showCreateAssetModal();
+    else if (action === "gen-asset")          handleGenerateAsset(target.dataset.assetId);
   });
 
   // ─── Inject missing DOM hooks into mockup ───────────────────────────
@@ -9830,6 +10304,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           <div class="seg seg--filter" data-comment-anchor="s2-toggle">
             <button class="seg__btn is-active" data-s2-tab="cast">Cast <span class="count" id="elx-cast-count">0</span></button>
             <button class="seg__btn" data-s2-tab="loc">Locations <span class="count" id="elx-loc-count">0</span></button>
+            <button class="seg__btn" data-s2-tab="asset">Style <span class="count" id="elx-asset-count">0</span></button>
           </div>
           <div class="s2__batch" id="elx-batch-bar">
             <span class="s2__batch-label">Batch:</span>
@@ -9841,17 +10316,19 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         </div>
         <div class="cast-grid s2__grid" id="elx-cast-grid"></div>
         <div class="loc-grid s2__grid"  id="elx-loc-grid"  style="display:none"></div>
+        <div class="cast-grid s2__grid" id="elx-asset-grid" style="display:none"></div>
       </div>
     `;
-    // Toggle — also retargets the batch buttons to cast or loc
+    // Toggle — also retargets the batch buttons to cast / loc / asset
     s2.querySelectorAll("[data-s2-tab]").forEach(b => {
       b.addEventListener("click", () => {
         const which = b.dataset.s2Tab;
         s2.querySelectorAll("[data-s2-tab]").forEach(x => x.classList.toggle("is-active", x === b));
-        $("#elx-cast-grid").style.display = which === "cast" ? "" : "none";
-        $("#elx-loc-grid").style.display  = which === "loc"  ? "" : "none";
-        // Retarget batch buttons
-        $$("#elx-batch-bar [data-batch-tab]").forEach(btn => btn.dataset.batchTab = which);
+        $("#elx-cast-grid").style.display  = which === "cast"  ? "" : "none";
+        $("#elx-loc-grid").style.display   = which === "loc"   ? "" : "none";
+        $("#elx-asset-grid").style.display = which === "asset" ? "" : "none";
+        // Retarget batch buttons (style assets share the cast pattern for now)
+        $$("#elx-batch-bar [data-batch-tab]").forEach(btn => btn.dataset.batchTab = which === "asset" ? "asset" : which);
       });
     });
   }
@@ -10003,16 +10480,23 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   // "Show prompt" affordance — director can see exactly what'll be sent to Seedance
-  function renderShotPromptBlock(shot, cast, environment) {
+  async function renderShotPromptBlock(shot, cast, environment) {
     const block = $("#elx-prompt-block");
     if (!block || !shot) return;
     // Try to compose a preview prompt; gracefully degrade if anything's missing
     let prompt = "";
     try {
+      // Resolve project + extras so the preview matches what'll actually be sent.
+      const project    = await Storage.Projects.getActive();
+      const allAssets  = await Storage.getAll("assets");
+      const envs       = await Storage.getAll("environments");
+      const chars      = await Storage.getAll("characters");
+      const shotRefs   = Array.isArray(shot.references) ? shot.references : [];
+      const extraAssets = resolveExtraAssets(shotRefs, { characters: chars, environments: envs, assets: allAssets });
       const composed = composer.composeSeedance({
-        shot, cast, environment,
+        shot, cast, environment, project,
         mode: shot.generation?.mode || "text_to_video",
-        assets: {},
+        assets: { extraAssets },
       });
       prompt = composed.prompt;
     } catch (err) {
@@ -10670,10 +11154,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   async function showCreateShotModal() {
-    const characters = await Storage.getAll("characters");
+    const characters   = await Storage.getAll("characters");
     const environments = await Storage.getAll("environments");
+    const styleAssets  = await Storage.getAll("assets");
     const existingShots = await Storage.getAll("shots");
+    const project       = await Storage.Projects.getActive();
     const nextShotNumber = (existingShots.reduce((m, s) => Math.max(m, s.shot_number || 0), 0)) + 1;
+    const projectDefaultDuration = project?.default_shot_duration_seconds ?? 8;
 
     const castOptions = characters.length === 0
       ? `<div style="font-size:12px; color:#9a9aab; padding:8px; background:#0a0a0c; border-radius:6px;">No characters in this project yet — add some first if your shot needs cast in frame.</div>`
@@ -10688,6 +11175,32 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const envOptions = environments.length === 0
       ? `<option value="">— no environments yet —</option>`
       : `<option value="">— pick one —</option>` + environments.map(e => `<option value="${esc(e.id)}">${esc(e.display_name)}</option>`).join("");
+
+    // v3 multi-asset reference picker — characters (extra), environments (extra), assets.
+    // Each option is a checkbox; on submit we collect ticked refs into shot.references[].
+    const refOptions = [];
+    for (const c of characters) {
+      refOptions.push({ kind: "character", id: c.id, label: `${c.display_name}`, sub: c.identity?.role_in_story || "extra portrait" });
+    }
+    for (const e of environments) {
+      refOptions.push({ kind: "environment", id: e.id, label: `${e.display_name}`, sub: "extra environment plate" });
+    }
+    for (const a of styleAssets) {
+      refOptions.push({ kind: "asset", id: a.id, label: `${a.display_name}`, sub: a.kind || "style asset" });
+    }
+    const refOptionsHtml = refOptions.length === 0
+      ? `<div style="font-size:11.5px; color:#9a9aab; padding:8px; background:#0a0a0c; border-radius:6px;">No additional refs available yet. Add style assets / extra environments first if needed.</div>`
+      : refOptions.map(r => `
+          <label style="display:flex; align-items:center; gap:8px; padding:5px 0; font-size:12.5px; cursor:pointer;">
+            <input type="checkbox" name="ref_${esc(r.kind)}_${esc(r.id)}" value="1" style="margin:0;">
+            <span>${esc(r.label)}</span>
+            <span style="font-size:10.5px; color:#6a6a78;">· ${esc(r.sub)}</span>
+          </label>
+        `).join("");
+
+    // VO speaker dropdown — cast OR "Narrator" placeholder.
+    const voSpeakerOptions = `<option value="narrator">Narrator (off-screen)</option>`
+      + characters.map(c => `<option value="${esc(c.id)}">${esc(c.display_name)} (off-screen)</option>`).join("");
 
     const formHtml = `
       <div style="display:grid; grid-template-columns:80px 1fr; gap:10px;">
@@ -10713,6 +11226,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             <option value="close-up">close-up</option>
             <option value="two-shot">two-shot</option>
             <option value="over-the-shoulder">over-the-shoulder</option>
+            <option value="low angle">low angle</option>
+            <option value="high angle">high angle</option>
+            <option value="extreme wide">extreme wide</option>
           </select>`
         )}
         ${fieldHtml(
@@ -10728,20 +11244,50 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       ${fieldHtml(
         "Location",
         `<select name="location_id" style="${FIELD_INPUT_STYLE}">${envOptions}</select>`,
-        "Required for image_to_video / reference_to_video generation paths."
+        "Primary environment. For multi-environment shots, add extras under 'Additional references' below."
       )}
       ${fieldHtml(
         "Cast in frame",
         `<div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:8px 12px;">${castOptions}</div>`,
-        "Check every character visible in the shot. Off-frame characters can be referenced in the moment description instead."
+        "Check every character visible in the shot. Off-frame VO speakers go in the Voiceover section below."
       )}
       ${fieldHtml(
-        "Dialogue (optional)",
+        "Dialogue (in-frame, optional)",
         `<textarea name="dialogue" rows="2" placeholder="Verbatim line(s). Format: Character Name: ...." style="${FIELD_INPUT_STYLE} resize:vertical;"></textarea>`,
-        "One line per dialogue. Prefix with the character display name + colon. Used for native lip-sync."
+        "One line per dialogue. Prefix with the character display name + colon. Native lip-sync."
       )}
-      <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:10px 12px; font-size:11.5px; color:#9a9aab; margin-top:6px;">
-        Render duration is fixed at <strong style="color:#c9a25a;">15s</strong> per shot — Seedance's full canvas. Cut to taste in your NLE.
+
+      <div style="margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+          <span style="font-size:11px; color:#c9a25a; letter-spacing:0.04em; text-transform:uppercase; font-weight:600;">Voiceover</span>
+          <span style="font-size:10.5px; color:#6a6a78;">— off-screen narration, overlaid post-hoc via ElevenLabs (not native to Seedance)</span>
+        </div>
+        <div style="display:grid; grid-template-columns:200px 1fr; gap:8px; margin-bottom:8px;">
+          <select name="vo_speaker" style="${FIELD_INPUT_STYLE}">${voSpeakerOptions}</select>
+          <input name="vo_text" type="text" placeholder="VO line — e.g. 'They told me a prince should stand in the light.'" style="${FIELD_INPUT_STYLE}">
+        </div>
+        <div style="font-size:10.5px; color:#6a6a78; line-height:1.4;">
+          Leave blank if no VO. For multiple VO lines on one shot, edit the shot afterward.
+        </div>
+      </div>
+
+      <div style="margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+          <span style="font-size:11px; color:#c9a25a; letter-spacing:0.04em; text-transform:uppercase; font-weight:600;">Additional references</span>
+          <span style="font-size:10.5px; color:#6a6a78;">— extras beyond cast-in-frame + primary location</span>
+        </div>
+        <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:8px 12px; max-height:160px; overflow-y:auto;">${refOptionsHtml}</div>
+        <div style="font-size:10.5px; color:#6a6a78; margin-top:4px; line-height:1.4;">
+          For reference-to-video mode, these get attached as extra reference images (Seedance limit: 9 total). Useful for style frames, fog/FX sheets, or 2nd environments.
+        </div>
+      </div>
+
+      <div style="margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
+        ${fieldHtml(
+          `Render duration (seconds)`,
+          `<input name="duration_override" type="number" min="4" max="15" value="${projectDefaultDuration}" style="${FIELD_INPUT_STYLE}">`,
+          `Defaults to this project's default (${projectDefaultDuration}s). Range 4–15 (Seedance limits). Override per-shot if a beat needs more or less canvas.`
+        )}
       </div>
     `;
     openFormModal({
@@ -10754,8 +11300,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         const shot_number = Number(fd.get("shot_number")) || nextShotNumber;
         const id = await ensureUniqueId("shots", slugifyId(`s${String(shot_number).padStart(2,"0")}`, display_name));
 
-        // Compute in/out from shot_number (15s blocks back-to-back)
-        const startSec = (shot_number - 1) * 15;
+        // Render duration — clamp to Seedance hard range
+        const rawDur = Number(fd.get("duration_override"));
+        const duration = Math.max(4, Math.min(15, isFinite(rawDur) ? rawDur : projectDefaultDuration));
+
+        // Compute in/out from shot_number using THIS shot's duration (back-to-back)
+        // Note: contiguous timecodes assume all prior shots also exist at this duration.
+        // It's a best-effort UI hint — the editorial timeline is owned by the FCPXML.
+        const startSec = (shot_number - 1) * duration;
         const fmt = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
 
         // Cast in frame from checked boxes
@@ -10783,6 +11335,23 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           }
         }
 
+        // v3: voiceover[] from the single inline row in this form. (Multi-VO
+        // editing comes via the shot editor later — keep create-form lean.)
+        const voiceover = [];
+        const voSpeaker = String(fd.get("vo_speaker") || "").trim();
+        const voText    = String(fd.get("vo_text") || "").trim();
+        if (voText) {
+          voiceover.push({ speaker_id: voSpeaker || "narrator", text: voText });
+        }
+
+        // v3: references[] — collect checked refs from the multi-select.
+        const references = [];
+        for (const r of refOptions) {
+          if (fd.get(`ref_${r.kind}_${r.id}`) === "1") {
+            references.push({ kind: r.kind, id: r.id, role: "support" });
+          }
+        }
+
         const row = {
           id,
           shot_number,
@@ -10790,8 +11359,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           status: "draft",
           timecode: {
             in: fmt(startSec),
-            out: fmt(startSec + 15),
-            duration_seconds: 15,
+            out: fmt(startSec + duration),
+            duration_seconds: duration,
           },
           the_moment: {
             verb: String(fd.get("verb") || "").trim(),
@@ -10809,6 +11378,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           cast_lockdown_required: castInFrame.length >= 3,
           generation: { mode: "auto" },
           prompt_engineering: {},
+          voiceover,         // v3
+          references,        // v3
           takes: [],
           keyframes: {},
           created_at: new Date().toISOString().slice(0, 10),
@@ -10891,6 +11462,24 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (seriesSection) seriesSection.textContent = "PROJECT";
   }
 
+  // v3: medium options for the project create/edit form. Read by the
+  // composer to adapt [Aesthetic] + [Production Brief] language.
+  const PROJECT_MEDIUMS = [
+    { value: "live_action",  label: "Live action" },
+    { value: "animated_3d",  label: "3D animation (Pixar / DreamWorks-style)" },
+    { value: "animated_2d",  label: "2D animation" },
+    { value: "documentary",  label: "Documentary" },
+  ];
+
+  // Style canon placeholder text shown to the director — they'll write
+  // the actual canon themselves. Keep this generic enough not to bias.
+  const STYLE_CANON_PLACEHOLDER =
+    "One paragraph that pins every shot to the same world. Example for Lionn: "
+    + "\"Premium stylized 3D animated dark-fantasy adventure for ages 10–14. Cinematic but emotionally readable. "
+    + "Moonlit indigo palette, antique gold royal-lion details, violet shadow magic, expressive youthful character "
+    + "animation, polished materials, dramatic but not horror, no gore, no franchise references. Prioritize clear "
+    + "staging, consistent character identity, readable action, and emotional facial performance.\"";
+
   function showProjectPicker(opts = {}) {
     if ($("#elx-proj-picker")) return; // already open
     const panel = document.createElement("div");
@@ -10900,13 +11489,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       display: flex; align-items: center; justify-content: center;
       backdrop-filter: blur(6px);
     `;
+    const mediumOptions = PROJECT_MEDIUMS.map(m => `<option value="${esc(m.value)}">${esc(m.label)}</option>`).join("");
     panel.innerHTML = `
       <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
-                  padding:24px 28px; max-width:600px; width:92%;
+                  padding:24px 28px; max-width:680px; width:92%;
                   font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
-                  box-shadow: 0 20px 60px rgba(0,0,0,0.6); max-height:80vh; overflow:auto;">
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6); max-height:88vh; overflow:auto;">
         <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:18px;">
-          <h2 style="margin:0; font-size:17px; font-weight:600;">Projects</h2>
+          <h2 id="elx-proj-title" style="margin:0; font-size:17px; font-weight:600;">Projects</h2>
           <button id="elx-proj-close" style="background:none; border:none; color:#9a9aab;
                   font-size:18px; cursor:pointer; line-height:1; padding:4px 8px;">×</button>
         </div>
@@ -10916,22 +11506,47 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             <span style="font-size:18px; color:#c9a25a; line-height:1;">+</span>
             <span style="font-size:13px; color:#e8e8ee;">New project</span>
           </div>
-          <div id="elx-proj-create-form" style="display:none; margin-top:10px; padding:14px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px;">
-            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:6px; letter-spacing:0.04em; text-transform:uppercase;">Project name</label>
-            <input id="elx-proj-name" type="text" placeholder="e.g. The Aftermath"
-                   style="width:100%; padding:9px 12px; background:#14141a; color:#e8e8ee;
-                          border:1px solid #2a2a35; border-radius:6px; font-size:13px;
-                          box-sizing:border-box; margin-bottom:10px;">
-            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:6px; letter-spacing:0.04em; text-transform:uppercase;">Short description (optional)</label>
-            <textarea id="elx-proj-desc" rows="2" placeholder="Logline or genre note"
-                   style="width:100%; padding:9px 12px; background:#14141a; color:#e8e8ee;
-                          border:1px solid #2a2a35; border-radius:6px; font-size:13px;
-                          font-family: inherit; resize:vertical; box-sizing:border-box; margin-bottom:14px;"></textarea>
+          <div id="elx-proj-form" style="display:none; margin-top:10px; padding:16px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px;">
+            <input type="hidden" id="elx-proj-edit-id" value="">
+
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Project name</label>
+            <input id="elx-proj-name" type="text" placeholder="e.g. Lionn: Night Prowler"
+                   style="${FIELD_INPUT_STYLE} margin-bottom:12px;">
+
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Logline (one sentence)</label>
+            <input id="elx-proj-logline" type="text" placeholder="A young prince afraid of his own shadow power must enter a ruined lion kingdom..."
+                   style="${FIELD_INPUT_STYLE} margin-bottom:12px;">
+
+            <div style="display:grid; grid-template-columns:1fr 130px; gap:12px; margin-bottom:12px;">
+              <div>
+                <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Medium</label>
+                <select id="elx-proj-medium" style="${FIELD_INPUT_STYLE}">
+                  ${mediumOptions}
+                </select>
+              </div>
+              <div>
+                <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Default shot duration</label>
+                <input id="elx-proj-default-duration" type="number" min="4" max="15" value="8"
+                       style="${FIELD_INPUT_STYLE}">
+              </div>
+            </div>
+            <div style="font-size:10.5px; color:#6a6a78; margin-top:-6px; margin-bottom:14px; line-height:1.4;">
+              Medium drives composer language (animation strips live-action lighting cues). Default duration is the per-shot Seedance render length unless a shot overrides it (4–15s range).
+            </div>
+
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Style canon (prepended to every shot prompt)</label>
+            <textarea id="elx-proj-style-canon" rows="5" placeholder="${esc(STYLE_CANON_PLACEHOLDER)}"
+                   style="${FIELD_INPUT_STYLE} resize:vertical; margin-bottom:12px;"></textarea>
+
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Description (internal note, optional)</label>
+            <textarea id="elx-proj-desc" rows="2" placeholder="Genre / audience / tone — anything that helps you remember the project"
+                   style="${FIELD_INPUT_STYLE} resize:vertical; margin-bottom:14px;"></textarea>
+
             <div style="display:flex; gap:8px; justify-content:flex-end;">
-              <button id="elx-proj-create-cancel"
+              <button id="elx-proj-form-cancel"
                       style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
                              padding:8px 16px; border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
-              <button id="elx-proj-create-save"
+              <button id="elx-proj-form-save"
                       style="background:#c9a25a; color:#14141a; border:none;
                              padding:8px 16px; border-radius:6px; font-size:12px;
                              font-weight:600; cursor:pointer;">Create + switch</button>
@@ -10949,37 +11564,79 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // Render the list
     renderProjectList(panel);
 
-    // Create form toggle
+    // Form toggle (used for both Create and Edit)
     const createToggle = $("#elx-proj-create-toggle", panel);
-    const createForm   = $("#elx-proj-create-form", panel);
-    const openCreate = () => {
-      createForm.style.display = "block";
-      createToggle.style.display = "none";
-      setTimeout(() => $("#elx-proj-name", panel)?.focus(), 50);
-    };
-    createToggle.addEventListener("click", openCreate);
-    if (opts.openCreate) openCreate();
+    const form         = $("#elx-proj-form", panel);
+    const editIdInput  = $("#elx-proj-edit-id", panel);
+    const saveBtn      = $("#elx-proj-form-save", panel);
 
-    $("#elx-proj-create-cancel", panel).addEventListener("click", () => {
-      createForm.style.display = "none";
+    const openForm = (editRow = null) => {
+      // Reset fields then populate if editing
+      $("#elx-proj-name", panel).value             = editRow?.display_name || "";
+      $("#elx-proj-logline", panel).value          = editRow?.logline || "";
+      $("#elx-proj-medium", panel).value           = editRow?.medium || "live_action";
+      $("#elx-proj-default-duration", panel).value = editRow?.default_shot_duration_seconds ?? 8;
+      $("#elx-proj-style-canon", panel).value      = editRow?.style_canon || "";
+      $("#elx-proj-desc", panel).value             = editRow?.description || "";
+      editIdInput.value = editRow?.id || "";
+      saveBtn.textContent = editRow ? "Save changes" : "Create + switch";
+      // Name field is immutable in edit (id is derived from it) — disable.
+      $("#elx-proj-name", panel).disabled = !!editRow;
+      $("#elx-proj-name", panel).style.opacity = editRow ? "0.6" : "1";
+
+      form.style.display = "block";
+      createToggle.style.display = "none";
+      setTimeout(() => (editRow ? $("#elx-proj-logline", panel) : $("#elx-proj-name", panel))?.focus(), 50);
+    };
+    createToggle.addEventListener("click", () => openForm(null));
+    if (opts.openCreate) openForm(null);
+    // Expose for the edit buttons in renderProjectList
+    panel._openEditForm = (row) => openForm(row);
+
+    $("#elx-proj-form-cancel", panel).addEventListener("click", () => {
+      form.style.display = "none";
       createToggle.style.display = "flex";
+      editIdInput.value = "";
     });
-    $("#elx-proj-create-save", panel).addEventListener("click", async () => {
-      const name = $("#elx-proj-name", panel).value.trim();
-      const desc = $("#elx-proj-desc", panel).value.trim();
-      if (!name) {
+
+    saveBtn.addEventListener("click", async () => {
+      const editingId = editIdInput.value;
+      const name           = $("#elx-proj-name", panel).value.trim();
+      const logline        = $("#elx-proj-logline", panel).value.trim();
+      const medium         = $("#elx-proj-medium", panel).value;
+      const defaultDur     = Number($("#elx-proj-default-duration", panel).value) || 8;
+      const styleCanon     = $("#elx-proj-style-canon", panel).value.trim();
+      const desc           = $("#elx-proj-desc", panel).value.trim();
+      if (!editingId && !name) {
         toast("Project name is required", { tone: "warn" });
         return;
       }
       try {
-        const row = await Storage.Projects.create({ display_name: name, description: desc });
-        await Storage.Projects.setActive(row.id);
-        toast(`Created "${row.display_name}" — reloading…`, { tone: "ok" });
-        // Full reload — every render path derives from active project, and a
-        // fresh page is the cleanest way to swap context without stale state.
+        if (editingId) {
+          await Storage.Projects.update(editingId, {
+            logline,
+            medium,
+            default_shot_duration_seconds: defaultDur,
+            style_canon: styleCanon,
+            description: desc,
+          });
+          toast(`Updated "${name || editingId}" — reloading…`, { tone: "ok" });
+        } else {
+          const row = await Storage.Projects.create({
+            display_name: name,
+            description: desc,
+            medium,
+            logline,
+            style_canon: styleCanon,
+            default_shot_duration_seconds: defaultDur,
+          });
+          await Storage.Projects.setActive(row.id);
+          toast(`Created "${row.display_name}" — reloading…`, { tone: "ok" });
+        }
+        // Full reload — every render path derives from active project + style canon.
         setTimeout(() => window.location.reload(), 600);
       } catch (err) {
-        toast(`Couldn't create project: ${err.message}`, { tone: "err", duration: 7000 });
+        toast(`Save failed: ${err.message}`, { tone: "err", duration: 7000 });
       }
     });
   }
@@ -10989,8 +11646,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (!wrap) return;
     const projects = await Storage.Projects.list();
     const activeId = await Storage.Projects.getActiveId();
+    const mediumLabelMap = Object.fromEntries(PROJECT_MEDIUMS.map(m => [m.value, m.label]));
     wrap.innerHTML = projects.map(p => {
       const isActive = p.id === activeId;
+      const mediumLabel = mediumLabelMap[p.medium] || p.medium || "—";
       return `
         <div data-proj-id="${esc(p.id)}"
              style="display:flex; align-items:center; gap:12px; padding:11px 14px;
@@ -11004,9 +11663,17 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
               ${isActive ? '<span style="font-size:10px; color:#c9a25a; margin-left:8px; letter-spacing:0.06em; text-transform:uppercase;">Active</span>' : ""}
               ${p.is_seeded ? '<span style="font-size:10px; color:#9a9aab; margin-left:8px; letter-spacing:0.06em; text-transform:uppercase;">Seeded</span>' : ""}
             </div>
+            ${p.logline ? `<div style="font-size:11.5px; color:#c8c8d4; margin-top:3px; line-height:1.4; font-style:italic;">${esc(p.logline)}</div>` : ""}
             ${p.description ? `<div style="font-size:11.5px; color:#9a9aab; margin-top:3px; line-height:1.4;">${esc(p.description)}</div>` : ""}
-            <div style="font-size:10.5px; color:#6a6a78; margin-top:4px;">Created ${esc(p.created_at || "—")}</div>
+            <div style="font-size:10.5px; color:#6a6a78; margin-top:4px;">
+              ${esc(mediumLabel)} · default ${p.default_shot_duration_seconds ?? 8}s · created ${esc(p.created_at || "—")}
+            </div>
           </div>
+          <button data-proj-edit="${esc(p.id)}"
+                  title="Edit project settings"
+                  style="background:none; color:#c9a25a; border:1px solid #c9a25a;
+                         padding:6px 10px; border-radius:5px; font-size:11px;
+                         cursor:pointer;">Edit</button>
           ${isActive ? "" : `
             <button data-proj-switch="${esc(p.id)}"
                     style="background:#c9a25a; color:#14141a; border:none;
@@ -11039,13 +11706,23 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       });
     });
 
+    // Wire edit buttons — open the same form populated with the project row
+    wrap.querySelectorAll("[data-proj-edit]").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.projEdit;
+        const proj = projects.find(p => p.id === id);
+        if (proj && panel._openEditForm) panel._openEditForm(proj);
+      });
+    });
+
     // Wire delete buttons
     wrap.querySelectorAll("[data-proj-delete]").forEach(btn => {
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
         const id = btn.dataset.projDelete;
         const proj = projects.find(p => p.id === id);
-        if (!confirm(`Delete project "${proj?.display_name || id}" and ALL its cast, environments, shots, and takes? This cannot be undone.`)) return;
+        if (!confirm(`Delete project "${proj?.display_name || id}" and ALL its cast, environments, shots, takes, and style assets? This cannot be undone.`)) return;
         try {
           await Storage.Projects.delete(id);
           toast(`Deleted "${proj?.display_name || id}"`, { tone: "ok" });
@@ -11199,6 +11876,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // Initial render
     await renderCastTab();
     await renderLocationTab();
+    await renderAssetsTab();
     await renderStoryboard();
     renderConnectionBadge();
     updateCostUi();
