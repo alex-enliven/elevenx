@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="5b9d431e8abd" data-build-time="2026-05-14T20:52:09.964Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"5b9d431e8abd",time:"2026-05-14T20:52:09.964Z"};</script>
+<meta name="elevenx-build" content="ceb16508e8db" data-build-time="2026-05-14T20:57:24.122Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"ceb16508e8db",time:"2026-05-14T20:57:24.122Z"};</script>
 
 </head>
-<!-- elevenx-build: 5b9d431e8abd @ 2026-05-14T20:52:09.964Z -->
+<!-- elevenx-build: ceb16508e8db @ 2026-05-14T20:57:24.122Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -10372,16 +10372,64 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // (clears the flag and they generate manually later via the cards' ↑/Generate
   // buttons). If the worker URL isn't set yet, the modal explains that and
   // offers a "Connect first" button → reopens the connection panel.
-  async function showAutoGenPostImportModal() {
+  // Count how many entities in the active project already have user uploads.
+  // Used to gate the auto-gen modal — when zero anchors exist, we strongly
+  // recommend uploading at least one before generating.
+  async function countUserUploads() {
+    const characters   = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const assets       = await Storage.getAll("assets");
+    let castWithAnchor = 0;
+    for (const c of characters) {
+      const anyUserSlot = ["head_on","three_quarter","full_body"].some(k => c.refs?.user?.[k]?.dataUrl);
+      if (anyUserSlot) castWithAnchor++;
+    }
+    let envWithAnchor = 0;
+    for (const e of environments) {
+      const anyUserSlot = ["wide","detail"].some(k => e.refs?.user?.[k]?.dataUrl);
+      if (anyUserSlot) envWithAnchor++;
+    }
+    let assetWithAnchor = 0;
+    for (const a of assets) {
+      if (a.refs?.user?.primary?.dataUrl) assetWithAnchor++;
+    }
+    return {
+      total: castWithAnchor + envWithAnchor + assetWithAnchor,
+      castWithAnchor,
+      envWithAnchor,
+      assetWithAnchor,
+      castTotal: characters.length,
+      envTotal: environments.length,
+      assetTotal: assets.length,
+    };
+  }
+  NS.countUserUploads = countUserUploads;
+
+  // Public entry point — opens the auto-gen modal whether triggered by the
+  // post-import flag OR manually from the s2 toolbar's "Generate references"
+  // button. The modal handles three states:
+  //   1. Nothing to generate → return silently (no modal)
+  //   2. Some/all anchors uploaded → standard "Generate all" CTA
+  //   3. Zero anchors uploaded → prominent warning + "Upload anchors first" primary CTA
+  //
+  // The zero-anchor warning exists because the chained gen anchors 3/4 + full_body
+  // off the head_on. Without a user upload, the head_on is text-to-image — single
+  // point of style failure. One uploaded anchor locks the whole 3-angle chain.
+  async function showAutoGenPostImportModal(opts = {}) {
     if ($("#elx-autogen-modal")) return;
     const estimate = await estimateMissingRefs();
     if (estimate.count === 0) {
-      // Nothing to do — every slot is already filled (e.g., user uploaded refs)
+      // Manual trigger from a toolbar button — explain why nothing's needed.
+      if (opts.surfaceWhenEmpty) {
+        toast("Every reference is already uploaded or generated. Nothing to do.", { tone: "ok" });
+      }
       return;
     }
     const project = await Storage.Projects.getActive();
     const projectName = project?.display_name || "your project";
     const workerConnected = !!State.fal || !!State.openai;
+    const anchors = await countUserUploads();
+    const noAnchorsAtAll = (anchors.total === 0) && (anchors.castTotal > 0);
 
     const panel = document.createElement("div");
     panel.id = "elx-autogen-modal";
@@ -10395,17 +10443,35 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (estimate.breakdown.environments > 0) breakdownLines.push(`<li>${estimate.breakdown.environments} environment plate${estimate.breakdown.environments === 1 ? "" : "s"}</li>`);
     if (estimate.breakdown.assets > 0) breakdownLines.push(`<li>${estimate.breakdown.assets} style asset${estimate.breakdown.assets === 1 ? "" : "s"}</li>`);
 
+    // The zero-anchor warning block — only rendered when noAnchorsAtAll is true.
+    const anchorWarning = noAnchorsAtAll ? `
+      <div style="background:rgba(201,162,90,0.10); border:1px solid #c9a25a; border-radius:8px; padding:14px 18px; margin-bottom:16px; line-height:1.55;">
+        <div style="font-size:13px; color:#c9a25a; font-weight:600; margin-bottom:6px; letter-spacing:0.02em;">
+          ↑ Upload at least one anchor first (strongly recommended)
+        </div>
+        <div style="font-size:12px; color:#c8c8d4; margin-bottom:8px;">
+          The first portrait of each character is text-to-image — the only shot without an anchor. Even with the project's style canon in the prompt, the model can still drift to photoreal output (especially for young characters).
+        </div>
+        <div style="font-size:12px; color:#c8c8d4;">
+          Upload your director's master sheets (or any concept art) for at least the hero character. The chained generator then uses your art as the identity AND style anchor for 3/4 + full_body. Everything stays on-brief.
+        </div>
+      </div>
+    ` : (anchors.total > 0 ? `
+      <div style="background:rgba(74,222,128,0.08); border:1px solid rgba(74,222,128,0.35); border-radius:6px; padding:8px 14px; margin-bottom:14px; font-size:11.5px; color:#4ade80; line-height:1.5;">
+        ✓ ${anchors.total} anchor${anchors.total === 1 ? "" : "s"} uploaded — derived angles will inherit your art's style.
+      </div>
+    ` : "");
+
     panel.innerHTML = `
       <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
-                  padding:28px 32px; max-width:560px; width:92%;
+                  padding:28px 32px; max-width:600px; width:92%;
                   font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
-                  box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6); max-height:90vh; overflow:auto;">
         <h2 style="margin:0 0 6px; font-size:18px; font-weight:600;">Generate references for ${esc(projectName)}?</h2>
         <p style="margin:0 0 16px; font-size:13px; color:#9a9aab; line-height:1.55;">
-          Your bible has been imported. ElevenX can auto-generate every reference image
-          described in the bible — uploaded refs you've added are never touched and become
-          the identity anchor for derived angles.
+          Your bible is imported. ElevenX can generate every missing reference image from the bible's prompts.
         </p>
+        ${anchorWarning}
         <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; padding:14px 18px; margin-bottom:18px;">
           <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
             <span style="font-size:12px; color:#9a9aab; letter-spacing:0.04em; text-transform:uppercase;">References to generate</span>
@@ -10427,11 +10493,20 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             ⚠ Your worker URL isn't set. Connect first to generate references.
           </div>
         `}
-        <div style="display:flex; gap:8px; justify-content:flex-end;">
+        <div style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
           <button id="elx-autogen-skip"
                   style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
-                         padding:10px 18px; border-radius:6px; font-size:12.5px; cursor:pointer;">Skip — I'll generate manually</button>
-          ${workerConnected ? `
+                         padding:10px 18px; border-radius:6px; font-size:12.5px; cursor:pointer;">${opts.fromManualTrigger ? "Cancel" : "Skip — I'll do it manually"}</button>
+          ${noAnchorsAtAll ? `
+            <button id="elx-autogen-anyway"
+                    style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
+                           padding:10px 18px; border-radius:6px; font-size:12.5px; cursor:pointer;"
+                    title="Generate without uploading anchors first — riskier for style consistency on the first portrait of each character">Generate without anchors</button>
+            <button id="elx-autogen-upload-first"
+                    style="background:#c9a25a; color:#14141a; border:none;
+                           padding:10px 22px; border-radius:6px; font-size:12.5px;
+                           font-weight:600; cursor:pointer;">↑ Upload anchors first</button>
+          ` : workerConnected ? `
             <button id="elx-autogen-go"
                     style="background:#c9a25a; color:#14141a; border:none;
                            padding:10px 22px; border-radius:6px; font-size:12.5px;
@@ -10448,29 +10523,51 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     document.body.appendChild(panel);
 
     const close = async () => {
-      // Always clear the flag on close — we don't want this modal coming back
-      // every page load. If the user picked Skip, that's their decision.
       await Storage.setSetting("auto_gen_pending", null);
       panel.remove();
     };
 
+    // Common: fire bulk-gen and close
+    const fireBulkGen = async () => {
+      if (!workerConnected) {
+        // Reroute to connect if somehow they got here without a worker
+        panel.remove();
+        showConnectionPanel();
+        return;
+      }
+      await Storage.setSetting("auto_gen_pending", null);
+      panel.remove();
+      bulkGenerateAllRefs().catch(err => {
+        console.error("[bulk-gen]", err);
+        toast(`Bulk generation errored: ${err.message}`, { tone: "err", duration: 8000 });
+      });
+    };
+
     $("#elx-autogen-skip", panel).addEventListener("click", close);
-    if (workerConnected) {
-      $("#elx-autogen-go", panel).addEventListener("click", async () => {
+
+    if (noAnchorsAtAll) {
+      // Upload-first primary CTA: close modal + switch to Cast tab + clear flag.
+      // The user uploads via ↑ buttons, then comes back via the s2 toolbar's
+      // "Generate references" button to re-trigger this modal.
+      $("#elx-autogen-upload-first", panel).addEventListener("click", async () => {
         await Storage.setSetting("auto_gen_pending", null);
         panel.remove();
-        // Fire bulk-gen without blocking — the GPS bar takes over progress UX
-        bulkGenerateAllRefs().catch(err => {
-          console.error("[bulk-gen]", err);
-          toast(`Bulk generation errored: ${err.message}`, { tone: "err", duration: 8000 });
-        });
+        // Switch to Cast & Locations screen
+        const castTab = document.querySelector('.proto-tab[data-screen="s2"]');
+        if (castTab) castTab.click();
+        toast(
+          `Upload anchors via the ↑ button on each cast / location / style card. When ready, click "Generate references" in the toolbar to resume auto-gen.`,
+          { tone: "ok", duration: 12000 }
+        );
       });
+      // Secondary: proceed anyway
+      $("#elx-autogen-anyway", panel).addEventListener("click", fireBulkGen);
+    } else if (workerConnected) {
+      $("#elx-autogen-go", panel).addEventListener("click", fireBulkGen);
     } else {
       $("#elx-autogen-connect", panel).addEventListener("click", () => {
         panel.remove();
         showConnectionPanel();
-        // Leave the flag set — when the user closes the connection panel,
-        // we'll re-prompt them on the next reload.
       });
     }
   }
@@ -11898,6 +11995,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "create-shot")        showCreateShotModal();
     else if (action === "create-asset")       showCreateAssetModal();
     else if (action === "gen-asset")          handleGenerateAsset(target.dataset.assetId);
+    else if (action === "generate-all-refs")  showAutoGenPostImportModal({ fromManualTrigger: true, surfaceWhenEmpty: true });
     else if (action === "upload-cast")        showUploadCharacterModal(target.dataset.charId);
     else if (action === "upload-env")         showUploadEnvironmentModal(target.dataset.locId);
     else if (action === "upload-asset")       showUploadAssetModal(target.dataset.assetId);
@@ -11924,6 +12022,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             <button class="btn btn--sm btn--ghost" data-action="batch-reroll" data-batch-tab="cast">Re-roll all</button>
           </div>
           <div class="s2__spacer"></div>
+          <button class="btn btn--sm" data-action="generate-all-refs" title="Open the auto-gen modal to fill every missing cast portrait, environment plate, and style asset across the whole project">↻ Generate references</button>
           <button class="btn btn--ghost btn--sm" data-action="open-connection">Connection</button>
         </div>
         <div class="cast-grid s2__grid" id="elx-cast-grid"></div>
