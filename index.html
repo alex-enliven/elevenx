@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="ceb16508e8db" data-build-time="2026-05-14T20:57:24.122Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"ceb16508e8db",time:"2026-05-14T20:57:24.122Z"};</script>
+<meta name="elevenx-build" content="765aa6df163d" data-build-time="2026-05-14T21:09:01.652Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"765aa6df163d",time:"2026-05-14T21:09:01.652Z"};</script>
 
 </head>
-<!-- elevenx-build: ceb16508e8db @ 2026-05-14T20:57:24.122Z -->
+<!-- elevenx-build: 765aa6df163d @ 2026-05-14T21:09:01.652Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -8866,6 +8866,65 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     console.log(`[cost] +${fmtUsd(amountUsd)} (${note}) — total ${fmtUsd(State.costSpentUsd)}`);
   }
 
+  // ─── Credential persistence (v3.6) ──────────────────────────────────
+  // Worker URL + ElevenLabs key were stored in IDB only, but two browser
+  // behaviors made them appear to "not persist":
+  //   1. type="password" inputs don't reliably preserve the `value="..."`
+  //      attribute across re-renders. The field LOOKED filled (browser
+  //      autofill) but `input.value` was empty when read. The save handler
+  //      then ran the "user cleared the field" branch and wiped the saved key.
+  //   2. The Save handler bailed if `testConn` failed AND user cancelled
+  //      the "Save anyway?" confirm — losing credentials on every save attempt.
+  // Fix: localStorage as primary store (more reliable than IDB across
+  // browser edge cases), IDB as secondary for forward-compat. Read prefers
+  // localStorage; writes go to both.
+  const LS_PREFIX = "elevenx:";
+
+  function saveCredential(key, value) {
+    const v = String(value || "");
+    try {
+      if (v) localStorage.setItem(LS_PREFIX + key, v);
+      else   localStorage.removeItem(LS_PREFIX + key);
+    } catch (err) {
+      // localStorage can throw in private mode / quota exceeded — log and
+      // keep going so the IDB write below still happens.
+      console.warn(`[credential] localStorage write failed for ${key}:`, err);
+    }
+    return Storage.setSetting(key, v);
+  }
+
+  async function loadCredential(key, fallback = null) {
+    try {
+      const v = localStorage.getItem(LS_PREFIX + key);
+      if (v) return v;
+    } catch (err) {
+      console.warn(`[credential] localStorage read failed for ${key}:`, err);
+    }
+    return Storage.getSetting(key, fallback);
+  }
+
+  // One-shot migration: copy any IDB-stored credentials into localStorage
+  // on init so users who saved them under the old code path don't lose them.
+  // Runs every boot but is a no-op once localStorage has the values.
+  async function migrateCredentialsToLocalStorage() {
+    try {
+      for (const key of ["worker_url", "eleven_key"]) {
+        const lsValue = localStorage.getItem(LS_PREFIX + key);
+        if (lsValue) continue; // already migrated
+        const idbValue = await Storage.getSetting(key, null);
+        if (idbValue) {
+          localStorage.setItem(LS_PREFIX + key, idbValue);
+          console.log(`[credential] migrated ${key} from IDB → localStorage`);
+        }
+      }
+    } catch (err) {
+      console.warn("[credential] migration failed:", err);
+    }
+  }
+
+  NS.saveCredential = saveCredential;
+  NS.loadCredential = loadCredential;
+
   // ─── Connection Panel ────────────────────────────────────────────────
   function showConnectionPanel() {
     if ($("#elx-conn-panel")) return; // already open
@@ -8891,29 +8950,55 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         <input id="elx-worker-input"
                type="url"
                placeholder="https://your-worker.workers.dev"
-               value="${esc(State.workerUrl || "")}"
                style="width:100%; padding:10px 12px; background:#0a0a0c; color:#e8e8ee;
                       border:1px solid #2a2a35; border-radius:6px; font-size:13px;
                       font-family: 'JetBrains Mono', monospace; box-sizing:border-box;">
         <label style="display:block; font-size:11px; color:#9a9aab; margin:18px 0 6px; letter-spacing:0.04em; text-transform:uppercase;">ElevenLabs API key <span style="text-transform:none; color:#5a5a6e; letter-spacing:0; font-size:10px">(optional — only needed for voice overlay)</span></label>
         <input id="elx-eleven-input"
-               type="password"
+               type="text"
+               autocomplete="off"
+               spellcheck="false"
                placeholder="xi-…"
-               value="${esc(State.elevenKey || "")}"
                style="width:100%; padding:10px 12px; background:#0a0a0c; color:#e8e8ee;
                       border:1px solid #2a2a35; border-radius:6px; font-size:13px;
-                      font-family: 'JetBrains Mono', monospace; box-sizing:border-box;">
+                      font-family: 'JetBrains Mono', monospace; box-sizing:border-box;
+                      -webkit-text-security: disc; text-security: disc;">
+        <div id="elx-saved-indicator" style="display:none; margin-top:10px; font-size:11px; color:#4ade80; line-height:1.5;"></div>
         <div id="elx-conn-status" style="margin-top:14px; font-size:12px; color:#9a9aab; min-height:18px;"></div>
-        <div style="margin-top:20px; display:flex; gap:8px; justify-content:flex-end;">
-          <button id="elx-conn-cancel" style="padding:8px 14px; background:transparent; color:#9a9aab; border:1px solid #2a2a35; border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
-          <button id="elx-conn-test"   style="padding:8px 14px; background:transparent; color:#c9a25a; border:1px solid #c9a25a; border-radius:6px; font-size:12px; cursor:pointer;">Test connection</button>
-          <button id="elx-conn-save"   style="padding:8px 14px; background:#c9a25a; color:#0a0a0c; border:none; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer;">Save</button>
+        <div style="margin-top:20px; display:flex; gap:8px; justify-content:space-between; align-items:center; flex-wrap:wrap;">
+          <button id="elx-conn-clear" style="padding:8px 14px; background:transparent; color:#9a9aab; border:1px solid #2a2a35; border-radius:6px; font-size:11.5px; cursor:pointer;" title="Wipe both saved credentials">Clear saved</button>
+          <div style="display:flex; gap:8px;">
+            <button id="elx-conn-cancel" style="padding:8px 14px; background:transparent; color:#9a9aab; border:1px solid #2a2a35; border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+            <button id="elx-conn-test"   style="padding:8px 14px; background:transparent; color:#c9a25a; border:1px solid #c9a25a; border-radius:6px; font-size:12px; cursor:pointer;">Test connection</button>
+            <button id="elx-conn-save"   style="padding:8px 14px; background:#c9a25a; color:#0a0a0c; border:none; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer;">Save</button>
+          </div>
         </div>
       </div>
     `;
     document.body.appendChild(panel);
     const input = $("#elx-worker-input");
+    const elInput = $("#elx-eleven-input");
     const status = $("#elx-conn-status");
+    const savedIndicator = $("#elx-saved-indicator");
+
+    // CRITICAL: set input values via JS *after* mount. The value="..." attribute
+    // on type="password" inputs is unreliable across browsers — Chrome's autofill
+    // can overlay it visually without the DOM .value property being populated,
+    // causing the save handler to read "" and wipe the saved credential.
+    // Setting via JS forces input.value to match State, which the save handler
+    // reads back correctly.
+    input.value = State.workerUrl || "";
+    elInput.value = State.elevenKey || "";
+
+    // Show what's already saved so the user knows the panel is informational.
+    const savedBits = [];
+    if (State.workerUrl) savedBits.push(`Worker URL set (${State.workerUrl.replace(/^https?:\/\//, "").slice(0, 28)}…)`);
+    if (State.elevenKey) savedBits.push(`ElevenLabs key set (${State.elevenKey.slice(0, 6)}…)`);
+    if (savedBits.length > 0) {
+      savedIndicator.style.display = "block";
+      savedIndicator.innerHTML = `✓ Already saved: ${savedBits.join(" · ")}`;
+    }
+
     input.focus();
     input.select();
 
@@ -8941,30 +9026,63 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     $("#elx-conn-test").addEventListener("click", () => testConn(input.value.trim()));
     $("#elx-conn-cancel").addEventListener("click", () => panel.remove());
+
+    // CRITICAL CHANGE: Save now ALWAYS saves what's in the inputs. It does NOT
+    // require a successful test (test is informational only). It does NOT
+    // wipe credentials when a field happens to be empty — wiping requires the
+    // explicit "Clear saved" button. This eliminates the "have to re-paste
+    // every time" failure mode where:
+    //   (a) test failed → user dismissed "Save anyway?" → nothing saved
+    //   (b) password field appeared filled (autofill) but input.value was empty
+    //       → save handler ran the wipe-on-empty branch and lost the key
     $("#elx-conn-save").addEventListener("click", async () => {
       const url = input.value.trim();
-      const elKey = $("#elx-eleven-input").value.trim();
-      if (!url && !elKey) return;
+      const elKey = elInput.value.trim();
+      const savedKeys = [];
+
       if (url) {
-        const ok = await testConn(url);
-        if (!ok && !confirm("Connection test did not pass. Save anyway?")) return;
         State.workerUrl = url;
-        await Storage.setSetting("worker_url", url);
+        await saveCredential("worker_url", url);
         State.fal    = new FalClient({ workerUrl: url, onLog: m => console.log("[fal]", m) });
         State.openai = new OpenAIClient({ workerUrl: url, onLog: m => console.log("[openai]", m) });
+        savedKeys.push("Worker URL");
       }
       if (elKey) {
         State.elevenKey = elKey;
-        await Storage.setSetting("eleven_key", elKey);
+        await saveCredential("eleven_key", elKey);
         State.eleven = new ElevenLabsClient({ apiKey: elKey, onLog: m => console.log("[eleven]", m) });
-      } else if (!elKey && State.elevenKey) {
-        // User cleared the field — drop the client
-        State.elevenKey = null;
-        State.eleven = null;
-        await Storage.setSetting("eleven_key", "");
+        savedKeys.push("ElevenLabs key");
       }
+
+      if (savedKeys.length === 0) {
+        status.innerHTML = `<span style="color:#fbbf24">Nothing to save — both fields are empty. Paste a value, or click "Clear saved" to explicitly wipe credentials.</span>`;
+        return;
+      }
+
       panel.remove();
-      toast("Connection settings saved.");
+      toast(`Saved: ${savedKeys.join(", ")}.`);
+      renderConnectionBadge();
+    });
+
+    // Explicit clear — separate path. The save handler never silently wipes.
+    $("#elx-conn-clear").addEventListener("click", async () => {
+      const hasAnything = !!(State.workerUrl || State.elevenKey);
+      if (!hasAnything) {
+        status.innerHTML = `<span style="color:#9a9aab">Nothing to clear.</span>`;
+        return;
+      }
+      if (!confirm("Clear saved Worker URL and ElevenLabs key? You'll need to re-enter them to roll Seedance or generate voice overlays.")) return;
+      State.workerUrl = null;
+      State.elevenKey = null;
+      State.fal = null;
+      State.openai = null;
+      State.eleven = null;
+      await saveCredential("worker_url", "");
+      await saveCredential("eleven_key", "");
+      input.value = "";
+      elInput.value = "";
+      savedIndicator.style.display = "none";
+      status.innerHTML = `<span style="color:#9a9aab">Credentials cleared.</span>`;
       renderConnectionBadge();
     });
   }
@@ -13743,9 +13861,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       await resyncFromSeed("environments", SEED_DATA.environments, ["refs", "chosenModel"]);
     }
 
-    // Restore settings
-    State.workerUrl    = await Storage.getSetting("worker_url", null);
-    State.elevenKey    = await Storage.getSetting("eleven_key", null);
+    // One-shot migration: copy any IDB-stored credentials from the old code
+    // path into localStorage so users don't lose them. Idempotent.
+    await migrateCredentialsToLocalStorage();
+
+    // Restore settings — credentials now read from localStorage first (more
+    // reliable than IDB across browser edge cases), IDB as fallback.
+    State.workerUrl    = await loadCredential("worker_url", null);
+    State.elevenKey    = await loadCredential("eleven_key", null);
     State.costSpentUsd = (await Storage.getSetting("cost_total", 0)) || 0;
     if (State.workerUrl) {
       State.fal    = new FalClient({ workerUrl: State.workerUrl, onLog: m => console.log("[fal]", m) });
