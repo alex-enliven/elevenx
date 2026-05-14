@@ -3923,8 +3923,23 @@ a { color: inherit; text-decoration: none; }
 .cast-card__palette { display: flex; gap: 4px; margin-top: 8px; }
 .cast-card__sw { display: inline-block; width: 14px; height: 14px; border-radius: 3px; }
 .cast-card__meta { font-size: 11px; color: #9a9aab; margin-top: 8px; font-family: 'JetBrains Mono', monospace; }
-.cast-card__bottom { margin-top: 10px; display: flex; gap: 6px; }
-.cast-card__bottom .cast-card__cta { flex: 1; }
+.cast-card__bottom { margin-top: 10px; display: flex; gap: 6px; position: relative; }
+/* The v2 mockup defined .cast-card__cta as position:absolute + opacity:0 with
+   hover-reveal — that's the legacy "floating CTA" pattern from when each
+   card had a single hover-only action. Our dual-button-row layout needs the
+   CTA back in normal flow as a sibling to the ↑ button, so override:
+     - position:static brings it back into the flex container
+     - opacity:1 + transform:none kills the hover-reveal animation
+     - flex:1 lets it grow to fill (the ↑ stays intrinsic-width)
+   If we don't override, clicking the visible ↑ falls through to the
+   invisible Generate button underneath. */
+.cast-card__bottom .cast-card__cta {
+  position: static !important;
+  opacity: 1 !important;
+  transform: none !important;
+  flex: 1;
+  bottom: auto; right: auto;
+}
 .s3 { padding: 16px 24px; display: flex; flex-direction: column; gap: 14px; min-height: 0; }
 .s3__toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .s3__spacer { flex: 1; }
