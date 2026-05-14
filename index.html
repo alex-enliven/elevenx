@@ -8554,15 +8554,32 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   // Resolve a single ref URL for a character or environment given an
-  // angle/kind. Defaults to ACTIVE_IMAGE_MODEL with fallback to the
-  // other model if the active one doesn't have that angle.
+  // angle/kind. Priority order (since v3 upload path — 2026-05-14):
+  //   1. user upload (sacred — survives re-rolls)
+  //   2. active model's generated ref
+  //   3. other model's generated ref (fallback)
+  // The user bucket lets directors anchor a slot with their own pre-drafted
+  // art; subsequent generation chains pick this up as the identity anchor
+  // for derived angles (3/4 + full_body via the edit endpoint).
   function refUrlFor(asset, angleKey) {
     if (!asset?.refs) return null;
     const primary = asset.chosenModel || ACTIVE_IMAGE_MODEL;
     const other   = primary === "seedream" ? "gpt" : "seedream";
-    return asset.refs[primary]?.[angleKey]?.dataUrl
+    return asset.refs.user?.[angleKey]?.dataUrl
+        || asset.refs[primary]?.[angleKey]?.dataUrl
         || asset.refs[other]?.[angleKey]?.dataUrl
         || null;
+  }
+  // Companion: tell the caller whether the resolved URL came from a user
+  // upload. Cards render a small "↑ uploaded" badge when true.
+  function refSourceFor(asset, angleKey) {
+    if (!asset?.refs) return null;
+    if (asset.refs.user?.[angleKey]?.dataUrl) return "user_upload";
+    const primary = asset.chosenModel || ACTIVE_IMAGE_MODEL;
+    if (asset.refs[primary]?.[angleKey]?.dataUrl) return primary;
+    const other = primary === "seedream" ? "gpt" : "seedream";
+    if (asset.refs[other]?.[angleKey]?.dataUrl) return other;
+    return null;
   }
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const fmtUsd = (n) => `$${(Number(n) || 0).toFixed(2)}`;
@@ -8796,22 +8813,30 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   function buildCastCard(c) {
     const modelKey  = ACTIVE_IMAGE_MODEL;
     const modelMeta = IMAGE_MODELS[modelKey];
-    const refsForModel = c.refs?.[modelKey] || {};
     const angleKeys    = ["head_on", "three_quarter", "full_body"];
     const angleLabels  = { head_on: "Head", three_quarter: "3/4", full_body: "Full" };
-    const refCount = angleKeys.filter(k => refsForModel[k]?.dataUrl).length;
-    const heroAngle = angleKeys.find(k => refsForModel[k]?.dataUrl) || null;
-    const heroUrl   = heroAngle ? refsForModel[heroAngle].dataUrl : null;
+    // v3: pick the resolved (user > generated) URL per angle for display
+    const resolvedByAngle = Object.fromEntries(angleKeys.map(k => [k, refUrlFor(c, k)]));
+    const sourceByAngle   = Object.fromEntries(angleKeys.map(k => [k, refSourceFor(c, k)]));
+    const refCount  = angleKeys.filter(k => resolvedByAngle[k]).length;
+    const userCount = angleKeys.filter(k => sourceByAngle[k] === "user_upload").length;
+    const heroAngle = angleKeys.find(k => resolvedByAngle[k]) || null;
+    const heroUrl   = heroAngle ? resolvedByAngle[heroAngle] : null;
     const card = document.createElement("div");
     card.className = `cast-card cast-card--${modelKey}`;
     card.dataset.id = c.id;
     const filmstrip = angleKeys.map(k => {
-      const url = refsForModel[k]?.dataUrl;
+      const url = resolvedByAngle[k];
+      const isUser = sourceByAngle[k] === "user_upload";
       const active = (k === heroAngle) ? " is-active" : "";
+      const userBadge = isUser ? `<span style="position:absolute; top:2px; right:2px; background:#c9a25a; color:#14141a; font-size:8px; padding:1px 4px; border-radius:3px; line-height:1; font-weight:600;">↑</span>` : "";
       return url
-        ? `<div class="cast-card__thumb${active}" data-angle="${k}" data-char-id="${esc(c.id)}" style="background-image:url('${url}'); background-size:cover; background-position:top center;" title="${esc(angleLabels[k])}"></div>`
+        ? `<div class="cast-card__thumb${active}" data-angle="${k}" data-char-id="${esc(c.id)}" style="background-image:url('${url}'); background-size:cover; background-position:top center; position:relative;" title="${esc(angleLabels[k])}${isUser ? " (uploaded)" : ""}">${userBadge}</div>`
         : `<div class="cast-card__thumb cast-card__thumb--empty" title="${esc(angleLabels[k])} — not generated yet">·</div>`;
     }).join("");
+    const meta = userCount > 0
+      ? `${refCount}/3 refs · <span style="color:#c9a25a;">↑ ${userCount} uploaded</span>${refCount === 3 ? '' : refCount === 0 ? '' : '<span style="color:#fbbf24"> · partial</span>'}`
+      : `${refCount}/3 refs · ${refCount === 3 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'}`;
     card.innerHTML = `
       <div class="cast-card__portrait" data-hero-host style="${heroUrl ? `background-image:url('${heroUrl}'); background-size:cover; background-position:top center;` : ''}">
         ${heroUrl ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(c.id).toUpperCase()}</div>`}
@@ -8821,9 +8846,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       <div class="cast-card__name">${esc(c.display_name)}</div>
       <div class="cast-card__role">${esc(c.identity?.age || "")} · ${esc(c.identity?.nationality || "")} · ${esc(c.identity?.archetype || "")}</div>
       <div class="cast-card__palette">${(c.wardrobe?.color_palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
-      <div class="cast-card__meta">${refCount}/3 refs · ${refCount === 3 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'}</div>
-      <div class="cast-card__bottom">
-        <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}">${refCount === 3 ? `Re-roll` : `Generate ${3 - refCount} angle${3-refCount===1?"":"s"}`}</button>
+      <div class="cast-card__meta">${meta}</div>
+      <div class="cast-card__bottom" style="display:flex; gap:6px;">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-cast" data-char-id="${esc(c.id)}" style="flex:1;">${refCount === 3 ? `Re-roll` : `Generate ${3 - refCount} angle${3-refCount===1?"":"s"}`}</button>
+        <button class="btn btn--sm btn--ghost" data-action="upload-cast" data-char-id="${esc(c.id)}" title="Upload pre-drafted images">↑</button>
       </div>
     `;
     return card;
@@ -8873,26 +8899,29 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
 
   function buildAssetCard(a) {
-    const url = a.refs?.[ACTIVE_IMAGE_MODEL]?.primary?.dataUrl
-             || a.refs?.seedream?.primary?.dataUrl
-             || a.refs?.gpt?.primary?.dataUrl
-             || null;
+    // v3: user > generated
+    const url    = refUrlFor(a, "primary");
+    const source = refSourceFor(a, "primary");
+    const isUser = source === "user_upload";
     const kindLabel = (ASSET_KINDS.find(k => k.value === a.kind)?.label) || a.kind || "asset";
     const hasRef = !!url;
+    const userBadge = isUser ? `<span style="position:absolute; top:8px; right:8px; background:#c9a25a; color:#14141a; font-size:9px; padding:2px 6px; border-radius:3px; line-height:1; font-weight:600; letter-spacing:0.04em; text-transform:uppercase;">↑ Uploaded</span>` : "";
     const card = document.createElement("div");
     card.className = `cast-card cast-card--asset cast-card--${ACTIVE_IMAGE_MODEL}`;
     card.dataset.id = a.id;
     card.innerHTML = `
-      <div class="cast-card__portrait" style="${url ? `background-image:url('${url}'); background-size:cover; background-position:center;` : ''}">
+      <div class="cast-card__portrait" style="${url ? `background-image:url('${url}'); background-size:cover; background-position:center;` : ''} position:relative;">
         ${url ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px; font-family:'JetBrains Mono',monospace;">${esc(a.id).toUpperCase()}</div>`}
+        ${userBadge}
         <span class="cast-card__hero-label">${esc(kindLabel)}</span>
       </div>
       <div class="cast-card__name">${esc(a.display_name)}</div>
       <div class="cast-card__role">${esc(a.description || kindLabel)}</div>
       <div class="cast-card__palette">${(a.palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
-      <div class="cast-card__meta">${hasRef ? '<span style="color:#4ade80">ready</span>' : '<span style="color:#9a9aab">no image yet</span>'}</div>
-      <div class="cast-card__bottom">
-        <button class="btn btn--sm cast-card__cta" data-action="gen-asset" data-asset-id="${esc(a.id)}">${hasRef ? "Re-roll" : "Generate"}</button>
+      <div class="cast-card__meta">${hasRef ? (isUser ? '<span style="color:#c9a25a">uploaded</span>' : '<span style="color:#4ade80">ready</span>') : '<span style="color:#9a9aab">no image yet</span>'}</div>
+      <div class="cast-card__bottom" style="display:flex; gap:6px;">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-asset" data-asset-id="${esc(a.id)}" style="flex:1;">${hasRef ? "Re-roll" : "Generate"}</button>
+        <button class="btn btn--sm btn--ghost" data-action="upload-asset" data-asset-id="${esc(a.id)}" title="Upload pre-drafted image">↑</button>
       </div>
     `;
     return card;
@@ -8974,10 +9003,12 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       } else {
         throw new Error("No image client available — set Worker URL");
       }
-      asset.refs = asset.refs || { seedream: {}, gpt: {} };
+      asset.refs = asset.refs || { seedream: {}, gpt: {}, user: {} };
       asset.refs[model] = asset.refs[model] || {};
       asset.refs[model].primary = { dataUrl, generatedAt: Date.now() };
-      asset.chosenModel = model;
+      // Don't overwrite chosenModel if a user upload is the canonical source.
+      // refUrlFor() already prefers user > active model regardless of this flag.
+      if (!asset.refs.user?.primary?.dataUrl) asset.chosenModel = model;
       await Storage.put("assets", asset);
       const costGuess = model === "gpt" ? 0.042 : 0.05;
       await trackCost(costGuess, `asset ${assetId}`);
@@ -8989,6 +9020,262 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     } finally {
       setGPS(false);
     }
+  }
+
+  // ─── User-upload path for refs (v3) ─────────────────────────────────
+  // Directors often have pre-drafted character/location/style art (concept
+  // art, Midjourney outputs, hand sketches). The upload path writes those
+  // images directly into c.refs.user / e.refs.user / a.refs.user — a
+  // separate bucket from generated refs so re-rolls don't nuke them. The
+  // chained generation pipeline picks user uploads up as the identity anchor
+  // (head_on / wide / primary), which means every derived angle is locked
+  // to the director's art instead of a model's text-to-image guess.
+
+  function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload  = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+  }
+
+  /**
+   * Generic upload modal — opens a per-slot file picker with live preview.
+   * Slots that already have a user upload show a "Replace" button; empty
+   * slots show "Choose file".
+   *
+   * @param {object} opts
+   * @param {string} opts.title         e.g. "Upload portraits for Lionn"
+   * @param {string} opts.subtitle      smaller helper line under the title
+   * @param {Array}  opts.slots         [{ key, label, hint?, currentDataUrl?, currentSource? }]
+   * @param {function} opts.onSave      async (selections) — selections is
+   *                                    { [slotKey]: { dataUrl, file } | null }
+   *                                    Slots the user didn't change are absent from selections.
+   */
+  function showUploadModal({ title, subtitle, slots, onSave }) {
+    if ($("#elx-upload-modal")) return;
+    const panel = document.createElement("div");
+    panel.id = "elx-upload-modal";
+    panel.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9000;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px);
+    `;
+
+    // Each slot becomes a row with: label, preview (current or new), file input, clear button
+    const slotsHtml = slots.map(s => {
+      const previewStyle = s.currentDataUrl
+        ? `background-image:url('${s.currentDataUrl}'); background-size:cover; background-position:center;`
+        : `background:#0a0a0c;`;
+      const sourceBadge = s.currentSource === "user_upload"
+        ? `<span style="font-size:9.5px; color:#c9a25a; letter-spacing:0.06em; text-transform:uppercase;">↑ uploaded</span>`
+        : s.currentDataUrl
+          ? `<span style="font-size:9.5px; color:#6a6a78; letter-spacing:0.06em; text-transform:uppercase;">generated</span>`
+          : `<span style="font-size:9.5px; color:#6a6a78; letter-spacing:0.06em; text-transform:uppercase;">empty</span>`;
+      return `
+        <div data-slot-key="${esc(s.key)}" style="display:grid; grid-template-columns:90px 1fr auto; gap:12px; align-items:center; padding:10px 0; border-bottom:1px solid #2a2a35;">
+          <div data-preview style="width:90px; height:90px; border:1px solid #2a2a35; border-radius:6px; ${previewStyle}"></div>
+          <div style="min-width:0;">
+            <div style="font-size:13px; color:#e8e8ee; font-weight:500; margin-bottom:2px;">${esc(s.label)}</div>
+            <div data-status style="font-size:11px; color:#9a9aab; margin-bottom:4px;">${sourceBadge}</div>
+            ${s.hint ? `<div style="font-size:10.5px; color:#6a6a78; line-height:1.4;">${esc(s.hint)}</div>` : ""}
+          </div>
+          <div style="display:flex; flex-direction:column; gap:6px;">
+            <label style="cursor:pointer; background:#14141a; color:#c9a25a; border:1px solid #c9a25a; padding:6px 12px; border-radius:5px; font-size:11px; text-align:center; white-space:nowrap;">
+              ${s.currentDataUrl ? "Replace" : "Choose file"}
+              <input type="file" data-file-input accept="image/png,image/jpeg,image/webp" style="display:none;">
+            </label>
+            <button type="button" data-clear-btn style="background:none; color:#9a9aab; border:1px solid #2a2a35; padding:5px 10px; border-radius:5px; font-size:10.5px; cursor:pointer; ${s.currentSource === "user_upload" ? "" : "visibility:hidden;"}">Clear upload</button>
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    panel.innerHTML = `
+      <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px;
+                  padding:24px 28px; max-width:640px; width:92%;
+                  font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.6); max-height:88vh; overflow:auto;">
+        <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:6px;">
+          <h2 style="margin:0; font-size:16px; font-weight:600;">${esc(title)}</h2>
+          <button id="elx-upload-close" style="background:none; border:none; color:#9a9aab; font-size:18px; cursor:pointer; line-height:1; padding:4px 8px;">×</button>
+        </div>
+        ${subtitle ? `<div style="font-size:12px; color:#9a9aab; margin-bottom:14px; line-height:1.5;">${esc(subtitle)}</div>` : ""}
+        <div id="elx-upload-slots">${slotsHtml}</div>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:16px;">
+          <button type="button" id="elx-upload-cancel"
+                  style="background:#14141a; color:#9a9aab; border:1px solid #2a2a35;
+                         padding:8px 16px; border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+          <button type="button" id="elx-upload-save"
+                  style="background:#c9a25a; color:#14141a; border:none;
+                         padding:8px 16px; border-radius:6px; font-size:12px;
+                         font-weight:600; cursor:pointer;">Save</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    // Holds in-memory selections keyed by slot.key.
+    // Values: { dataUrl, file } for new uploads, or "__clear__" to drop a user upload.
+    const selections = {};
+
+    const close = () => panel.remove();
+    panel.addEventListener("click", (e) => { if (e.target === panel) close(); });
+    $("#elx-upload-close", panel).addEventListener("click", close);
+    $("#elx-upload-cancel", panel).addEventListener("click", close);
+
+    // Wire each slot
+    panel.querySelectorAll("[data-slot-key]").forEach(row => {
+      const slotKey = row.dataset.slotKey;
+      const fileInput = row.querySelector("[data-file-input]");
+      const previewEl = row.querySelector("[data-preview]");
+      const statusEl  = row.querySelector("[data-status]");
+      const clearBtn  = row.querySelector("[data-clear-btn]");
+
+      fileInput.addEventListener("change", async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        try {
+          const dataUrl = await readFileAsDataUrl(file);
+          selections[slotKey] = { dataUrl, file };
+          previewEl.style.backgroundImage = `url('${dataUrl}')`;
+          previewEl.style.backgroundSize = "cover";
+          previewEl.style.backgroundPosition = "center";
+          previewEl.style.background = `url('${dataUrl}') center/cover`;
+          statusEl.innerHTML = `<span style="font-size:9.5px; color:#4ade80; letter-spacing:0.06em; text-transform:uppercase;">↑ ready to save</span>`;
+          clearBtn.style.visibility = "hidden"; // clearing a pending new upload — just pick again
+        } catch (err) {
+          toast(`Couldn't read file: ${err.message}`, { tone: "err" });
+        }
+      });
+
+      clearBtn.addEventListener("click", () => {
+        selections[slotKey] = "__clear__";
+        previewEl.style.background = "#0a0a0c";
+        previewEl.style.backgroundImage = "";
+        statusEl.innerHTML = `<span style="font-size:9.5px; color:#f87171; letter-spacing:0.06em; text-transform:uppercase;">will clear</span>`;
+        clearBtn.style.visibility = "hidden";
+      });
+    });
+
+    $("#elx-upload-save", panel).addEventListener("click", async () => {
+      if (Object.keys(selections).length === 0) {
+        close();
+        return;
+      }
+      try {
+        await onSave(selections);
+        close();
+      } catch (err) {
+        toast(`Save failed: ${err.message}`, { tone: "err", duration: 7000 });
+        console.error(err);
+      }
+    });
+  }
+
+  // ─── Per-type upload dispatchers ─────────────────────────────────────
+
+  async function showUploadCharacterModal(charId) {
+    const c = await Storage.get("characters", charId);
+    if (!c) return;
+    c.refs = c.refs || {};
+    c.refs.user = c.refs.user || {};
+    const slots = [
+      { key: "head_on",       label: "Head-on",        currentDataUrl: refUrlFor(c, "head_on"),       currentSource: refSourceFor(c, "head_on") },
+      { key: "three_quarter", label: "3/4 view",       currentDataUrl: refUrlFor(c, "three_quarter"), currentSource: refSourceFor(c, "three_quarter") },
+      { key: "full_body",     label: "Full body",      currentDataUrl: refUrlFor(c, "full_body"),     currentSource: refSourceFor(c, "full_body") },
+    ];
+    showUploadModal({
+      title: `Upload portraits for ${c.display_name}`,
+      subtitle: "Drop in pre-drafted images per angle. Uploaded refs are sacred — they survive 'Re-roll' and become the identity anchor for any unfilled slots when you generate the rest.",
+      slots,
+      onSave: async (selections) => {
+        for (const [key, val] of Object.entries(selections)) {
+          if (val === "__clear__") {
+            delete c.refs.user[key];
+          } else if (val?.dataUrl) {
+            c.refs.user[key] = {
+              dataUrl: val.dataUrl,
+              filename: val.file?.name || null,
+              byte_size: val.file?.size || null,
+              uploaded_at: Date.now(),
+              source: "user_upload",
+            };
+          }
+        }
+        await Storage.put("characters", c);
+        toast(`Saved uploads for ${c.display_name}`, { tone: "ok" });
+        await renderCastTab();
+      },
+    });
+  }
+
+  async function showUploadEnvironmentModal(locId) {
+    const e = await Storage.get("environments", locId);
+    if (!e) return;
+    e.refs = e.refs || {};
+    e.refs.user = e.refs.user || {};
+    const slots = [
+      { key: "wide",   label: "Wide establisher", currentDataUrl: refUrlFor(e, "wide"),   currentSource: refSourceFor(e, "wide") },
+      { key: "detail", label: "Detail / close",   currentDataUrl: refUrlFor(e, "detail"), currentSource: refSourceFor(e, "detail") },
+    ];
+    showUploadModal({
+      title: `Upload reference plates for ${e.display_name}`,
+      subtitle: "Pre-drafted environment plates (concept art, photographs, etc.). The Wide is used as the anchor when generating the Detail via the edit endpoint — so a good wide locks down spatial layout.",
+      slots,
+      onSave: async (selections) => {
+        for (const [key, val] of Object.entries(selections)) {
+          if (val === "__clear__") {
+            delete e.refs.user[key];
+          } else if (val?.dataUrl) {
+            e.refs.user[key] = {
+              dataUrl: val.dataUrl,
+              filename: val.file?.name || null,
+              byte_size: val.file?.size || null,
+              uploaded_at: Date.now(),
+              source: "user_upload",
+            };
+          }
+        }
+        await Storage.put("environments", e);
+        toast(`Saved uploads for ${e.display_name}`, { tone: "ok" });
+        await renderLocationTab();
+      },
+    });
+  }
+
+  async function showUploadAssetModal(assetId) {
+    const a = await Storage.get("assets", assetId);
+    if (!a) return;
+    a.refs = a.refs || {};
+    a.refs.user = a.refs.user || {};
+    const slots = [
+      { key: "primary", label: "Primary image", currentDataUrl: refUrlFor(a, "primary"), currentSource: refSourceFor(a, "primary") },
+    ];
+    showUploadModal({
+      title: `Upload image for ${a.display_name}`,
+      subtitle: "Pre-drafted style frame / prop / FX sheet. Replaces the generated image when present; appears in shot references the same way.",
+      slots,
+      onSave: async (selections) => {
+        for (const [key, val] of Object.entries(selections)) {
+          if (val === "__clear__") {
+            delete a.refs.user[key];
+          } else if (val?.dataUrl) {
+            a.refs.user[key] = {
+              dataUrl: val.dataUrl,
+              filename: val.file?.name || null,
+              byte_size: val.file?.size || null,
+              uploaded_at: Date.now(),
+              source: "user_upload",
+            };
+          }
+        }
+        await Storage.put("assets", a);
+        toast(`Saved upload for ${a.display_name}`, { tone: "ok" });
+        await renderAssetsTab();
+      },
+    });
   }
 
   // Generic "+ Add" tile used at the end of cast/loc/storyboard grids.
@@ -9027,22 +9314,30 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
   function buildLocationCard(e) {
     const modelKey  = ACTIVE_IMAGE_MODEL;
-    const refsForModel = e.refs?.[modelKey] || {};
     const kindKeys = ["wide", "detail"];
     const kindLabels = { wide: "Wide", detail: "Detail" };
-    const refCount = kindKeys.filter(k => refsForModel[k]?.dataUrl).length;
-    const heroKind = kindKeys.find(k => refsForModel[k]?.dataUrl) || null;
-    const heroUrl  = heroKind ? refsForModel[heroKind].dataUrl : null;
+    // v3: pick user > generated
+    const resolvedByKind = Object.fromEntries(kindKeys.map(k => [k, refUrlFor(e, k)]));
+    const sourceByKind   = Object.fromEntries(kindKeys.map(k => [k, refSourceFor(e, k)]));
+    const refCount  = kindKeys.filter(k => resolvedByKind[k]).length;
+    const userCount = kindKeys.filter(k => sourceByKind[k] === "user_upload").length;
+    const heroKind = kindKeys.find(k => resolvedByKind[k]) || null;
+    const heroUrl  = heroKind ? resolvedByKind[heroKind] : null;
     const card = document.createElement("div");
     card.className = `cast-card cast-card--loc cast-card--${modelKey}`;
     card.dataset.id = e.id;
     const filmstrip = kindKeys.map(k => {
-      const url = refsForModel[k]?.dataUrl;
+      const url = resolvedByKind[k];
+      const isUser = sourceByKind[k] === "user_upload";
       const active = (k === heroKind) ? " is-active" : "";
+      const userBadge = isUser ? `<span style="position:absolute; top:2px; right:2px; background:#c9a25a; color:#14141a; font-size:8px; padding:1px 4px; border-radius:3px; line-height:1; font-weight:600;">↑</span>` : "";
       return url
-        ? `<div class="cast-card__thumb cast-card__thumb--loc${active}" data-loc-kind="${k}" data-loc-id="${esc(e.id)}" style="background-image:url('${url}'); background-size:cover; background-position:center;" title="${esc(kindLabels[k])}"></div>`
+        ? `<div class="cast-card__thumb cast-card__thumb--loc${active}" data-loc-kind="${k}" data-loc-id="${esc(e.id)}" style="background-image:url('${url}'); background-size:cover; background-position:center; position:relative;" title="${esc(kindLabels[k])}${isUser ? " (uploaded)" : ""}">${userBadge}</div>`
         : `<div class="cast-card__thumb cast-card__thumb--loc cast-card__thumb--empty" title="${esc(kindLabels[k])} — not generated yet">·</div>`;
     }).join("");
+    const meta = userCount > 0
+      ? `${refCount}/2 refs · <span style="color:#c9a25a;">↑ ${userCount} uploaded</span>`
+      : `${refCount}/2 refs · ${refCount === 2 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'}`;
     card.innerHTML = `
       <div class="cast-card__portrait" data-hero-host style="${heroUrl ? `background-image:url('${heroUrl}'); background-size:cover; background-position:center;` : ''}">
         ${heroUrl ? "" : `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#5a5a6e; font-size:11px;">${esc(e.id).toUpperCase()}</div>`}
@@ -9052,9 +9347,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       <div class="cast-card__name">${esc(e.display_name)}</div>
       <div class="cast-card__role">${esc(e.architecture?.type || "")}</div>
       <div class="cast-card__palette">${(e.palette || []).map(col => `<span class="cast-card__sw" style="background:${nameToColor(col)}; border:1px solid rgba(255,255,255,0.1);"></span>`).join("")}</div>
-      <div class="cast-card__meta">${refCount}/2 refs · ${refCount === 2 ? '<span style="color:#4ade80">complete</span>' : refCount === 0 ? '<span style="color:#9a9aab">no refs</span>' : '<span style="color:#fbbf24">partial</span>'}</div>
-      <div class="cast-card__bottom">
-        <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}">${refCount === 2 ? `Re-roll` : `Generate ${2 - refCount} ref${2-refCount===1?"":"s"}`}</button>
+      <div class="cast-card__meta">${meta}</div>
+      <div class="cast-card__bottom" style="display:flex; gap:6px;">
+        <button class="btn btn--sm cast-card__cta" data-action="gen-env" data-loc-id="${esc(e.id)}" style="flex:1;">${refCount === 2 ? `Re-roll` : `Generate ${2 - refCount} ref${2-refCount===1?"":"s"}`}</button>
+        <button class="btn btn--sm btn--ghost" data-action="upload-env" data-loc-id="${esc(e.id)}" title="Upload pre-drafted plates">↑</button>
       </div>
     `;
     return card;
@@ -9433,10 +9729,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (!c) return;
     c.refs = c.refs || {};
     c.refs[modelKey] = c.refs[modelKey] || {};
+    c.refs.user = c.refs.user || {};
 
-    // If user clicked "Re-roll" (all 3 present), CLEAR and re-do with chaining.
-    // This is the fix for cross-angle identity drift — previous text-to-image
-    // approach gave us 3 different people per character.
+    // If user clicked "Re-roll" (all 3 generated angles present), CLEAR
+    // and re-do with chaining. NEVER touches c.refs.user — uploaded refs
+    // are sacred and re-rolls preserve them.
     const angles = ["head_on", "three_quarter", "full_body"];
     const allPresent = angles.every(k => c.refs[modelKey][k]?.dataUrl);
     if (allPresent) {
@@ -9449,7 +9746,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
     try {
       // ── STEP 1: head_on via text-to-image (no reference) ────────────────
-      let headOnDataUrl = c.refs[modelKey].head_on?.dataUrl || null;
+      // User uploads win — if a director has dropped in their own head_on,
+      // we use it as the identity anchor for derived angles instead of
+      // generating fresh from text. This is the high-leverage path for
+      // projects with pre-drafted character art.
+      let headOnDataUrl = c.refs.user.head_on?.dataUrl
+                       || c.refs[modelKey].head_on?.dataUrl
+                       || null;
       if (!headOnDataUrl) {
         setGPS(true, `Generating <span class="mono">${esc(charId)} · head_on</span>`, `${modelMeta.label} · base portrait`, 15);
         try {
@@ -9491,6 +9794,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 
       // ── STEP 2 + 3: three_quarter & full_body as EDITS using head_on as reference ──
       for (const angle of ["three_quarter", "full_body"]) {
+        // Skip if already present in EITHER bucket (user upload OR generated)
+        if (c.refs.user[angle]?.dataUrl) continue;
         if (c.refs[modelKey][angle]?.dataUrl) continue;
         setGPS(true, `Generating <span class="mono">${esc(charId)} · ${angle}</span>`,
           `${modelMeta.label} · identity-locked from head_on`, 40);
@@ -9555,10 +9860,12 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     if (!e) return;
     e.refs = e.refs || {};
     e.refs[modelKey] = e.refs[modelKey] || {};
+    e.refs.user = e.refs.user || {};
 
     // Same chained pattern as cast — wide first (base), then detail as edit
     // using the wide as reference. Solves spatial consistency the same way
-    // the cast chaining solves identity consistency.
+    // the cast chaining solves identity consistency. User uploads are
+    // sacred — re-rolls don't touch e.refs.user.
     const kinds = ["wide", "detail"];
     const allPresent = kinds.every(k => e.refs[modelKey][k]?.dataUrl);
     if (allPresent) {
@@ -9570,8 +9877,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     let okCount = 0, failCount = 0;
 
     try {
-      // ── STEP 1: wide via text-to-image ──────────────────────────────────
-      let wideDataUrl = e.refs[modelKey].wide?.dataUrl || null;
+      // ── STEP 1: wide via text-to-image (user upload wins as anchor) ─────
+      let wideDataUrl = e.refs.user.wide?.dataUrl
+                     || e.refs[modelKey].wide?.dataUrl
+                     || null;
       if (!wideDataUrl) {
         setGPS(true, `Generating <span class="mono">${esc(locId)} · wide</span>`, `${modelMeta.label} · base frame`, 20);
         try {
@@ -9609,7 +9918,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       }
 
       // ── STEP 2: detail as edit using wide as reference ───────────────────
-      if (!e.refs[modelKey].detail?.dataUrl) {
+      // Skip if EITHER bucket has it
+      if (!e.refs.user.detail?.dataUrl && !e.refs[modelKey].detail?.dataUrl) {
         setGPS(true, `Generating <span class="mono">${esc(locId)} · detail</span>`, `${modelMeta.label} · space-locked from wide`, 60);
         try {
           const editSpec = composer.composeEnvironmentReferenceEditPrompt(e, "detail");
@@ -10289,6 +10599,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     else if (action === "create-shot")        showCreateShotModal();
     else if (action === "create-asset")       showCreateAssetModal();
     else if (action === "gen-asset")          handleGenerateAsset(target.dataset.assetId);
+    else if (action === "upload-cast")        showUploadCharacterModal(target.dataset.charId);
+    else if (action === "upload-env")         showUploadEnvironmentModal(target.dataset.locId);
+    else if (action === "upload-asset")       showUploadAssetModal(target.dataset.assetId);
   });
 
   // ─── Inject missing DOM hooks into mockup ───────────────────────────
