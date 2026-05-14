@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="e9400190c8c6" data-build-time="2026-05-14T22:34:11.770Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"e9400190c8c6",time:"2026-05-14T22:34:11.770Z"};</script>
+<meta name="elevenx-build" content="2e76072af025" data-build-time="2026-05-14T22:51:16.296Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"2e76072af025",time:"2026-05-14T22:51:16.296Z"};</script>
 
 </head>
-<!-- elevenx-build: e9400190c8c6 @ 2026-05-14T22:34:11.770Z -->
+<!-- elevenx-build: 2e76072af025 @ 2026-05-14T22:51:16.296Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -12902,7 +12902,19 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       const inShot = (shot.cast_in_frame || []).find(x => x.character_id === c.id);
       return inShot?.role_in_shot === "speaking";
     }) || castInFrame[0];
-    if (!speakingChar) throw new Error("No cast in frame — can't anchor keyframe");
+    if (!speakingChar) {
+      // v4.5: distinguish "shot has no cast at all" from "cast IDs don't
+      // resolve in current bible". The latter is the cross-project mismatch
+      // pattern; the catch block in handleRollShot uses err.message verbatim
+      // in the toast, so make it specific.
+      const declaredIds = (shot.cast_in_frame || [])
+        .map(c => c.character_id)
+        .filter(Boolean);
+      if (declaredIds.length === 0) {
+        throw new Error("shot has no cast_in_frame entries");
+      }
+      throw new Error(`cast_in_frame IDs [${declaredIds.join(", ")}] not in current Cast Bible`);
+    }
     const charRef = refUrlFor(speakingChar, "three_quarter")
                  || refUrlFor(speakingChar, "head_on")
                  || refUrlFor(speakingChar, "full_body");
@@ -13123,6 +13135,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     const envs       = await Storage.getAll("environments");
     const allAssets  = await Storage.getAll("assets");
     const project    = await Storage.Projects.getActive();
+    // v4.5: pin the storyboard Spec rail to whatever shot is being rolled,
+    // so the user sees an accurate panel after a click (without having to
+    // hover) and during the rolling state. No-op if the panel isn't mounted.
+    renderStoryboardSpecRail(shot);
 
     const castInFrame = (shot.cast_in_frame || []).map(c => characters.find(x => x.id === c.character_id)).filter(Boolean);
     const environment = envs.find(x => x.id === shot.location?.location_id);
@@ -13154,17 +13170,69 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           if (State.activeShotId === shotId) renderShotEditor(shotId);
           renderStoryboard();
         } catch (err) {
-          // Don't bail entirely — fall back to a cast portrait
-          console.warn("[keyframe] auto-gen failed, falling back to cast portrait:", err);
-          toast(`Keyframe gen failed (${err.message}); using cast portrait as fallback`, { tone: "warn" });
-          startImage = refUrlFor(castInFrame[0], "three_quarter") || refUrlFor(castInFrame[0], "head_on");
+          // v4.5: the pre-fix catch advertised a cast-portrait fallback
+          // unconditionally, then tried refUrlFor(castInFrame[0], ...).
+          // When the throw fired because castInFrame was EMPTY (the common
+          // cross-bible case — shot.cast_in_frame references character_ids
+          // that don't exist in the currently loaded Cast Bible),
+          // castInFrame[0] was undefined, the advertised fallback was a
+          // no-op, and the next guard fired a contradictory second toast
+          // ("needs a keyframe… generate cast refs first").
+          //
+          // New behaviour: try a real fallback ladder, then emit a single
+          // accurate toast based on what actually happened.
+          console.warn("[keyframe] auto-gen failed; trying fallback ladder:", err);
+          let fallbackSource = null;
+          // 1. Cast portrait of any in-frame character (3/4 → head_on → full_body)
+          for (const c of castInFrame) {
+            const url = refUrlFor(c, "three_quarter")
+                     || refUrlFor(c, "head_on")
+                     || refUrlFor(c, "full_body");
+            if (url) {
+              startImage = url;
+              fallbackSource = `cast portrait (${c.display_name || c.id})`;
+              break;
+            }
+          }
+          // 2. Environment ref (wide → detail) — useful when the shot is
+          //    location-driven and cast IDs don't resolve in this bible.
+          if (!startImage && environment) {
+            const envUrl = refUrlFor(environment, "wide") || refUrlFor(environment, "detail");
+            if (envUrl) {
+              startImage = envUrl;
+              fallbackSource = `${environment.display_name || environment.id} (environment ref)`;
+            }
+          }
+          if (startImage) {
+            toast(`Keyframe gen failed (${err.message}); anchored on ${fallbackSource} instead.`, { tone: "warn" });
+          } else {
+            // 3. Real diagnosis — what was actually wrong?
+            const declaredIds = (shot.cast_in_frame || [])
+              .map(c => c.character_id)
+              .filter(Boolean);
+            const unresolvedIds = declaredIds.filter(id => !characters.find(x => x.id === id));
+            let msg;
+            if (declaredIds.length === 0) {
+              msg = `Shot ${shot.display_name || shotId} has no cast_in_frame entries and no environment ref to anchor on. Add a character or upload an environment anchor.`;
+            } else if (unresolvedIds.length === declaredIds.length) {
+              msg = `Shot ${shot.display_name || shotId} references cast not in this project's Cast Bible: ${unresolvedIds.join(", ")}. Re-import the matching bible or edit cast_in_frame to use IDs from the current cast.`;
+            } else {
+              msg = `Keyframe gen failed (${err.message}). No cast portrait or environment ref available to fall back on — upload anchors via the Anchor Planner first.`;
+            }
+            toast(msg, { tone: "warn" });
+            setGPS(false);
+            return; // activeJobs not yet incremented
+          }
         }
       }
       assets.startImageUrl = startImage;
+      // Safety guard: above ladder always either sets startImage or returns,
+      // so this branch should be unreachable. Kept as a belt-and-braces fence
+      // against future refactors that might bypass the ladder.
       if (!assets.startImageUrl) {
-        toast("This shot needs a keyframe or cast ref before image-to-video. Generate cast refs first.", { tone: "warn" });
+        toast(`Shot ${shot.display_name || shotId} can't anchor an image_to_video keyframe — no shot.keyframes, no cast portrait, no environment ref.`, { tone: "warn" });
         setGPS(false);
-        return; // activeJobs not yet incremented
+        return;
       }
     } else if (resolved.mode === "reference_to_video") {
       assets.referenceImageUrls = [];
@@ -13529,6 +13597,76 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         renderStoryboard();
       });
     });
+    // v4.5: wipe the v2 mockup's hardcoded Spec rail content (the
+    // "S05 · The interruption / Tom warmly cuts in" block authored at
+    // build time) and install a delegated hover handler so the panel
+    // reflects the actual hovered shot. Without this the rail kept
+    // showing Standup mockup content even when a Lionn shot was active —
+    // confused the audit and made the rail look like a data-binding bug.
+    renderStoryboardSpecRail(null);
+    const grid = $("#elx-shot-grid", s3);
+    if (grid && !grid._specHoverWired) {
+      grid.addEventListener("mouseover", async (e) => {
+        const card = e.target.closest(".elx-shot[data-shot-id]");
+        if (!card) return;
+        const sid = card.dataset.shotId;
+        if (grid._lastHoverShotId === sid) return;
+        grid._lastHoverShotId = sid;
+        const shot = await Storage.get("shots", sid);
+        if (shot) renderStoryboardSpecRail(shot);
+      });
+      grid.addEventListener("mouseleave", () => { grid._lastHoverShotId = null; });
+      grid._specHoverWired = true;
+    }
+  }
+
+  // v4.5: populate the storyboard-screen right-rail Spec panel
+  // ([data-rail="s3"] [data-rtp="spec"]) from a live shot. The mockup
+  // shipped this rail with hardcoded "S05 · The interruption" content that
+  // was never wired up, which meant the panel reported the wrong shot
+  // regardless of project / active selection. Pass `null` to render the
+  // empty-state placeholder.
+  async function renderStoryboardSpecRail(shot) {
+    const panel = document.querySelector('[data-rail="s3"] [data-rtp="spec"]');
+    if (!panel) return;
+    if (!shot) {
+      panel.innerHTML = `<div style="padding:24px; color:#6a6a78; font-style:italic; text-align:center; line-height:1.5;">Hover a shot card to preview its spec.</div>`;
+      return;
+    }
+    const characters  = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const moment = shot.the_moment || {};
+    const camera = shot.camera || {};
+    const cont   = shot.continuity || {};
+    const tc     = shot.timecode || {};
+    const env    = environments.find(e => e.id === shot.location?.location_id);
+    const shotNum = shot.shot_number != null ? `S${String(shot.shot_number).padStart(2,"0")}` : "S?";
+    const modeKey = shot.generation?.mode || "image_to_video";
+    const modeShort = { text_to_video:"t2v", image_to_video:"i2v", reference_to_video:"r2v", built_in_resolve:"built-in" }[modeKey] || modeKey;
+    const inheritsFromShot = cont.start_image_ref ? String(cont.start_image_ref).split(":")[0] : null;
+    const totalCost = (shot.takes || []).reduce((sum, t) => sum + (t.cost_usd || 0), 0);
+    // v4.5: cross-bible mismatch warning. If shot.cast_in_frame references
+    // character ids that don't resolve in the current Cast Bible, surface it
+    // here so the user can fix the shot before rolling.
+    const declaredIds = (shot.cast_in_frame || []).map(c => c.character_id).filter(Boolean);
+    const unresolvedIds = declaredIds.filter(id => !characters.find(x => x.id === id));
+    const mismatchBanner = unresolvedIds.length === declaredIds.length && declaredIds.length > 0
+      ? `<div style="margin-bottom:10px; padding:8px 10px; background:#2a1a14; border:1px solid #6a3a25; border-radius:4px; color:#e4a980; font-size:11px; line-height:1.4;">
+           ⚠ This shot references cast not in the loaded Cast Bible: <span class="mono">${esc(unresolvedIds.join(", "))}</span>. Edit cast_in_frame or re-import the matching bible before rolling.
+         </div>`
+      : "";
+    panel.innerHTML = `
+      ${mismatchBanner}
+      <div class="spec-row"><span class="k">Shot</span><span class="v mono">${esc(shotNum)} · ${esc(shot.display_name || shot.id)}</span></div>
+      <div class="spec-row"><span class="k">Moment</span><span class="v">${esc(moment.focal_point || moment.emotional_beat || "—")}</span></div>
+      <div class="spec-row"><span class="k">Mode</span><span class="v"><span class="pill pill--indigo">${esc(modeShort)}</span></span></div>
+      <div class="spec-row"><span class="k">Timecode</span><span class="v mono">${esc(tc.in || "?")} – ${esc(tc.out || "?")}</span></div>
+      <div class="spec-row"><span class="k">Duration</span><span class="v mono">${tc.duration_seconds ?? "?"}s</span></div>
+      <div class="spec-row"><span class="k">Location</span><span class="v">${esc(env?.display_name || shot.location?.location_id || "—")}</span></div>
+      ${inheritsFromShot ? `<div class="spec-row"><span class="k">Continuity</span><span class="v">inherits <span class="mono" style="color:#c9a25a">${esc(inheritsFromShot)}</span></span></div>` : ""}
+      <div class="spec-row"><span class="k">Takes</span><span class="v">${(shot.takes || []).length} rolled</span></div>
+      <div class="spec-row"><span class="k">Cost so far</span><span class="v mono" style="color:#c9a25a">${fmtUsd(totalCost)}</span></div>
+    `;
   }
 
   function adaptScreenFour() {
@@ -15863,6 +16001,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   NS.showEditCharacterModal   = showEditCharacterModal;
   NS.showEditEnvironmentModal = showEditEnvironmentModal;
   NS.showEditShotModal        = showEditShotModal;
+  // v4.5: expose the storyboard Spec rail helper so verify-build can
+  // confirm the wiring landed (replaces the hardcoded S05 mockup content).
+  NS.renderStoryboardSpecRail = renderStoryboardSpecRail;
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
