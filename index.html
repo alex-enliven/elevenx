@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="932593236f99" data-build-time="2026-05-15T06:11:26.720Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"932593236f99",time:"2026-05-15T06:11:26.720Z"};</script>
+<meta name="elevenx-build" content="9c280289f367" data-build-time="2026-05-15T06:18:04.627Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"9c280289f367",time:"2026-05-15T06:18:04.627Z"};</script>
 
 </head>
-<!-- elevenx-build: 932593236f99 @ 2026-05-15T06:11:26.720Z -->
+<!-- elevenx-build: 9c280289f367 @ 2026-05-15T06:18:04.627Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11424,21 +11424,148 @@ JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.showShotDoctorModal = showShotDoctorModal;
 
-  // v4.10: QA debug helper. Seeds forced states for the Shot Doctor's
-  // detection branches without firing real API calls — addresses v4.9 QA
-  // feedback that IDB-injected flags weren't being picked up because the
-  // audit reads derived state (e.g. shot mode after resolveShotModeForAudit)
-  // rather than raw stored fields. Each option mutates IDB + State to
-  // create the EXACT condition the audit looks for.
+  // v4.10/v4.11: QA debug helper. Seeds forced states for the Shot Doctor's
+  // detection branches without firing real API calls.
+  //
+  // v4.11 — Snapshot persistence: every destructive op (wipeCharRefs,
+  // wipeEnvRefs, wipeAssetRefs) auto-snapshots affected rows to IDB BEFORE
+  // mutating, returning the snapshot name in `applied[]`. The snapshot
+  // survives hard refreshes because it lives in IDB, not window globals —
+  // which is the exact failure mode that lost three character refs in v4.10
+  // QA when a `window.__charBackup` got wiped by a page navigation.
   //
   // Usage examples (paste in DevTools console):
+  //   // Manual snapshot ops
+  //   await ElevenX.__shotDoctorDebug({ snapshot: "pre-qa-session" })
+  //   await ElevenX.__shotDoctorDebug({ listSnapshots: true })
+  //   await ElevenX.__shotDoctorDebug({ restoreSnapshot: "pre-qa-session" })
+  //   await ElevenX.__shotDoctorDebug({ deleteSnapshot: "old-snapshot" })
+  //
+  //   // Test seeding (auto-snapshots before any destructive op)
   //   await ElevenX.__shotDoctorDebug({ clearShotForTask1: "the_boy_hides_the_shadow_2" })
-  //   await ElevenX.__shotDoctorDebug({ markKeyframeFailed: "ep01_s01_lionn_breathes", failureError: "Forced for QA" })
+  //   await ElevenX.__shotDoctorDebug({ markKeyframeFailed: "ep01_s01_lionn_breathes" })
   //   await ElevenX.__shotDoctorDebug({ wipeCharRefs: "lionn_2", ensureR2vShots: ["ep01_s02_the_first_team_2"] })
-  //   await ElevenX.__shotDoctorDebug({ setSpentUsd: 247 })
-  //   await ElevenX.__shotDoctorDebug({ restore: { shotId: "...", patch: {...} } })   // free-form patch
+  //   //   → returns { applied: ["snapshot auto-<iso> created", "wiped refs on character lionn_2"], ... }
+  //
+  //   // Restore by snapshot name if anything went sideways:
+  //   await ElevenX.__shotDoctorDebug({ restoreSnapshot: "auto-2026-05-15T06-30-00" })
+
+  // Internal: take a full snapshot of cast + environments + assets. The
+  // shots store is NOT included — Task 1/3 mutations there are intentional
+  // and shot rows are easier to rebuild via re-import than character refs
+  // (which carry user-uploaded image bytes).
+  async function _shotDoctorTakeSnapshot(name) {
+    const key = `__sd_snap_${name}`;
+    const characters   = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const assets       = await Storage.getAll("assets");
+    const snapshot = {
+      name,
+      created_at: Date.now(),
+      schema: 1,
+      characters,
+      environments,
+      assets,
+    };
+    await Storage.setSetting(key, snapshot);
+    // Compute size for UX reporting — dataUrls dominate
+    const sizeKb = Math.round(JSON.stringify(snapshot).length / 1024);
+    return {
+      name,
+      key,
+      counts: {
+        characters: characters.length,
+        environments: environments.length,
+        assets: assets.length,
+      },
+      sizeKb,
+    };
+  }
+
+  // Internal: restore a snapshot. Overwrites cast/env/asset rows wholesale
+  // (Storage.put with the same id is an upsert). Returns counts.
+  async function _shotDoctorRestoreSnapshot(name) {
+    const key = `__sd_snap_${name}`;
+    const snap = await Storage.getSetting(key, null);
+    if (!snap) throw new Error(`snapshot "${name}" not found`);
+    if (snap.__sd_tombstone) throw new Error(`snapshot "${name}" was deleted (tombstoned)`);
+    const counts = { characters: 0, environments: 0, assets: 0 };
+    for (const c of (snap.characters || [])) { await Storage.put("characters",   c); counts.characters++; }
+    for (const e of (snap.environments || [])) { await Storage.put("environments", e); counts.environments++; }
+    for (const a of (snap.assets || []))      { await Storage.put("assets",       a); counts.assets++; }
+    return { name, counts, created_at: snap.created_at };
+  }
+
   async function __shotDoctorDebug(opts = {}) {
     const out = { applied: [], errors: [] };
+
+    // ─── Snapshot ops (v4.11) ──────────────────────────────────────────
+    if (opts.snapshot) {
+      try {
+        const info = await _shotDoctorTakeSnapshot(opts.snapshot);
+        out.applied.push(`snapshot "${opts.snapshot}" saved (${info.counts.characters} chars, ${info.counts.environments} envs, ${info.counts.assets} assets, ~${info.sizeKb} KB)`);
+        out.snapshot = info;
+      } catch (err) { out.errors.push(`snapshot ${opts.snapshot}: ${err.message}`); }
+    }
+    if (opts.restoreSnapshot) {
+      try {
+        const info = await _shotDoctorRestoreSnapshot(opts.restoreSnapshot);
+        out.applied.push(`restored snapshot "${info.name}" (${info.counts.characters} chars, ${info.counts.environments} envs, ${info.counts.assets} assets from ${new Date(info.created_at).toISOString()})`);
+        out.restoredSnapshot = info;
+      } catch (err) { out.errors.push(`restoreSnapshot ${opts.restoreSnapshot}: ${err.message}`); }
+    }
+    if (opts.listSnapshots) {
+      try {
+        const all = await Storage.getAll("settings");
+        const snaps = all
+          .filter(r => r.key && r.key.startsWith("__sd_snap_") && !r.value?.__sd_tombstone)
+          .map(r => ({
+            name: r.key.slice("__sd_snap_".length),
+            created_at: r.value?.created_at,
+            iso: r.value?.created_at ? new Date(r.value.created_at).toISOString() : null,
+            counts: {
+              characters: (r.value?.characters || []).length,
+              environments: (r.value?.environments || []).length,
+              assets: (r.value?.assets || []).length,
+            },
+            sizeKb: Math.round(JSON.stringify(r.value || {}).length / 1024),
+          }))
+          .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+        out.snapshots = snaps;
+        out.applied.push(`listed ${snaps.length} snapshot(s)`);
+      } catch (err) { out.errors.push(`listSnapshots: ${err.message}`); }
+    }
+    if (opts.deleteSnapshot) {
+      try {
+        const key = `__sd_snap_${opts.deleteSnapshot}`;
+        const existing = await Storage.getSetting(key, null);
+        if (!existing || existing.__sd_tombstone) throw new Error(`snapshot "${opts.deleteSnapshot}" not found`);
+        // Storage doesn't expose a delete primitive for the settings store.
+        // Tombstone the entry — listSnapshots filters tombstones out, and
+        // restoreSnapshot throws on tombstoned entries (no data left).
+        await Storage.setSetting(key, { __sd_tombstone: true, deleted_at: Date.now() });
+        out.applied.push(`deleted snapshot "${opts.deleteSnapshot}"`);
+      } catch (err) { out.errors.push(`deleteSnapshot ${opts.deleteSnapshot}: ${err.message}`); }
+    }
+
+    // v4.11 auto-snapshot: any destructive op below auto-snapshots first.
+    // This is the actual structural fix for the v4.10 QA data loss. We only
+    // take the snapshot when at least one destructive op is requested, and
+    // we only take ONE per __shotDoctorDebug call (cheaper + cleaner).
+    const willMutateRefs = !!(opts.wipeCharRefs || opts.wipeEnvRefs || opts.wipeAssetRefs);
+    if (willMutateRefs && !opts._skipAutoSnapshot) {
+      try {
+        const autoName = `auto-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
+        const info = await _shotDoctorTakeSnapshot(autoName);
+        out.applied.push(`auto-snapshot "${autoName}" created before destructive ops (~${info.sizeKb} KB) — restore via __shotDoctorDebug({ restoreSnapshot: "${autoName}" })`);
+        out.autoSnapshot = autoName;
+      } catch (err) {
+        // If we can't snapshot, REFUSE to proceed with destructive ops.
+        // Hard rule: never wipe without a recovery path.
+        out.errors.push(`auto-snapshot failed (${err.message}); aborting destructive ops to protect user data. Pass _skipAutoSnapshot:true to override.`);
+        return out;
+      }
+    }
 
     // Force Task 1: clear focal_point, cast_in_frame, location on a shot so
     // the audit must derive replacements.
