@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="75f829e61bac" data-build-time="2026-05-15T23:04:59.345Z">
+<meta name="elevenx-build" content="3a91c9a8edf3" data-build-time="2026-05-15T23:14:46.863Z">
 <script>
 (function(){
-  var info = { hash: "75f829e61bac", time: "2026-05-15T23:04:59.345Z" };
+  var info = { hash: "3a91c9a8edf3", time: "2026-05-15T23:14:46.863Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 75f829e61bac @ 2026-05-15T23:04:59.345Z -->
+<!-- elevenx-build: 3a91c9a8edf3 @ 2026-05-15T23:14:46.863Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11135,6 +11135,61 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return orphans;
   }
 
+  // ─── v4.17 keyframe-gate primitives ────────────────────────────────────
+  // Schema:
+  //   shot.keyframes = {
+  //     // Legacy (v4.16-) fields preserved for back-compat:
+  //     startDataUrl, start_referenced_char, prompt, medium, last_*, ...
+  //     // v4.17 gate fields:
+  //     has_state_change: bool,        // proposer flag, user-overridable
+  //     start: {
+  //       candidates: [{id, dataUrl, model, seed, prompt, generated_at}],
+  //       approved_id: string | null,
+  //       approved_at: number | null,
+  //       approved_dataUrl: string | null,
+  //     },
+  //     end?: { same shape, only present when has_state_change is true }
+  //   }
+  //
+  // Gate satisfied = start.approved_dataUrl present AND (!has_state_change
+  // OR end.approved_dataUrl present). t2v/built_in_resolve shots are
+  // exempt from the gate (no keyframe required by the underlying model).
+  function isShotGateSatisfied(shot) {
+    const k = shot?.keyframes || {};
+    if (!k.start?.approved_dataUrl) return false;
+    if (k.has_state_change && !k.end?.approved_dataUrl) return false;
+    return true;
+  }
+  NS.isShotGateSatisfied = isShotGateSatisfied;
+
+  function shotModeRequiresGate(shot) {
+    const mode = shot?.generation?.mode;
+    return mode !== "text_to_video"
+        && mode !== "built_in_resolve"
+        && mode !== "auto";  // auto-resolved at roll time; we check then
+  }
+  NS.shotModeRequiresGate = shotModeRequiresGate;
+
+  // Verb heuristic for has_state_change. State-change verbs imply a
+  // distinct end frame is needed (clash, ignite, capture, etc.);
+  // hold verbs imply a static moment (stand, hold, gaze). Default
+  // safe-side: TRUE — assume state change so the gate requires an end
+  // frame. User can toggle off per shot via the gate UI.
+  const STATE_CHANGE_VERBS = /\b(ignit|lift|fall|fled|flee|take|taken|captur|snap|sprint|jump|land|clash|strike|hide|hides|reveal|rise|rises|calm|transform|melt|shatter|awaken|burst|break|crash|enter|exit|approach|chase|throw|catch|drop|cut|slash|attack|emerge|vanish|appear|step|run|race|move|turn|spin|punch|kick|grab|push|pull|pick|raise|lower|open|close|smash)/i;
+  const HOLD_VERBS = /\b(stand|standing|hold|holds|watch|watching|speak|speaks|speaking|sit|sitting|gaze|gazes|gazing|look|looks|looking|regard|regards|listen|listens|listening|breathe|breathes|breathing|wait|waits|waiting|pause|paus|consider|considers|considering|contemplate|rest|rests|resting)\b/i;
+  function proposeHasStateChangeForShot(shot) {
+    const text = [
+      shot.display_name || "",
+      shot.the_moment?.focal_point || "",
+      shot.the_moment?.emotional_beat || "",
+      shot.the_moment?.verb || "",
+    ].join(" ").toLowerCase();
+    if (STATE_CHANGE_VERBS.test(text)) return true;
+    if (HOLD_VERBS.test(text)) return false;
+    return true;  // default safe-side: require end frame
+  }
+  NS.proposeHasStateChangeForShot = proposeHasStateChangeForShot;
+
   // Heuristic: derive a focal_point from existing data when the field is
   // empty. NEVER invents lore — pulls from display_name / verb /
   // emotional_beat. Returns null if the shot has literally nothing to work
@@ -14284,6 +14339,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
 
     // Hydrate the right rail with full shot context
     renderShotEditorRail(shot, castInFrame, environment);
+    // v4.17: keyframe gate panel — start/end candidates + approval state
+    renderKeyframeGate(shot);
     // Render the collapsible prompt-preview block under the takes
     renderShotPromptBlock(shot, castInFrame, environment);
 
@@ -15035,6 +15092,248 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return dataUrl;
   }
 
+  // ─── v4.17 keyframe-gate candidate generation ─────────────────────────
+  // Generates N candidate keyframes for shot[slot] (slot ∈ {"start","end"})
+  // via Seedream edit with distinct seeds. Persists candidates to
+  // shot.keyframes[slot].candidates. Approval is a separate user action.
+  // Cost: ~$0.05 per candidate. Default N=3 → $0.15 per slot per gen.
+  //
+  // For "end" slot, the prompt includes "moment AFTER" language so the
+  // candidate represents the post-action state rather than the same beat
+  // as the start frame.
+  //
+  // Designed so generateKeyframeForShot's existing single-frame path keeps
+  // working — that function is now reserved for legacy / non-gated paths
+  // and v4.17 callers use generateKeyframeCandidates instead.
+  async function generateKeyframeCandidates(shotId, slot = "start", n = 3) {
+    if (!State.fal) throw new Error("No fal client (set worker URL first)");
+    if (slot !== "start" && slot !== "end") throw new Error(`invalid slot: "${slot}" (must be "start" or "end")`);
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) throw new Error(`shot ${shotId} not found`);
+    const project = await Storage.Projects.getActive();
+    const characters = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+
+    // v4.15: cast = cast_in_frame ∪ references[].character
+    const castInFrame = (shot.cast_in_frame || [])
+      .map(c => characters.find(x => x.id === c.character_id))
+      .filter(Boolean);
+    const refCharIds = (shot.references || [])
+      .map(r => {
+        if (!r || typeof r !== "object") return null;
+        const k = (r.kind || "").toLowerCase();
+        if (k !== "character" && k !== "char") return null;
+        return r.character_id || r.ref_id || r.id;
+      })
+      .filter(Boolean);
+    const refCast = refCharIds.map(id => characters.find(x => x.id === id)).filter(Boolean);
+    const allCast = [...castInFrame, ...refCast.filter(rc => !castInFrame.some(c => c.id === rc.id))];
+    const environment = environments.find(x => x.id === shot.location?.location_id);
+
+    // Pick anchor character (speaking role first; first available otherwise)
+    const speakingChar = allCast.find(c => {
+      const inShot = (shot.cast_in_frame || []).find(x => x.character_id === c.id);
+      return inShot?.role_in_shot === "speaking" || inShot?.role_in_shot === "speaks";
+    }) || allCast[0];
+    if (!speakingChar) throw new Error("no character anchor available — add to cast_in_frame or shot.references[]");
+    const charRef = refUrlFor(speakingChar, "three_quarter")
+                 || refUrlFor(speakingChar, "head_on")
+                 || refUrlFor(speakingChar, "full_body");
+    if (!charRef) throw new Error(`no uploaded ref for ${speakingChar.display_name} — upload via Cast & Locations first`);
+
+    // Build the slot-aware prompt. Re-uses generateKeyframeForShot's
+    // medium-aware language; v4.17 adds "moment BEFORE" vs "moment AFTER"
+    // framing so end candidates depict the post-action state.
+    const moment = shot.the_moment || {};
+    const camera = shot.camera || {};
+    const envName = environment?.display_name || "the location";
+    const medium = project?.medium || "live_action";
+    const styleSpec = composer.mediumPromptSpec
+      ? composer.mediumPromptSpec(medium)
+      : { opening: "Cinematic still, identity-locked.", qualityCues: "", negativeCues: "" };
+
+    const slotLanguage = slot === "start"
+      ? `Capture the moment BEFORE the action begins — character in their initial state, before "${moment.verb || moment.focal_point || "the beat"}"`
+      : `Capture the moment AFTER the action completes — character in their resolved/aftermath state, having just completed "${moment.verb || moment.focal_point || "the beat"}"`;
+
+    const distinctiveFeatures = Array.isArray(speakingChar.physical?.distinctive_features)
+      ? speakingChar.physical.distinctive_features.filter(s => s && String(s).trim()).slice(0, 4)
+      : [];
+    const neverList = Array.isArray(speakingChar.never)
+      ? speakingChar.never.filter(s => s && String(s).trim()).slice(0, 4)
+      : [];
+    const palette = Array.isArray(environment?.palette)
+      ? environment.palette.filter(s => s && String(s).trim()).slice(0, 5).join(", ")
+      : "";
+    const propsList = Array.isArray(environment?.props)
+      ? environment.props.filter(s => s && String(s).trim()).slice(0, 5).join(", ")
+      : "";
+    const continuityLocks = Array.isArray(environment?.continuity_locks)
+      ? environment.continuity_locks.filter(s => s && String(s).trim()).slice(0, 4)
+      : [];
+
+    const allCastNames = allCast.map(c => c.display_name).filter(Boolean);
+    let canon = project?.style_canon || "";
+    try {
+      if (canon && typeof NS.sanitizeStyleCanonForCharacter === "function") {
+        canon = NS.sanitizeStyleCanonForCharacter(canon, speakingChar.display_name, allCastNames);
+      }
+    } catch { /* keep raw */ }
+
+    const promptText = [
+      styleSpec.opening,
+      `${slotLanguage}.`,
+      `Frame: ${camera.framing || "medium shot"} of ${speakingChar.display_name}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
+      moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
+      distinctiveFeatures.length ? `Identity anchors (must be visible): ${distinctiveFeatures.join("; ")}.` : "",
+      `The character's face, hair, and wardrobe must match the reference image exactly. Identity-locked.`,
+      `Location: ${envName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}`,
+      environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}${environment.lighting.quality ? ", " + environment.lighting.quality : ""}.` : "",
+      palette ? `Color palette: ${palette}.` : "",
+      propsList ? `Props visible: ${propsList}.` : "",
+      continuityLocks.length ? `Continuity locks: ${continuityLocks.join("; ")}.` : "",
+      `Camera: ${camera.lens || "35mm equivalent"}, depth ${camera.depth || "shallow"}.`,
+      styleSpec.qualityCues || "",
+      canon ? `Style canon: ${canon}` : "",
+      project?.visual_rule ? `Visual rule: ${project.visual_rule}.` : "",
+      neverList.length ? `Never: ${neverList.join("; ")}.` : "",
+      `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare"}.`,
+    ].filter(s => s && s.length > 2).join(" ");
+
+    // Generate N candidates with distinct seeds.
+    const newCandidates = [];
+    const placeholderDataUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+    for (let i = 0; i < n; i++) {
+      const seed = Math.floor(Math.random() * 1_000_000);
+      const candidateId = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `cand_${Date.now()}_${i}`;
+      if (State.dryRun) {
+        newCandidates.push({
+          id: candidateId,
+          dataUrl: placeholderDataUrl,
+          model: "dry-run-placeholder",
+          seed,
+          prompt: promptText,
+          generated_at: Date.now(),
+        });
+        console.log(`[dry-run · keyframe-candidate] shot=${shot.id} slot=${slot} seed=${seed}`);
+        continue;
+      }
+      try {
+        const result = await State.fal.seedreamEdit({
+          prompt: promptText,
+          image_urls: [charRef],
+          num_images: 1,
+          seed,
+        });
+        const imgUrl = result?.images?.[0]?.url;
+        if (!imgUrl) throw new Error("Seedream returned no image");
+        const blob = await fetch(imgUrl).then(r => r.blob());
+        const dataUrl = await blobToDataUrl(blob);
+        newCandidates.push({
+          id: candidateId,
+          dataUrl,
+          model: "seedream-v4.5",
+          seed,
+          prompt: promptText,
+          generated_at: Date.now(),
+        });
+        await trackCost(0.05, `seedream keyframe candidate ${shot.id}/${slot}`);
+      } catch (err) {
+        console.warn(`[keyframe-candidate] ${slot} ${i+1}/${n} failed:`, err);
+      }
+    }
+    if (newCandidates.length === 0) throw new Error("all candidate generations failed");
+
+    // Persist — append, never replace, so multiple "Generate" clicks
+    // accumulate candidate options.
+    const freshShot = await Storage.get("shots", shotId);
+    freshShot.keyframes = freshShot.keyframes || {};
+    freshShot.keyframes[slot] = freshShot.keyframes[slot] || {
+      candidates: [], approved_id: null, approved_at: null, approved_dataUrl: null,
+    };
+    freshShot.keyframes[slot].candidates = [...(freshShot.keyframes[slot].candidates || []), ...newCandidates];
+    await Storage.put("shots", freshShot);
+    return newCandidates;
+  }
+  NS.generateKeyframeCandidates = generateKeyframeCandidates;
+
+  // v4.17 click handlers for the keyframe gate UI
+  async function handleGenerateKeyframeCandidates(shotId, slot) {
+    if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
+    if (!shotId || !slot) return;
+    setGPS(true, `Generating 3 keyframe candidates for ${slot}`, "seedream-v4.5 · 3 seeds", 20);
+    try {
+      const candidates = await generateKeyframeCandidates(shotId, slot, 3);
+      setGPS(false);
+      toast(`✓ Generated ${candidates.length} keyframe candidate(s) for ${slot}. Click one to approve.`, { duration: 6000 });
+      if (State.activeShotId === shotId) renderShotEditor(shotId);
+      renderStoryboard();
+    } catch (err) {
+      setGPS(false);
+      toast(`Keyframe gen failed: ${err.message}`, { tone: "warn", duration: 8000 });
+      console.error("[keyframe-candidates]", err);
+    }
+  }
+  async function handleApproveCandidate(shotId, slot, candidateId) {
+    if (!shotId || !slot || !candidateId) return;
+    try {
+      await approveKeyframeCandidate(shotId, slot, candidateId);
+      toast(`✓ ${slot[0].toUpperCase()}${slot.slice(1)} frame approved.`, { duration: 3000 });
+      if (State.activeShotId === shotId) renderShotEditor(shotId);
+      renderStoryboard();
+    } catch (err) {
+      toast(`Approve failed: ${err.message}`, { tone: "warn" });
+    }
+  }
+  async function handleToggleStateChange(shotId, value) {
+    if (!shotId) return;
+    try {
+      await setShotHasStateChange(shotId, value);
+      if (State.activeShotId === shotId) renderShotEditor(shotId);
+    } catch (err) {
+      toast(`Toggle failed: ${err.message}`, { tone: "warn" });
+    }
+  }
+
+  // v4.17: approve a specific candidate for a slot. Sets approved_id +
+  // approved_dataUrl (denormalised for fast reads). Idempotent.
+  async function approveKeyframeCandidate(shotId, slot, candidateId) {
+    if (slot !== "start" && slot !== "end") throw new Error(`invalid slot: "${slot}"`);
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) throw new Error(`shot ${shotId} not found`);
+    const slotData = shot.keyframes?.[slot];
+    if (!slotData) throw new Error(`shot has no keyframes.${slot} (generate candidates first)`);
+    const candidate = (slotData.candidates || []).find(c => c.id === candidateId);
+    if (!candidate) throw new Error(`candidate ${candidateId} not found in keyframes.${slot}.candidates`);
+    slotData.approved_id = candidateId;
+    slotData.approved_at = Date.now();
+    slotData.approved_dataUrl = candidate.dataUrl;
+    // Back-compat: also stamp legacy startDataUrl so any code path that
+    // still reads it (the v4.5 fallback ladder, etc.) sees the approved frame.
+    if (slot === "start") {
+      shot.keyframes.startDataUrl = candidate.dataUrl;
+    }
+    await Storage.put("shots", shot);
+    return { slot, approved_id: candidateId };
+  }
+  NS.approveKeyframeCandidate = approveKeyframeCandidate;
+
+  // v4.17: toggle has_state_change. When flipping to true, ensure the end
+  // slot exists (empty). When flipping to false, leave end data in place
+  // (don't destroy work) but the gate stops requiring it.
+  async function setShotHasStateChange(shotId, value) {
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) throw new Error(`shot ${shotId} not found`);
+    shot.keyframes = shot.keyframes || {};
+    shot.keyframes.has_state_change = !!value;
+    if (value && !shot.keyframes.end) {
+      shot.keyframes.end = { candidates: [], approved_id: null, approved_at: null, approved_dataUrl: null };
+    }
+    await Storage.put("shots", shot);
+    return shot.keyframes.has_state_change;
+  }
+  NS.setShotHasStateChange = setShotHasStateChange;
+
   // Generate an ElevenLabs v3 voice overlay for a single take.
   // Pulls dialogue + voice_id from the shot + cast bible. The result is
   // stored on the take as audioDataUrl + overlay metadata. Playback in the
@@ -15268,6 +15567,24 @@ JSON object only. No commentary. No fences. No trailing text.`;
       return;
     }
 
+    // v4.17 hard keyframe-gate. i2v / r2v / kling shots require approved
+    // start frame (and approved end frame if has_state_change). t2v is
+    // exempt — Seedance composes from prompt directly. Note: at this point
+    // shot.generation.mode may still be "auto" — we evaluate after mode
+    // resolution below, since the gate predicate is mode-dependent. For
+    // shots with mode declared upfront we can check early.
+    if (shotModeRequiresGate(shot) && !isShotGateSatisfied(shot)) {
+      const missing = [];
+      if (!shot.keyframes?.start?.approved_dataUrl) missing.push("start frame");
+      if (shot.keyframes?.has_state_change && !shot.keyframes?.end?.approved_dataUrl) missing.push("end frame");
+      toast(
+        `Roll blocked for ${shot.display_name || shotId} — keyframe gate not satisfied. Approve ${missing.join(" + ")} via the 🎯 Keyframe gate panel in the Shot Editor before rolling.`,
+        { tone: "warn", duration: 10000 }
+      );
+      console.warn(`[v4.17 keyframe-gate] ${shotId} blocked:`, missing);
+      return;
+    }
+
     const castInFrame = (shot.cast_in_frame || []).map(c => characters.find(x => x.id === c.character_id)).filter(Boolean);
     const environment = envs.find(x => x.id === shot.location?.location_id);
     // v3 multi-asset references — style frames / props / extra environments
@@ -15316,7 +15633,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // (much more expensive) Seedance roll fires.
     let assets = { referenceImageUrls: [] };
     if (resolved.mode === "image_to_video") {
-      let startImage = shot.keyframes?.startDataUrl;
+      // v4.17: prefer approved gate frame; fall back to legacy startDataUrl.
+      // The gate write-path (approveKeyframeCandidate) also stamps the
+      // legacy field, so both reads stay in lockstep.
+      let startImage = shot.keyframes?.start?.approved_dataUrl
+                    || shot.keyframes?.startDataUrl;
       if (!startImage) {
         setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, "seedream-v4.5 · cast-anchored", 30);
         try {
@@ -15558,13 +15879,42 @@ JSON object only. No commentary. No fences. No trailing text.`;
       return;
     }
 
-    setGPS(true, `Rolling Seedance · <span class="mono">${esc(shotId)}</span>`, `${resolved.mode} · est ${fmtUsd(estCost)}`, 5);
+    // v4.17 motion routing: i2v shots with has_state_change + both frames
+    // approved go through Kling O1 dual-keyframe (interpolates start → end).
+    // i2v hold shots stay on Seedance i2v (single start frame). t2v / r2v
+    // unchanged. Per audit (2026-05-16) recommendation: Kling's dual-frame
+    // mode is what the "constrained motion between approved anchors" goal
+    // actually needs — Seedance can't pin an end frame.
+    const useKlingDualFrame =
+      resolved.mode === "image_to_video"
+      && shot.keyframes?.has_state_change
+      && shot.keyframes?.end?.approved_dataUrl;
+    const renderEngine = useKlingDualFrame ? "kling-o1-dual" : `seedance-${resolved.mode}`;
+    setGPS(true, `Rolling ${useKlingDualFrame ? "Kling O1 dual-keyframe" : "Seedance"} · <span class="mono">${esc(shotId)}</span>`, `${renderEngine} · est ${fmtUsd(estCost)}`, 5);
 
     try {
       let result;
-      if (resolved.mode === "text_to_video") result = await State.fal.seedanceTextToVideo(composed.body);
-      else if (resolved.mode === "image_to_video") result = await State.fal.seedanceImageToVideo(composed.body);
-      else result = await State.fal.seedanceReferenceToVideo(composed.body);
+      if (resolved.mode === "text_to_video") {
+        result = await State.fal.seedanceTextToVideo(composed.body);
+      } else if (resolved.mode === "image_to_video") {
+        if (useKlingDualFrame) {
+          // Kling O1 dual-keyframe — start_image_url + tail_image_url.
+          // Re-uses the composed Seedance prompt for the visual direction;
+          // both anchors are gate-approved frames.
+          const klingBody = {
+            prompt: composed.prompt,
+            image_url: shot.keyframes.start.approved_dataUrl,
+            tail_image_url: shot.keyframes.end.approved_dataUrl,
+            duration: composed.body.duration,
+            aspect_ratio: composed.body.aspect_ratio,
+          };
+          result = await State.fal.klingDualKeyframe(klingBody);
+        } else {
+          result = await State.fal.seedanceImageToVideo(composed.body);
+        }
+      } else {
+        result = await State.fal.seedanceReferenceToVideo(composed.body);
+      }
 
       const videoUrl = result?.video?.url;
       if (!videoUrl) throw new Error("No video URL in Seedance response.");
@@ -15585,6 +15935,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         id: crypto.randomUUID(),
         shotId,
         mode: resolved.mode,
+        // v4.17: explicit render engine so the storyboard / Exports can
+        // tell Kling-routed takes apart from Seedance ones.
+        render_engine: renderEngine,
         prompt: composed.prompt,
         request: requestForPersist,
         videoDataUrl,
@@ -15801,6 +16154,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
     else if (action === "roll-all-pending")   handleRollAllPending();
     else if (action === "producer-prompt")    showProducerPromptModal();
     else if (action === "shot-doctor")        showShotDoctorModal();
+    else if (action === "gen-keyframe-candidates") handleGenerateKeyframeCandidates(target.dataset.shotId, target.dataset.slot);
+    else if (action === "approve-candidate")  handleApproveCandidate(target.dataset.shotId, target.dataset.slot, target.dataset.candidateId);
+    else if (action === "toggle-state-change") handleToggleStateChange(target.dataset.shotId, target.checked);
     else if (action === "finish-play-all")    playSequenceFromIdx(0);
     else if (action === "finish-pause")       $("#elx-finish-video")?.pause();
     else if (action === "finish-score-pick") {
@@ -16088,6 +16444,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       <div class="s4" id="elx-shot-editor">
         <h2 class="s4__title" style="font-family:Inter,sans-serif; font-size:18px; margin:0 0 6px;">Shot Editor</h2>
         <div class="elx-shot-context" id="elx-shot-context"></div>
+        <div class="elx-keyframe-gate" id="elx-keyframe-gate" style="margin:0 0 16px;"></div>
         <div class="elx-preview-wrap" style="position:relative; aspect-ratio:16/9; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; overflow:hidden; margin-bottom:16px;">
           <div class="elx-preview-frame" style="width:100%; height:100%;"></div>
         </div>
@@ -16096,6 +16453,108 @@ JSON object only. No commentary. No fences. No trailing text.`;
       </div>
     `;
   }
+
+  // v4.17: render the keyframe gate panel in the Shot Editor. Shows the
+  // start frame slot (always) + end frame slot (when has_state_change),
+  // each with a candidate strip + approve interactions + a "Generate 3
+  // candidates" button. Gate status banner indicates whether Roll is
+  // unlocked.
+  function renderKeyframeGate(shot) {
+    const host = $("#elx-keyframe-gate");
+    if (!host || !shot) return;
+    // t2v / built_in_resolve shots don't use a keyframe — render a compact
+    // explainer banner instead of the full gate UI.
+    const mode = shot.generation?.mode || "auto";
+    if (mode === "text_to_video" || mode === "built_in_resolve") {
+      host.innerHTML = `
+        <div style="padding:10px 12px; background:#14141a; border:1px solid #2a2a35; border-radius:8px; font-size:11.5px; color:#9a9aab;">
+          🎯 Keyframe gate not required for <span class="mono" style="color:#c9a25a;">${esc(mode)}</span> — Seedance composes the scene from prompt directly.
+        </div>
+      `;
+      return;
+    }
+    const kf = shot.keyframes || {};
+    const hasStateChange = !!kf.has_state_change;
+    const startSlot = kf.start || { candidates: [], approved_id: null };
+    const endSlot   = kf.end   || { candidates: [], approved_id: null };
+    const startOK = !!startSlot.approved_dataUrl;
+    const endOK   = !hasStateChange || !!endSlot.approved_dataUrl;
+    const gateOK  = startOK && endOK;
+
+    const renderCandidateStrip = (slot, slotData) => {
+      const candidates = slotData.candidates || [];
+      if (candidates.length === 0) {
+        return `<div style="padding:14px; color:#6a6a78; font-size:11px; font-style:italic; text-align:center; border:1px dashed #2a2a35; border-radius:4px;">No candidates yet. Click "Generate 3 candidates" → Seedream produces 3 variations to pick from. ~$0.15.</div>`;
+      }
+      return `<div style="display:flex; gap:6px; flex-wrap:wrap;">${candidates.map(c => {
+        const isApproved = c.id === slotData.approved_id;
+        return `<div
+          data-action="approve-candidate"
+          data-shot-id="${esc(shot.id)}"
+          data-slot="${slot}"
+          data-candidate-id="${esc(c.id)}"
+          title="${isApproved ? "Approved" : "Click to approve as the " + slot + " frame"}"
+          style="
+            width: 120px; aspect-ratio: 16/9;
+            background-image: url('${c.dataUrl}');
+            background-size: cover; background-position: center;
+            border: 2px solid ${isApproved ? "#4ade80" : "#2a2a35"};
+            border-radius: 4px; cursor: pointer; position: relative;
+            transition: border-color .1s;
+          ">
+          ${isApproved ? `<span style="position:absolute; top:2px; right:4px; background:#4ade80; color:#0a0a0c; font-size:10px; font-weight:700; padding:1px 4px; border-radius:2px;">✓ approved</span>` : ""}
+          <span style="position:absolute; bottom:2px; left:4px; font-size:9px; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.8); font-family:'JetBrains Mono', monospace;">${c.model || "?"} · seed ${c.seed ?? "—"}</span>
+        </div>`;
+      }).join("")}</div>`;
+    };
+
+    host.innerHTML = `
+      <div style="background:#14141a; border:1px solid ${gateOK ? "#3a5a3a" : "#5a3a2a"}; border-radius:8px; padding:12px 14px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="font-size:13px; font-weight:600; color:#e8e8ee;">🎯 Keyframe gate</span>
+            <span style="font-size:11px; color:${gateOK ? "#4ade80" : "#fbbf24"};">${gateOK ? "✓ satisfied — Roll Seedance enabled" : "Approve frames below before rolling"}</span>
+          </div>
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; font-size:11px; color:#9a9aab;">
+            <input type="checkbox" ${hasStateChange ? "checked" : ""}
+                   data-action="toggle-state-change" data-shot-id="${esc(shot.id)}"
+                   style="width:13px; height:13px; cursor:pointer;">
+            Has state change (requires end frame · Kling dual-keyframe)
+          </label>
+        </div>
+        <!-- Start frame slot -->
+        <div style="margin-bottom:${hasStateChange ? "12" : "0"}px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+            <span style="font-size:11.5px; color:${startOK ? "#4ade80" : "#e8e8ee"}; font-weight:600;">
+              Start frame ${startOK ? "✓" : "(required)"}
+            </span>
+            <button type="button"
+                    data-action="gen-keyframe-candidates" data-shot-id="${esc(shot.id)}" data-slot="start"
+                    style="background:#14141a; color:#c9a25a; border:1px solid #c9a25a; padding:5px 11px; border-radius:4px; font-size:11px; cursor:pointer;">
+              ${(startSlot.candidates || []).length > 0 ? "+ Generate 3 more" : "Generate 3 candidates"} <span style="color:#6a6a78;">· ~$0.15</span>
+            </button>
+          </div>
+          ${renderCandidateStrip("start", startSlot)}
+        </div>
+        ${hasStateChange ? `
+        <!-- End frame slot -->
+        <div>
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+            <span style="font-size:11.5px; color:${endOK ? "#4ade80" : "#e8e8ee"}; font-weight:600;">
+              End frame ${endOK ? "✓" : "(required for state-change shots)"}
+            </span>
+            <button type="button"
+                    data-action="gen-keyframe-candidates" data-shot-id="${esc(shot.id)}" data-slot="end"
+                    style="background:#14141a; color:#c9a25a; border:1px solid #c9a25a; padding:5px 11px; border-radius:4px; font-size:11px; cursor:pointer;">
+              ${(endSlot.candidates || []).length > 0 ? "+ Generate 3 more" : "Generate 3 candidates"} <span style="color:#6a6a78;">· ~$0.15</span>
+            </button>
+          </div>
+          ${renderCandidateStrip("end", endSlot)}
+        </div>` : ""}
+      </div>
+    `;
+  }
+  NS.renderKeyframeGate = renderKeyframeGate;
 
   // Replace the static v2 mockup right rail with dynamic, shot-aware content.
   // Shows: brief description, cast in frame with their action+dialogue, camera,
@@ -18454,6 +18913,34 @@ JSON object only. No commentary. No fences. No trailing text.`;
           });
           dirty = true;
         }
+        // v4.17: backfill keyframes.start.approved_dataUrl from legacy
+        // keyframes.startDataUrl. Pre-v4.17 shots had a single startDataUrl
+        // field that the gate doesn't read directly. Wrap it in the new
+        // shape with a synthetic "legacy" candidate so the gate sees it as
+        // pre-approved (legacy_pre_gate takes are fine to keep; the gate
+        // applies to NEW rolls). Also seed has_state_change proposer.
+        const legacyStart = shot.keyframes?.startDataUrl;
+        if (legacyStart && !shot.keyframes?.start) {
+          shot.keyframes.start = {
+            candidates: [{
+              id: "legacy_pre_v417",
+              dataUrl: legacyStart,
+              model: "legacy",
+              seed: null,
+              prompt: shot.keyframes.prompt || null,
+              generated_at: shot.keyframes.start_generated_at || Date.now(),
+            }],
+            approved_id: "legacy_pre_v417",
+            approved_at: shot.keyframes.start_generated_at || Date.now(),
+            approved_dataUrl: legacyStart,
+          };
+          dirty = true;
+        }
+        if (shot.keyframes && shot.keyframes.has_state_change == null) {
+          shot.keyframes.has_state_change = proposeHasStateChangeForShot(shot);
+          dirty = true;
+        }
+
         // v4.16: strip embedded dataURIs from existing take.request payloads.
         // Audit found ~5 MB/take of base64 image data persisted on every
         // take's request body. Going-forward fixes are in handleRollShot,
