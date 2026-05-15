@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="d035f9ee6622" data-build-time="2026-05-14T23:25:29.522Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"d035f9ee6622",time:"2026-05-14T23:25:29.522Z"};</script>
+<meta name="elevenx-build" content="a903e91f95c5" data-build-time="2026-05-15T02:47:27.501Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"a903e91f95c5",time:"2026-05-15T02:47:27.501Z"};</script>
 
 </head>
-<!-- elevenx-build: d035f9ee6622 @ 2026-05-14T23:25:29.522Z -->
+<!-- elevenx-build: a903e91f95c5 @ 2026-05-15T02:47:27.501Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11927,6 +11927,17 @@ JSON object only. No commentary. No fences. No trailing text.`;
           validationReport.totals.i2vOrphan = (validationReport.totals.i2vOrphan || 0) + 1;
         }
       }
+      // 10. (v4.8) i2v with no anchorable content — image_to_video shot with
+      //     no cast_in_frame AND no inherited continuity. This is almost
+      //     always an atmospheric/establishing beat that should be
+      //     text_to_video. The Roll path auto-downgrades transparently, but
+      //     flagging at import gets the user to fix it permanently.
+      if (mode === "image_to_video"
+          && declaredCastIds.length === 0
+          && !s.continuity?.start_image_ref) {
+        issues.push({ kind: "i2v_no_anchors", detail: null });
+        validationReport.totals.i2vNoAnchors = (validationReport.totals.i2vNoAnchors || 0) + 1;
+      }
       validationReport.byShot.push({ shotId, displayName: s.display_name || `Shot ${shotNumber}`, issues });
 
       await Storage.put("shots", {
@@ -11970,7 +11981,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const vt = validationReport.totals;
     const totalIssues = vt.unresolvedCast + vt.unresolvedEnv + vt.missingFocal + vt.missingFraming
                       + vt.badDuration + vt.r2vOverflow
-                      + (vt.missingEmotional || 0) + (vt.missingRole || 0) + (vt.i2vOrphan || 0);
+                      + (vt.missingEmotional || 0) + (vt.missingRole || 0) + (vt.i2vOrphan || 0)
+                      + (vt.i2vNoAnchors || 0);
     if (totalIssues > 0) {
       const bits = [];
       if (vt.unresolvedCast > 0) bits.push(`${vt.unresolvedCast} cast_in_frame id(s) not in bible`);
@@ -11982,6 +11994,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (vt.missingEmotional)   bits.push(`${vt.missingEmotional} shot(s) without emotional_beat`);
       if (vt.missingRole)        bits.push(`${vt.missingRole} shot(s) with cast but no role_in_shot`);
       if (vt.i2vOrphan)          bits.push(`${vt.i2vOrphan} i2v shot(s) orphaned (no inherit + no manual_upload)`);
+      if (vt.i2vNoAnchors)       bits.push(`${vt.i2vNoAnchors} i2v shot(s) with no cast/inherit (auto-switch to t2v at roll)`);
       warnings.push(`Shot validation: ${bits.join(", ")}. See Storyboard for ⚠ badges.`);
     }
 
@@ -13771,17 +13784,41 @@ JSON object only. No commentary. No fences. No trailing text.`;
               .map(c => c.character_id)
               .filter(Boolean);
             const unresolvedIds = declaredIds.filter(id => !characters.find(x => x.id === id));
-            let msg;
-            if (declaredIds.length === 0) {
-              msg = `Shot ${shot.display_name || shotId} has no cast_in_frame entries and no environment ref to anchor on. Add a character or upload an environment anchor.`;
-            } else if (unresolvedIds.length === declaredIds.length) {
-              msg = `Shot ${shot.display_name || shotId} references cast not in this project's Cast Bible: ${unresolvedIds.join(", ")}. Re-import the matching bible or edit cast_in_frame to use IDs from the current cast.`;
+            // v4.8: When the shot has NO cast_in_frame entries at all AND no
+            // environment ref to fall back on, an atmospheric / establishing
+            // shot is almost certainly what the director intended (e.g.
+            // "The fallen kingdom breathes"). text_to_video composes the
+            // scene from prompt directly — no keyframe needed. Auto-downgrade
+            // at roll time so the shot still rolls cleanly. The downgrade is
+            // PER-ROLL only: shot.generation.mode is not mutated, so the user
+            // can still edit the shot to lock it in via the Edit Shot modal.
+            const focal = shot.the_moment?.focal_point;
+            if (declaredIds.length === 0 && focal && String(focal).trim().length >= 5) {
+              console.warn(`[roll-gate] auto-downgrading ${shotId} to text_to_video (no cast, no env ref, atmospheric focal_point present)`);
+              toast(
+                `Auto-switched "${shot.display_name || shotId}" to text_to_video — no cast or env ref to anchor on; this is an atmospheric beat. Edit the shot (generation.mode → text_to_video) to lock this in permanently.`,
+                { tone: "warn", duration: 9000 }
+              );
+              // Force t2v for this roll; composeSeedance(text_to_video)
+              // ignores assets.startImageUrl entirely.
+              resolved.mode = "text_to_video";
+              // Set a placeholder so the post-block safety guard doesn't
+              // trip on undefined assets.startImageUrl. The t2v composer
+              // doesn't consult it.
+              startImage = "auto-downgraded";
             } else {
-              msg = `Keyframe gen failed (${err.message}). No cast portrait or environment ref available to fall back on — upload anchors via the Anchor Planner first.`;
+              let msg;
+              if (declaredIds.length === 0) {
+                msg = `Shot ${shot.display_name || shotId} has no cast_in_frame entries, no environment ref, AND no focal_point — can't compose a prompt. Edit the shot to add focal_point + either cast or an environment anchor.`;
+              } else if (unresolvedIds.length === declaredIds.length) {
+                msg = `Shot ${shot.display_name || shotId} references cast not in this project's Cast Bible: ${unresolvedIds.join(", ")}. Re-import the matching bible or edit cast_in_frame to use IDs from the current cast.`;
+              } else {
+                msg = `Keyframe gen failed (${err.message}). No cast portrait or environment ref available to fall back on — upload anchors via the Anchor Planner first.`;
+              }
+              toast(msg, { tone: "warn" });
+              setGPS(false);
+              return; // activeJobs not yet incremented
             }
-            toast(msg, { tone: "warn" });
-            setGPS(false);
-            return; // activeJobs not yet incremented
           }
         }
       }
@@ -14245,6 +14282,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         return "cast_in_frame entries lack role_in_shot (composer can't pick speaking anchor)";
       case "i2v_orphan":
         return "image_to_video without inherited keyframe or 'manual_upload' continuity (will fail keyframe gate)";
+      // v4.8
+      case "i2v_no_anchors":
+        return "image_to_video with no cast_in_frame and no inherited keyframe — atmospheric shot. Will auto-switch to text_to_video at Roll time; recommend editing the shot to make text_to_video permanent.";
       default:
         return issue.kind;
     }
