@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="9c280289f367" data-build-time="2026-05-15T06:18:14.847Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"9c280289f367",time:"2026-05-15T06:18:14.847Z"};</script>
+<meta name="elevenx-build" content="a8367fd46bfb" data-build-time="2026-05-15T06:26:23.514Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"a8367fd46bfb",time:"2026-05-15T06:26:23.514Z"};</script>
 
 </head>
-<!-- elevenx-build: 9c280289f367 @ 2026-05-15T06:18:14.847Z -->
+<!-- elevenx-build: a8367fd46bfb @ 2026-05-15T06:26:23.514Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11496,7 +11496,28 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return { name, counts, created_at: snap.created_at };
   }
 
+  // v4.12: serialize all __shotDoctorDebug calls through an internal queue.
+  // Caught in v4.11 QA — `Promise.all([deleteSnapshot:"X", restoreSnapshot:"X"])`
+  // can race, with restore winning against not-yet-tombstoned data. The queue
+  // guarantees each call's effects complete before the next call starts,
+  // matching the contract callers reasonably expect ("the operations happen
+  // in the order I issued them"). Cost is a tiny serialization overhead;
+  // callers who want parallelism for snapshots can issue them in their own
+  // call (one __shotDoctorDebug invocation already runs its options
+  // sequentially internally).
+  let __sdDebugQueue = Promise.resolve();
   async function __shotDoctorDebug(opts = {}) {
+    const job = __sdDebugQueue.then(
+      () => __shotDoctorDebugImpl(opts),
+      () => __shotDoctorDebugImpl(opts),  // prior failure shouldn't poison the queue
+    );
+    // Don't let a rejection break the next caller's chain — they read errors
+    // through the returned promise, not via this queue handle.
+    __sdDebugQueue = job.then(() => {}, () => {});
+    return job;
+  }
+
+  async function __shotDoctorDebugImpl(opts = {}) {
     const out = { applied: [], errors: [] };
 
     // ─── Snapshot ops (v4.11) ──────────────────────────────────────────
