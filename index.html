@@ -4141,11 +4141,30 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="09ab1e37c1bc" data-build-time="2026-05-15T20:51:18.925Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"09ab1e37c1bc",time:"2026-05-15T20:51:18.925Z"};</script>
+<meta name="elevenx-build" content="b9b228b4d391" data-build-time="2026-05-15T21:17:53.984Z">
+<script>
+(function(){
+  var info = { hash: "b9b228b4d391", time: "2026-05-15T21:17:53.984Z" };
+  window.BUILD_INFO = info;
+  (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
+  // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
+  // a read still returns the marker by scraping the meta tag.
+  Object.defineProperty(window, "__getBuildInfo", {
+    value: function(){
+      if (window.ElevenX && window.ElevenX.BUILD_INFO) return window.ElevenX.BUILD_INFO;
+      if (window.BUILD_INFO) return window.BUILD_INFO;
+      var m = document.querySelector('meta[name="elevenx-build"]');
+      if (m) return { hash: m.getAttribute("content"), time: m.getAttribute("data-build-time") };
+      return null;
+    },
+    configurable: false,
+    writable: false,
+  });
+})();
+</script>
 
 </head>
-<!-- elevenx-build: 09ab1e37c1bc @ 2026-05-15T20:51:18.925Z -->
+<!-- elevenx-build: b9b228b4d391 @ 2026-05-15T21:17:53.984Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6495,6 +6514,14 @@ function resolveMode(shot, ctx = {}) {
 /**
  * Pre-flight checks for a shot before firing Seedance.
  * Returns { ok, errors[], warnings[] }. Caller decides whether to block.
+ *
+ * v4.14: enforces referential integrity. When ctx.bible is supplied
+ * (Sets of valid char/env/asset IDs), every foreign key in the shot
+ * (cast_in_frame[*].character_id, location.location_id, references[*])
+ * is hard-validated. Unresolved refs are ERRORS, not warnings — caught
+ * by the audit on 2026-05-15 as the actual root cause behind the entire
+ * v4.5–v4.13 swirl of symptomatic fixes. Make this layer the source of
+ * truth so Shot Doctor + Roll button stop disagreeing.
  */
 function preflightShot(shot, ctx = {}) {
   const errors = [];
@@ -6516,6 +6543,47 @@ function preflightShot(shot, ctx = {}) {
   const cast = shot.cast_in_frame || [];
   if (cast.length === 0 && shot.shot_number !== 1) {
     warnings.push("No cast in frame on a non-establishing shot. Likely a stub or pre-finalization state.");
+  }
+
+  // ─── v4.14 referential-integrity hard checks ───────────────────────────
+  // Run when the caller supplies a bible (Sets of valid IDs). Each unresolved
+  // foreign key is an ERROR, since composer + keyframe gen will fail in
+  // confusing ways downstream. Aggregates unresolved IDs into a single error
+  // string per kind so the Shot Doctor / Roll-gate UI can surface them
+  // compactly.
+  const bible = ctx.bible || {};
+  const refCheck = (set, kind, valueGetter, items) => {
+    // v4.14: duck-type the Set check — `instanceof Set` fails cross-realm
+    // (Node-created Sets passed into jsdom-loaded preflightShot). Just
+    // check the .has method directly.
+    if (!set || typeof set.has !== "function") return;  // bible not supplied for this kind
+    const seen = [];
+    for (const item of items || []) {
+      const v = valueGetter(item);
+      if (!v) continue;
+      if (!set.has(v)) seen.push(v);
+    }
+    if (seen.length > 0) {
+      errors.push(`${kind} ID(s) not in current bible: ${[...new Set(seen)].join(", ")}. Fix via Shot Doctor or re-import the matching bible.`);
+    }
+  };
+  refCheck(bible.characters, "cast_in_frame.character_id", (c) => typeof c === "string" ? c : c?.character_id, cast);
+  if (shot.location?.location_id) {
+    refCheck(bible.environments, "location.location_id", () => shot.location.location_id, [shot.location.location_id]);
+  }
+  // references[] can be heterogeneous — strings or {ref_id|asset_id|id, kind?}
+  const refList = Array.isArray(shot.references) ? shot.references : [];
+  const unresolvedRefs = [];
+  for (const ref of refList) {
+    const refId = typeof ref === "string"
+      ? ref
+      : ref?.ref_id || ref?.asset_id || ref?.id;
+    if (!refId) continue;
+    const known = (bible.characters?.has(refId)) || (bible.environments?.has(refId)) || (bible.assets?.has(refId));
+    if (!known) unresolvedRefs.push(refId);
+  }
+  if (unresolvedRefs.length > 0) {
+    errors.push(`references[] ID(s) not in current bible: ${[...new Set(unresolvedRefs)].join(", ")}. These rows don't exist for this project; fix via Shot Doctor.`);
   }
 
   // If reference_to_video, validate ref count budget
@@ -7018,8 +7086,29 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
   if (mode === "text_to_video") {
     body = { prompt, duration, aspect_ratio: aspect, resolution, generate_audio: genAudio };
   } else if (mode === "image_to_video") {
+    // v4.14: split the historical "assets.startImageUrl is required" error
+    // into three discriminable failure modes. The old single-message form
+    // hid root causes — every i2v call site got the same string regardless
+    // of whether the shot had no keyframe at all, the keyframe asset wasn't
+    // resolved, or the asset was resolved but had no rendered refs. Caught
+    // by the 2026-05-15 audit on Lionn: Night Prowler (2).
     if (!assets.startImageUrl) {
-      throw new Error("composeSeedance(image_to_video): assets.startImageUrl is required");
+      // The caller couldn't even attempt to resolve a keyframe. Look at
+      // what was passed in `assets` to discriminate.
+      const declaredCast = (shot.cast_in_frame || []).length;
+      const hasRef       = (shot.references || []).length;
+      const hasLoc       = !!shot.location?.location_id;
+      let detail;
+      if (declaredCast === 0 && !hasRef && !hasLoc) {
+        detail = "shot has no cast_in_frame, no references, no location.location_id — nothing for keyframe-gen to anchor on. Switch mode to text_to_video or add a reference.";
+      } else if (assets._keyframeAssetUnresolved) {
+        detail = `referenced asset/character/env id "${assets._keyframeAssetUnresolved}" not found in current bible. Run Shot Doctor to remap or re-import the matching bible.`;
+      } else if (assets._keyframeAssetEmpty) {
+        detail = `keyframe anchor "${assets._keyframeAssetEmpty}" was resolved but has no uploaded or generated refs. Upload via Cast & Locations or run "Generate 3 angles".`;
+      } else {
+        detail = "keyframe-gen failed to produce a start image, and no fallback (cast portrait, env plate, asset frame) was available.";
+      }
+      throw new Error(`composeSeedance(image_to_video): ${detail}`);
     }
     body = {
       prompt,
@@ -7030,7 +7119,7 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
   } else if (mode === "reference_to_video") {
     const refs = assets.referenceImageUrls || [];
     if (refs.length === 0) {
-      throw new Error("composeSeedance(reference_to_video): assets.referenceImageUrls[] is required");
+      throw new Error("composeSeedance(reference_to_video): no reference images resolved. Either cast_in_frame IDs don't match current bible, or the matching characters/assets have no uploaded/generated refs yet. Run Shot Doctor or upload via Cast & Locations.");
     }
     if (refs.length > 9) {
       throw new Error(`composeSeedance(reference_to_video): max 9 reference_images (got ${refs.length})`);
@@ -8749,6 +8838,18 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 (() => {
   const NS = window.ElevenX;
   if (!NS) { console.error("[ElevenX] missing namespace"); return; }
+
+  // v4.14: re-publish BUILD_INFO from inside the IIFE. The head-script sets
+  // it before this code runs, but the audit found cases where the global
+  // read came back null/undefined (likely an isolated-world or stale
+  // service-worker artefact). Re-anchoring here is idempotent and adds a
+  // second observable read path: `ElevenX.BUILD_INFO` survives even if
+  // something between the head and the IIFE wiped the global. The
+  // self-healing accessor `window.__getBuildInfo()` (set in the head script)
+  // is the universal fallback.
+  if (!NS.BUILD_INFO && typeof window.__getBuildInfo === "function") {
+    NS.BUILD_INFO = window.__getBuildInfo();
+  }
 
   const { Storage, SEED_DATA, FalClient, OpenAIClient, ElevenLabsClient, composer, modeResolver } = NS;
 
@@ -10882,6 +10983,18 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const envById  = new Map(environments.map(e => [e.id, e]));
     const assetById = new Map(assets.map(a => [a.id, a]));
 
+    // v4.14: live preflight for every shot. Surfaces referential-integrity
+    // errors that the static `_validation.issues` stamp may have missed
+    // (especially old shots imported before v4.6). The Doctor's report
+    // includes these even when no auto-fix is proposed, so users can see
+    // "this shot has 3 dangling refs" without rolling first to find out.
+    const liveIssuesByShot = new Map();
+    for (const s of shots) {
+      const live = await livePreflightShot(s);
+      if (live.issues?.length) {
+        liveIssuesByShot.set(s.id, live.issues);
+      }
+    }
     // Task 1 — proposed shot mutations. Each entry: { shotId, before, fixes:[{field, value, reason}] }
     // We DO NOT skip shots with approved takes for Task 1 (the focal_point /
     // attachment fixes are metadata-only and improve future re-rolls).
@@ -11042,6 +11155,18 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const remaining = Math.max(0, SHOT_DOCTOR_BUDGET_CAP_USD - (State.costSpentUsd || 0));
     const overBudget = totalProjection > remaining;
 
+    // v4.14: serialise the Map for transport + persistence — Maps don't
+    // survive structured clone in some IDB paths. liveIssues is an array of
+    // {shotId, displayName, issues:[{kind,detail}]}.
+    const liveIssues = [];
+    for (const [shotId, issues] of liveIssuesByShot) {
+      const shot = shots.find(s => s.id === shotId);
+      liveIssues.push({
+        shotId,
+        displayName: shot?.display_name || shotId,
+        issues,
+      });
+    }
     return {
       project: project ? { id: project.id, name: project.display_name } : null,
       counts: { shots: shots.length, characters: characters.length, environments: environments.length, assets: assets.length },
@@ -11049,6 +11174,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
       task2,
       task3,
       task3CostProjection,
+      // v4.14: integrity-preflight findings (separate from the static
+      // `_validation.issues` stamps so legacy shots without stamps still
+      // surface). Markdown renderer + Doctor modal both consume this.
+      liveIssues,
       budget: {
         capUsd: SHOT_DOCTOR_BUDGET_CAP_USD,
         spentUsd: State.costSpentUsd || 0,
@@ -11197,6 +11326,21 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // silent no-op (caught in v4.9 QA report).
     lines.push("## Shot fixes");
     lines.push("");
+    // v4.14: surface integrity-preflight findings first (these are
+    // typically what's blocking Roll Seedance, even when task1 looks empty).
+    if (plan.liveIssues?.length) {
+      lines.push(`**⛔ ${plan.liveIssues.length} shot${plan.liveIssues.length === 1 ? "" : "s"} fail integrity preflight — Roll is blocked until these are fixed:**`);
+      lines.push("");
+      lines.push("| Shot | Failing references |");
+      lines.push("|---|---|");
+      for (const li of plan.liveIssues) {
+        const issueLines = li.issues.map(i => describeShotIssue(i)).join("<br>");
+        lines.push(`| ${li.displayName} | ${issueLines} |`);
+      }
+      lines.push("");
+      lines.push("> The boot-time integrity migration auto-fixes IDs that have an unambiguous suffixed counterpart (e.g. `lionn` → `lionn_2`). Refs surfaced above couldn't be auto-fixed — either no match, or multiple ambiguous candidates. Open the Shot Editor → ✎ Edit shot to fix manually.");
+      lines.push("");
+    }
     if (task1Result?.diffs?.length) {
       lines.push(`**✓ Applied ${task1Result.diffs.length} shot fix${task1Result.diffs.length === 1 ? "" : "es"}:**`);
       lines.push("```");
@@ -12798,6 +12942,15 @@ JSON object only. No commentary. No fences. No trailing text.`;
     await Storage.Projects.setActive(createdProject.id);
 
     // 3. Characters
+    // v4.14: remap tables (bible-supplied id → final persisted id) for each
+    // kind. ensureUniqueId may suffix on collision (e.g. `lionn` → `lionn_2`
+    // on a re-import), so shot foreign keys authored against the bare ids
+    // would otherwise resolve to nothing. We collect the remaps here and
+    // apply them when persisting shots below — prevents the audit-class
+    // bug ("references point at non-existent rows") going forward.
+    const charIdRemap  = new Map();
+    const envIdRemap   = new Map();
+    const assetIdRemap = new Map();
     let charCount = 0;
     const idCollisions = new Set();
     for (const c of (bible.characters || [])) {
@@ -12805,6 +12958,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const desired = c.id || slugifyId("char", c.display_name);
       const charId = await ensureUniqueId("characters", desired);
       if (charId !== desired) idCollisions.add(`${desired} → ${charId}`);
+      // Always record both the desired (bible-supplied) and the slug-of-name
+      // mapping, so refs authored either way still remap correctly.
+      charIdRemap.set(desired, charId);
+      if (c.id && c.id !== desired) charIdRemap.set(c.id, charId);
       await Storage.put("characters", {
         id: charId,
         display_name: c.display_name,
@@ -12832,6 +12989,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const desired = e.id || slugifyId("env", e.display_name);
       const envId = await ensureUniqueId("environments", desired);
       if (envId !== desired) idCollisions.add(`${desired} → ${envId}`);
+      envIdRemap.set(desired, envId);
+      if (e.id && e.id !== desired) envIdRemap.set(e.id, envId);
       await Storage.put("environments", {
         id: envId,
         display_name: e.display_name,
@@ -12855,6 +13014,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const desired = a.id || slugifyId("asset", a.display_name);
       const assetId = await ensureUniqueId("assets", desired);
       if (assetId !== desired) idCollisions.add(`${desired} → ${assetId}`);
+      assetIdRemap.set(desired, assetId);
+      if (a.id && a.id !== desired) assetIdRemap.set(a.id, assetId);
       await Storage.put("assets", {
         id: assetId,
         display_name: a.display_name,
@@ -12912,22 +13073,64 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const shotId = await ensureUniqueId("shots", desired);
       if (shotId !== desired) idCollisions.add(`${desired} → ${shotId}`);
 
+      // v4.14: remap shot foreign keys through the bare→final ID tables we
+      // built while persisting characters/envs/assets. This is the upstream
+      // fix for the audit-identified bug; the boot-time
+      // migrateShotReferencesIntegrity() handles legacy data that was
+      // imported before this code shipped.
+      const remappedCastInFrame = Array.isArray(s.cast_in_frame)
+        ? s.cast_in_frame.map(entry => {
+            if (typeof entry === "string") {
+              return charIdRemap.get(entry) || entry;
+            }
+            if (entry && typeof entry === "object" && entry.character_id) {
+              const remapped = charIdRemap.get(entry.character_id);
+              return remapped ? { ...entry, character_id: remapped } : entry;
+            }
+            return entry;
+          })
+        : (s.cast_in_frame || []);
+      const declaredLocIdRaw = s.location_id || s.location?.location_id;
+      const remappedLocId = declaredLocIdRaw ? (envIdRemap.get(declaredLocIdRaw) || declaredLocIdRaw) : null;
+      const remappedReferences = Array.isArray(s.references)
+        ? s.references.map(ref => {
+            if (typeof ref === "string") {
+              return charIdRemap.get(ref) || envIdRemap.get(ref) || assetIdRemap.get(ref) || ref;
+            }
+            if (ref && typeof ref === "object") {
+              const out = { ...ref };
+              for (const key of ["ref_id", "asset_id", "id"]) {
+                if (out[key]) {
+                  out[key] = charIdRemap.get(out[key]) || envIdRemap.get(out[key]) || assetIdRemap.get(out[key]) || out[key];
+                  break;
+                }
+              }
+              return out;
+            }
+            return ref;
+          })
+        : (s.references || []);
+
       // ─── v4.6 per-shot validation ────────────────────────────────────────
       // Compute defects before persisting so the shot record carries the
       // diagnosis. Each defect is also pushed to validationReport so the
       // post-import modal can summarise.
+      // v4.14: validate against REMAPPED ids (post-remap-table application).
+      // Anything still unresolved after remapping is a genuine cross-bible
+      // problem, not just a stale-id artefact.
       const issues = [];
       // 1. Cast resolution — flag character_ids that don't exist in the bible.
-      const declaredCastIds = (s.cast_in_frame || []).map(c => c.character_id).filter(Boolean);
+      const declaredCastIds = remappedCastInFrame.map(c =>
+        typeof c === "string" ? c : c?.character_id
+      ).filter(Boolean);
       const unresolvedCastIds = declaredCastIds.filter(id => !validCharIds.has(id));
       if (unresolvedCastIds.length > 0) {
         issues.push({ kind: "cast_unresolved", detail: unresolvedCastIds });
         validationReport.totals.unresolvedCast += unresolvedCastIds.length;
       }
       // 2. Location resolution — flag location_id that doesn't exist in the bible.
-      const declaredLocId = s.location_id || s.location?.location_id;
-      if (declaredLocId && !validEnvIds.has(declaredLocId)) {
-        issues.push({ kind: "env_unresolved", detail: declaredLocId });
+      if (remappedLocId && !validEnvIds.has(remappedLocId)) {
+        issues.push({ kind: "env_unresolved", detail: remappedLocId });
         validationReport.totals.unresolvedEnv += 1;
       }
       // 3. focal_point — the single most important field for prompt assembly.
@@ -13014,13 +13217,15 @@ JSON object only. No commentary. No fences. No trailing text.`;
         the_moment: s.the_moment || {},
         camera: { aspect_ratio: "16:9", framing: "medium", movement: "locked", depth: "shallow", ...(s.camera || {}) },
         audio: s.audio || { generate_native: true },
-        location: { location_id: s.location_id || s.location?.location_id || null },
-        cast_in_frame: s.cast_in_frame || [],
-        cast_lockdown_required: (s.cast_in_frame || []).length >= 3,
+        // v4.14: persist remapped foreign keys (NOT raw bible IDs). Maps
+        // were built when characters/envs/assets were inserted above.
+        location: { location_id: remappedLocId },
+        cast_in_frame: remappedCastInFrame,
+        cast_lockdown_required: (remappedCastInFrame || []).length >= 3,
         generation: s.generation || { mode: "auto" },
         prompt_engineering: s.prompt_engineering || {},
         voiceover: s.voiceover || [],
-        references: s.references || [],
+        references: remappedReferences,
         director_note: s.director_note || "",
         watch_points: s.watch_points || [],
         takes: [],
@@ -14762,11 +14967,24 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // so the user sees an accurate panel after a click (without having to
     // hover) and during the rolling state. No-op if the panel isn't mounted.
     renderStoryboardSpecRail(shot);
-    // v4.7: critical-issue gate — refuse to fire Seedance on shots whose
-    // validator stamped them with issues that guarantee a wasted credit
-    // (cast/env unresolved, missing focal, i2v orphan). Surface the exact
-    // defect list so the user knows what to fix in the bible.
-    const critical = criticalIssuesOf(shot);
+    // v4.7+v4.14: critical-issue gate — refuse to fire Seedance on shots
+    // whose validator stamped them with issues that guarantee a wasted
+    // credit (cast/env unresolved, missing focal, i2v orphan), AND on
+    // shots that fail a fresh live preflight (references that don't
+    // resolve in the project's bible right now). The live preflight closes
+    // the gap that the audit found: shots imported before v4.6 had no
+    // _validation stamp, so the static gate let broken shots through.
+    const stampedCritical = criticalIssuesOf(shot);
+    const live = await livePreflightShot(shot);
+    const liveCritical = (live.issues || []).filter(i => CRITICAL_VALIDATION_KINDS.has(i.kind));
+    // Deduplicate by kind+detail signature
+    const seen = new Set();
+    const critical = [...stampedCritical, ...liveCritical].filter(i => {
+      const sig = i.kind + ":" + JSON.stringify(i.detail || null);
+      if (seen.has(sig)) return false;
+      seen.add(sig);
+      return true;
+    });
     if (critical.length > 0) {
       const lines = critical.map(i => "  • " + describeShotIssue(i)).join("\n");
       toast(
@@ -15022,6 +15240,15 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // Auto-demote any previously approved take to "rejected" so only one is approved at a time
       for (const t of shot.takes) if (t.status === "approved") t.status = "rejected";
       shot.takes.push(take);
+      // v4.14: clear stale keyframe-failure fingerprint. A successful take
+      // means the previous failure is no longer relevant. Without this,
+      // Shot Doctor + storyboard ⚠ badges keep showing the old error
+      // after the underlying problem was actually resolved — audit found
+      // an approved-take shot still flagged as "last_attempt_failed: true".
+      if (shot.keyframes) {
+        shot.keyframes.last_attempt_failed = false;
+        shot.keyframes.last_error = null;
+      }
       await Storage.put("shots", shot);
       await trackCost(estCost, `seedance ${resolved.mode} ${shotId}`);
       toast(`Take rolled · ${fmtUsd(estCost)} · ${resolved.mode}`);
@@ -15349,10 +15576,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // of how good the rest of the bible is. Soft = the take will fire but
   // will drift / be sub-optimal.
   const CRITICAL_VALIDATION_KINDS = new Set([
-    "cast_unresolved",  // composer can't anchor identity
-    "env_unresolved",   // composer can't anchor scene
-    "missing_focal",    // composeSeedance produces empty body
-    "i2v_orphan",       // i2v with no inheritance + no manual keyframe path
+    "cast_unresolved",       // composer can't anchor identity
+    "env_unresolved",        // composer can't anchor scene
+    "missing_focal",         // composeSeedance produces empty body
+    "i2v_orphan",            // i2v with no inheritance + no manual keyframe path
+    "references_unresolved", // v4.14: shot.references[] points at non-existent rows
   ]);
   function shotHasCriticalIssues(shot) {
     return (shot?._validation?.issues || []).some(i => CRITICAL_VALIDATION_KINDS.has(i.kind));
@@ -15361,6 +15589,44 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return (shot?._validation?.issues || []).filter(i => CRITICAL_VALIDATION_KINDS.has(i.kind));
   }
   NS.shotHasCriticalIssues = shotHasCriticalIssues;
+
+  // v4.14: live preflight that consults the project's bible. Runs the same
+  // referential-integrity check at Roll time AND at Shot Doctor audit time
+  // so both surfaces agree (caught in the audit: old shots imported before
+  // v4.6 had no _validation stamp, so the static gate let them through).
+  // Returns { ok, errors[], warnings[], issues[] } — `issues` is a synthetic
+  // _validation.issues-shaped list so it can be merged with the existing
+  // CRITICAL_VALIDATION_KINDS path.
+  async function livePreflightShot(shot) {
+    const characters   = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const assetsList   = await Storage.getAll("assets");
+    const bible = {
+      characters:   new Set(characters.map(c => c.id)),
+      environments: new Set(environments.map(e => e.id)),
+      assets:       new Set(assetsList.map(a => a.id)),
+    };
+    const pre = modeResolver.preflightShot(shot, { bible });
+    // Translate referential-integrity errors into the CRITICAL_VALIDATION_KINDS
+    // shape so the Roll gate + Spec rail + Shot Doctor all describe them
+    // with one vocabulary.
+    const issues = [];
+    for (const err of pre.errors) {
+      if (err.startsWith("cast_in_frame.character_id ID(s) not in")) {
+        const ids = err.match(/: ([^.]+)\./)?.[1]?.split(", ") || [];
+        issues.push({ kind: "cast_unresolved", detail: ids });
+      } else if (err.startsWith("location.location_id ID(s) not in")) {
+        const id = err.match(/: ([^.]+)\./)?.[1] || "";
+        issues.push({ kind: "env_unresolved", detail: id });
+      } else if (err.startsWith("references[] ID(s) not in")) {
+        const ids = err.match(/: ([^.]+)\./)?.[1]?.split(", ") || [];
+        issues.push({ kind: "references_unresolved", detail: ids });
+      }
+    }
+    return { ok: pre.ok, errors: pre.errors, warnings: pre.warnings, issues };
+  }
+  NS.livePreflightShot = livePreflightShot;
+
 
   // v4.6: translate a validator issue object into a human sentence.
   // Used by the storyboard card tooltip + the Spec rail banner so both
@@ -15390,6 +15656,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // v4.8
       case "i2v_no_anchors":
         return "image_to_video with no cast_in_frame and no inherited keyframe — atmospheric shot. Will auto-switch to text_to_video at Roll time; recommend editing the shot to make text_to_video permanent.";
+      // v4.14
+      case "references_unresolved":
+        return `shot.references[] points at IDs not in current bible: ${(issue.detail || []).join(", ")}. Run Shot Doctor to remap or remove dangling refs.`;
       default:
         return issue.kind;
     }
@@ -17621,6 +17890,181 @@ JSON object only. No commentary. No fences. No trailing text.`;
     }
   }
 
+  // ─── v4.14 referential-integrity migration ─────────────────────────────
+  // See call site above (around the v4.6/v4.5 ref-shape migrations) for the
+  // background incident. This function is pure data-fix; no UI side-effects.
+  //
+  // Builds, for each project, three unambiguous maps:
+  //   characters:   { bareId → suffixedId | null-when-ambiguous }
+  //   environments: { bareId → suffixedId | null-when-ambiguous }
+  //   assets:       { bareId → suffixedId | null-when-ambiguous }
+  //
+  // A bare ID `X` maps to `X_<n>` iff exactly ONE row in that project has an
+  // id that matches `^X_\d+$` (or `^X_\d+_<more>$` recursively). If multiple
+  // candidates exist, we don't guess — the ref is reported as unresolvable.
+  // Also, if `X` itself exists as a row id in the project, no rewrite is
+  // needed (the bare id is the actual id).
+  //
+  // Apply phase: for each shot in the project, rewrite cast_in_frame entries
+  // (handles both `{character_id: "..."}` objects and bare strings),
+  // location.location_id, and references[*] (handles strings, {ref_id},
+  // {asset_id}, {id}). Stable: never overwrites a successfully-resolving ref;
+  // never blanks an unresolvable one (leaves it so preflight can surface).
+  async function migrateShotReferencesIntegrity() {
+    const report = {
+      projectsScanned: 0,
+      shotsTouched: 0,
+      rewrites: [],
+      unresolved: [],
+    };
+    const allProjects = await Storage.getAllRaw("projects");
+    const allShots    = await Storage.getAllRaw("shots");
+    const allChars    = await Storage.getAllRaw("characters");
+    const allEnvs     = await Storage.getAllRaw("environments");
+    const allAssets   = await Storage.getAllRaw("assets");
+
+    for (const project of allProjects) {
+      report.projectsScanned++;
+      const projId = project.id;
+      const projChars  = allChars.filter(c => (c.project_id || "the_standup") === projId);
+      const projEnvs   = allEnvs.filter(e  => (e.project_id || "the_standup") === projId);
+      const projAssets = allAssets.filter(a => (a.project_id || "the_standup") === projId);
+      const projShots  = allShots.filter(s => (s.project_id || "the_standup") === projId);
+
+      // Build bareId → suffixedId map for each kind.
+      // Strategy: for every row id `Y` in the project, if `Y` matches
+      // `<bare>_<digit(s)>(_…)?`, register the bare prefix. Multiple rows
+      // sharing a bare prefix → mark bare as ambiguous (null).
+      function buildResolver(rows) {
+        const byId = new Set(rows.map(r => r.id));
+        const candidates = new Map();  // bareId → [suffixedId, ...]
+        for (const r of rows) {
+          const id = r.id || "";
+          const m = id.match(/^([a-z0-9_]+?)_(\d+)$/);
+          if (!m) continue;
+          const bare = m[1];
+          if (!candidates.has(bare)) candidates.set(bare, []);
+          candidates.get(bare).push(id);
+        }
+        return function resolve(refId) {
+          if (!refId) return { ok: false, reason: "empty ref" };
+          if (byId.has(refId)) return { ok: true, value: refId, rewrote: false };
+          const list = candidates.get(refId) || [];
+          if (list.length === 1) return { ok: true, value: list[0], rewrote: true };
+          if (list.length > 1) return { ok: false, reason: `ambiguous (${list.length} candidates: ${list.join(", ")})` };
+          return { ok: false, reason: "not found in project bible" };
+        };
+      }
+      const resolveChar  = buildResolver(projChars);
+      const resolveEnv   = buildResolver(projEnvs);
+      const resolveAsset = buildResolver(projAssets);
+
+      for (const shot of projShots) {
+        let dirty = false;
+        // cast_in_frame: array of strings OR objects with character_id
+        if (Array.isArray(shot.cast_in_frame)) {
+          for (const entry of shot.cast_in_frame) {
+            if (typeof entry === "string") {
+              const res = resolveChar(entry);
+              if (res.ok && res.rewrote) {
+                report.rewrites.push({ shotId: shot.id, field: "cast_in_frame[]", from: entry, to: res.value });
+                // mutate the array index — but `entry` is a copy of the string; can't mutate by ref
+                // Fall through: we'll rewrite array below
+                dirty = true;
+              } else if (!res.ok) {
+                report.unresolved.push({ shotId: shot.id, projectId: projId, field: "cast_in_frame[]", value: entry, reason: res.reason });
+              }
+            } else if (entry && typeof entry === "object" && entry.character_id) {
+              const res = resolveChar(entry.character_id);
+              if (res.ok && res.rewrote) {
+                report.rewrites.push({ shotId: shot.id, field: "cast_in_frame[].character_id", from: entry.character_id, to: res.value });
+                entry.character_id = res.value;
+                dirty = true;
+              } else if (!res.ok) {
+                report.unresolved.push({ shotId: shot.id, projectId: projId, field: "cast_in_frame[].character_id", value: entry.character_id, reason: res.reason });
+              }
+            }
+          }
+          // Handle string-shape cast_in_frame by mapping array
+          if (shot.cast_in_frame.some(e => typeof e === "string")) {
+            shot.cast_in_frame = shot.cast_in_frame.map(e => {
+              if (typeof e !== "string") return e;
+              const res = resolveChar(e);
+              return res.ok ? res.value : e;
+            });
+          }
+        }
+        // location.location_id
+        const locId = shot.location?.location_id;
+        if (locId) {
+          const res = resolveEnv(locId);
+          if (res.ok && res.rewrote) {
+            report.rewrites.push({ shotId: shot.id, field: "location.location_id", from: locId, to: res.value });
+            shot.location = { ...(shot.location || {}), location_id: res.value };
+            dirty = true;
+          } else if (!res.ok) {
+            report.unresolved.push({ shotId: shot.id, projectId: projId, field: "location.location_id", value: locId, reason: res.reason });
+          }
+        }
+        // references[*]: heterogeneous shape — strings, {ref_id}, {asset_id}, {id}
+        if (Array.isArray(shot.references)) {
+          for (let i = 0; i < shot.references.length; i++) {
+            const ref = shot.references[i];
+            if (typeof ref === "string") {
+              // could be char/env/asset id; try each
+              for (const [kind, resolver] of [["character", resolveChar], ["environment", resolveEnv], ["asset", resolveAsset]]) {
+                const res = resolver(ref);
+                if (res.ok && res.rewrote) {
+                  report.rewrites.push({ shotId: shot.id, field: `references[${i}]`, from: ref, to: res.value, kind });
+                  shot.references[i] = res.value;
+                  dirty = true;
+                  break;
+                } else if (res.ok) {
+                  break;  // already resolves; no rewrite needed, no other resolver applies
+                }
+              }
+              // If none resolved at all, log as unresolved
+              const stillUnresolved = !resolveChar(shot.references[i]).ok && !resolveEnv(shot.references[i]).ok && !resolveAsset(shot.references[i]).ok;
+              if (stillUnresolved) {
+                report.unresolved.push({ shotId: shot.id, projectId: projId, field: `references[${i}]`, value: ref, reason: "not a known char/env/asset id" });
+              }
+            } else if (ref && typeof ref === "object") {
+              for (const key of ["ref_id", "asset_id", "id"]) {
+                if (ref[key]) {
+                  // Try all three resolvers in priority order
+                  let resolved = false;
+                  for (const [kind, resolver] of [["character", resolveChar], ["environment", resolveEnv], ["asset", resolveAsset]]) {
+                    const res = resolver(ref[key]);
+                    if (res.ok && res.rewrote) {
+                      report.rewrites.push({ shotId: shot.id, field: `references[${i}].${key}`, from: ref[key], to: res.value, kind });
+                      ref[key] = res.value;
+                      dirty = true;
+                      resolved = true;
+                      break;
+                    } else if (res.ok) {
+                      resolved = true;
+                      break;
+                    }
+                  }
+                  if (!resolved) {
+                    report.unresolved.push({ shotId: shot.id, projectId: projId, field: `references[${i}].${key}`, value: ref[key], reason: "not a known char/env/asset id" });
+                  }
+                  break;  // only one of ref_id/asset_id/id should be present
+                }
+              }
+            }
+          }
+        }
+        if (dirty) {
+          await Storage.put("shots", shot);
+          report.shotsTouched++;
+        }
+      }
+    }
+    return report;
+  }
+  NS.migrateShotReferencesIntegrity = migrateShotReferencesIntegrity;
+
   // ─── Bootstrap ──────────────────────────────────────────────────────
   async function init() {
     console.log("[ElevenX] init");
@@ -17714,6 +18158,36 @@ JSON object only. No commentary. No fences. No trailing text.`;
         dirty = true;
       }
       if (dirty) await Storage.put("environments", env);
+    }
+
+    // v4.14: cross-project referential-integrity migration. Root cause was a
+    // duplicated-import path that suffixed row primary keys (`lionn` → `lionn_2`)
+    // via ensureUniqueId, but did NOT rewrite the foreign keys embedded inside
+    // each shot (`cast_in_frame[*].character_id`, `location.location_id`,
+    // `references[*].ref_id` / asset_id / id). Result: every downstream
+    // resolver came up empty, preflight didn't notice, composer threw the
+    // generic "assets.startImageUrl is required" error, and the Roll path
+    // silently auto-downgraded i2v shots to t2v — losing identity locking
+    // because the keyframe-gen step couldn't run. The audit traced this
+    // explicitly on the Lionn: Night Prowler (2) project.
+    //
+    // The migration walks every project, builds an unambiguous bare → suffixed
+    // ID map per kind, and rewrites every shot's foreign keys through it.
+    // Idempotent: a second run finds no unresolved bare IDs. Unresolvables
+    // are left in place so preflight can surface them.
+    try {
+      const report = await migrateShotReferencesIntegrity();
+      if (report.rewrites.length > 0) {
+        console.log(`[v4.14 integrity] rewrote ${report.rewrites.length} foreign key(s) across ${report.shotsTouched} shot(s) in ${report.projectsScanned} project(s)`);
+        for (const r of report.rewrites.slice(0, 25)) console.log(`  ${r.shotId}: ${r.field} "${r.from}" → "${r.to}"`);
+        if (report.rewrites.length > 25) console.log(`  …and ${report.rewrites.length - 25} more`);
+      }
+      if (report.unresolved.length > 0) {
+        console.warn(`[v4.14 integrity] ${report.unresolved.length} reference(s) couldn't be auto-fixed — left in place for preflight to surface:`);
+        for (const u of report.unresolved.slice(0, 25)) console.warn(`  ${u.shotId} (${u.projectId}): ${u.field} "${u.value}" — ${u.reason}`);
+      }
+    } catch (err) {
+      console.error("[v4.14 integrity] migration failed:", err);
     }
 
     // Adapt each screen's DOM (replace static mockup content with live containers)
