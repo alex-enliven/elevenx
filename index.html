@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="a8367fd46bfb" data-build-time="2026-05-15T06:26:23.514Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"a8367fd46bfb",time:"2026-05-15T06:26:23.514Z"};</script>
+<meta name="elevenx-build" content="09ab1e37c1bc" data-build-time="2026-05-15T20:51:18.925Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"09ab1e37c1bc",time:"2026-05-15T20:51:18.925Z"};</script>
 
 </head>
-<!-- elevenx-build: a8367fd46bfb @ 2026-05-15T06:26:23.514Z -->
+<!-- elevenx-build: 09ab1e37c1bc @ 2026-05-15T20:51:18.925Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -10749,36 +10749,93 @@ JSON object only. No commentary. No fences. No trailing text.`;
   const SHOT_DOCTOR_ENV_REF_COST  = 0.05;   // per generated env angle
   const SHOT_DOCTOR_KEYFRAME_COST = 0.05;   // per keyframe retry
 
-  // Heuristic: which character is thematically obvious for this shot when no
-  // cast is declared and no env_ref is anchorable? Director's hint:
-  //   • Lionn        → ruin / run / fall / breath / fled / courtyard
-  //   • Fynn         → capture / caught / trap / bind / prisoner / chain
-  //   • Veyr         → throne / court / palace / decree / command / crown
-  //   • Night Cutter → clash / sword / strike / blade / fight / attack / slash
-  // Falls back to the first cast member by index if no keyword wins.
-  function pickThematicCastForShot(shot, characters) {
-    if (!characters?.length) return null;
-    const text = [
+  // v4.13: bible-driven thematic matcher. Replaces the hardcoded
+  // Lionn/Fynn/Veyr/Night-Cutter keyword table (which was project-specific
+  // and missed e.g. "The Hollow Guard awaken" matching a Hollow Guard asset).
+  //
+  // Strategy: tokenise every character / environment / asset's id +
+  // display_name, then score each entity by how many of its tokens appear in
+  // the shot's display_name + focal_point + emotional_beat + verb. The
+  // winner across all three entity kinds is returned.
+  //
+  // Returns one of:
+  //   { kind: "cast",  entity, score, tokens }
+  //   { kind: "env",   entity, score, tokens }
+  //   { kind: "asset", entity, score, tokens }
+  //   { kind: "cast", entity: <first character>, score: 0, fallback: true }
+  //   null  (when characters/environments/assets are all empty)
+  //
+  // Min token length: 4 chars (avoids false positives like "the" / "of" /
+  // 2-char ids).
+  function _tokeniseBibleEntity(e) {
+    if (!e) return [];
+    const id = String(e.id || "").toLowerCase();
+    const name = String(e.display_name || "").toLowerCase();
+    const tokens = new Set();
+    // Whole strings (so multi-word names like "hollow guard" match as a phrase)
+    if (id) tokens.add(id);
+    if (name) tokens.add(name);
+    // Per-word splits
+    for (const part of id.split(/[_\-\s]+/)) if (part.length >= 4) tokens.add(part);
+    for (const part of name.split(/\s+/)) if (part.length >= 4) tokens.add(part);
+    return [...tokens];
+  }
+  function pickThematicEntityForShot(shot, { characters = [], environments = [], assets = [] } = {}) {
+    const shotText = [
       shot.display_name || "",
       shot.the_moment?.focal_point || "",
       shot.the_moment?.emotional_beat || "",
       shot.the_moment?.verb || "",
     ].join(" ").toLowerCase();
-    const themes = [
-      { idHints: ["lionn"], keywords: ["ruin", "run", "fall", "breath", "fled", "flee", "courtyard", "shadow", "prince"] },
-      { idHints: ["fynn"],  keywords: ["capture", "caught", "trap", "bind", "prisoner", "chain", "captive"] },
-      { idHints: ["veyr"],  keywords: ["throne", "court", "palace", "decree", "command", "crown", "royal"] },
-      { idHints: ["night_cutter", "cutter", "nightcutter"], keywords: ["clash", "sword", "strike", "blade", "fight", "attack", "slash", "duel"] },
-    ];
-    for (const theme of themes) {
-      if (theme.keywords.some(k => text.includes(k))) {
-        const match = characters.find(c =>
-          theme.idHints.some(h => c.id?.toLowerCase().includes(h) || c.display_name?.toLowerCase().includes(h))
-        );
-        if (match) return match;
-      }
+    if (!shotText.trim()) {
+      return characters.length ? { kind: "cast", entity: characters[0], score: 0, fallback: true } : null;
     }
-    return characters[0];  // fall back to first by index
+    // v4.13: word-boundary matching for single-word tokens. Earlier
+    // substring-based check made "lion" (from "Ruined Lion Courtyard")
+    // falsely match against "lionn", which let the courtyard env outscore
+    // the Lionn character on shots like "Lionn breathes at the courtyard
+    // threshold". Splitting shotText into a word set (alphanum, length≥4)
+    // and requiring exact-word membership eliminates these prefix collisions.
+    // Multi-word tokens still use substring (phrase match against the full
+    // shotText), which is appropriate since they're literal phrases.
+    const shotWords = new Set((shotText.match(/[a-z0-9]+/g) || []).filter(w => w.length >= 4));
+    let best = null;
+    const scoreEntity = (entity, kind, weight) => {
+      const tokens = _tokeniseBibleEntity(entity);
+      let score = 0;
+      const matched = [];
+      for (const t of tokens) {
+        const isMultiWord = /\s/.test(t);
+        const hit = isMultiWord ? shotText.includes(t) : shotWords.has(t);
+        if (hit) {
+          score++;
+          matched.push(t);
+        }
+      }
+      if (score === 0) return;
+      // Slight weight nudges so cast > env > asset on tied scores (cast
+      // attachment is the most common authoring intent, asset attachment
+      // is rarer + more specific).
+      const weighted = score + weight;
+      if (!best || weighted > best.weighted) {
+        best = { kind, entity, score, tokens: matched, weighted };
+      }
+    };
+    // Higher weight = preferred when tied. Cast=0.3, env=0.2, asset=0.0.
+    for (const c of characters)   scoreEntity(c, "cast",  0.3);
+    for (const e of environments) scoreEntity(e, "env",   0.2);
+    for (const a of assets)       scoreEntity(a, "asset", 0.0);
+    if (best) return best;
+    return characters.length ? { kind: "cast", entity: characters[0], score: 0, fallback: true } : null;
+  }
+  NS.pickThematicEntityForShot = pickThematicEntityForShot;
+
+  // Back-compat shim for any code that still expects the v4.9 signature.
+  // Returns just the character entity (or null) so existing tests don't break.
+  function pickThematicCastForShot(shot, characters) {
+    const pick = pickThematicEntityForShot(shot, { characters });
+    if (!pick || pick.kind !== "cast") return characters?.[0] || null;
+    return pick.entity;
   }
 
   // Heuristic: derive a focal_point from existing data when the field is
@@ -10838,28 +10895,48 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (derivedFocal) {
         proposedFixes.push({ field: "the_moment.focal_point", value: derivedFocal, reason: "derived from display_name/verb/emotional_beat" });
       }
-      // 1.2 env_ref + cast attachment
+      // 1.2 env_ref + cast attachment + asset attachment
+      // v4.13: use the bible-driven matcher so projects with non-canonical
+      // names ("Hollow Guard", arbitrary factions, etc.) get matched too.
+      // The matcher scores every character / environment / asset by token
+      // overlap with the shot text and picks the highest. Cast > env > asset
+      // on tied scores; weighted nudges encode that preference.
       const declaredCast = (s.cast_in_frame || []).map(c => c.character_id).filter(Boolean);
       const hasCast = declaredCast.length > 0;
       const hasEnv  = !!s.location?.location_id;
-      if (!hasCast && !hasEnv) {
-        // 1.2.a Prefer env if we can infer one from display_name keywords
-        const dnLower = (s.display_name || "").toLowerCase();
-        const envGuess = environments.find(e => {
-          const id = (e.id || "").toLowerCase();
-          const name = (e.display_name || "").toLowerCase();
-          return dnLower.includes(id.split("_")[0]) || dnLower.includes(name.split(" ")[0]);
-        });
-        if (envGuess) {
-          proposedFixes.push({ field: "location.location_id", value: envGuess.id, reason: `name-matched "${envGuess.display_name}"` });
-        } else {
-          // 1.2.b thematic cast member
-          const themeCast = pickThematicCastForShot(s, characters);
-          if (themeCast) {
+      const hasAssetRef = Array.isArray(s.references) && s.references.length > 0;
+      if (!hasCast && !hasEnv && !hasAssetRef) {
+        const pick = pickThematicEntityForShot(s, { characters, environments, assets });
+        if (pick && pick.score > 0 && !pick.fallback) {
+          if (pick.kind === "env") {
+            proposedFixes.push({
+              field: "location.location_id",
+              value: pick.entity.id,
+              reason: `bible-token match: "${pick.entity.display_name}" (matched: ${pick.tokens.join(", ")})`,
+            });
+          } else if (pick.kind === "asset") {
+            // Attach as a shot reference so r2v/i2v can use it as a style
+            // anchor without consuming a cast_in_frame slot.
+            proposedFixes.push({
+              field: "references",
+              value: { kind: "asset", asset_id: pick.entity.id, label: pick.entity.display_name || pick.entity.id },
+              reason: `bible-token match: asset "${pick.entity.display_name}" (matched: ${pick.tokens.join(", ")})`,
+            });
+          } else {
             proposedFixes.push({
               field: "cast_in_frame",
-              value: [{ character_id: themeCast.id, role_in_shot: "transitional", action: "" }],
-              reason: `thematic match for ${themeCast.display_name}`,
+              value: [{ character_id: pick.entity.id, role_in_shot: "transitional", action: "" }],
+              reason: `bible-token match: ${pick.entity.display_name} (matched: ${pick.tokens.join(", ")})`,
+            });
+          }
+        } else {
+          // Fallback to first character — same as v4.9 behaviour
+          const fallback = pickThematicCastForShot(s, characters);
+          if (fallback) {
+            proposedFixes.push({
+              field: "cast_in_frame",
+              value: [{ character_id: fallback.id, role_in_shot: "transitional", action: "" }],
+              reason: `no bible-token match found; defaulting to ${fallback.display_name}`,
             });
           }
         }
@@ -11005,6 +11082,21 @@ JSON object only. No commentary. No fences. No trailing text.`;
           if ((shot.cast_in_frame || []).length > 0) continue;
           shot.cast_in_frame = fix.value;
           applied.push(`+cast=${(fix.value || []).map(c => c.character_id).join(",")}`);
+        } else if (fix.field === "references") {
+          // v4.13: asset attachment. fix.value is a single reference entry
+          // (the v3 multi-asset shape used by resolveExtraAssets). Append
+          // rather than replace so existing director-authored refs survive.
+          shot.references = Array.isArray(shot.references) ? shot.references : [];
+          const ref = fix.value;
+          // Skip if an entry with the same asset_id already exists
+          const existing = shot.references.find(r =>
+            (r && r.asset_id && r.asset_id === ref?.asset_id) ||
+            (r && r.id && r.id === ref?.asset_id) ||
+            (typeof r === "string" && r === ref?.asset_id)
+          );
+          if (existing) continue;
+          shot.references.push(ref);
+          applied.push(`+ref=${ref?.asset_id || "(unknown)"}`);
         }
       }
       if (applied.length > 0) {
@@ -14828,8 +14920,38 @@ JSON object only. No commentary. No fences. No trailing text.`;
         assets.referenceImageUrls.push(a.dataUrl);
       }
       if (assets.referenceImageUrls.length === 0) {
-        toast("Reference-to-video needs cast refs or extra references first. Generate them in the Cast / Style Assets tabs.", { tone: "warn" });
-        return;
+        // v4.13: mirror of v4.8's i2v→t2v auto-downgrade. Same root cause:
+        // the shot wants r2v but has no resolvable refs (either cross-bible
+        // mismatched cast IDs from re-imported projects, or genuinely
+        // atmospheric beats authored without cast). Auto-route to t2v at
+        // roll time so the shot rolls; surface what happened in a single
+        // toast that names the exact unresolved IDs.
+        const focal = shot.the_moment?.focal_point;
+        const declaredCastIds = (shot.cast_in_frame || []).map(c => c.character_id).filter(Boolean);
+        const unresolvedCastIds = declaredCastIds.filter(id => !characters.find(x => x.id === id));
+        if (focal && String(focal).trim().length >= 5) {
+          let reason;
+          if (declaredCastIds.length === 0) {
+            reason = "no cast_in_frame entries and no extra references";
+          } else if (unresolvedCastIds.length === declaredCastIds.length) {
+            reason = `cast_in_frame IDs [${unresolvedCastIds.join(", ")}] don't resolve in current Cast Bible`;
+          } else {
+            reason = "cast members in frame have no uploaded or generated refs yet";
+          }
+          console.warn(`[roll-gate] auto-downgrading ${shotId} reference_to_video→text_to_video: ${reason}`);
+          toast(
+            `Auto-switched "${shot.display_name || shotId}" to text_to_video — ${reason}. Edit cast_in_frame or upload refs in Cast & Locations to keep reference_to_video.`,
+            { tone: "warn", duration: 9000 }
+          );
+          resolved.mode = "text_to_video";
+          // No assets to set — composeSeedance(text_to_video) ignores them.
+        } else {
+          toast(
+            `Shot "${shot.display_name || shotId}" can't roll — reference_to_video has no resolvable refs and the shot has no focal_point to fall back on. Edit the shot to add focal_point + fix cast_in_frame.`,
+            { tone: "warn" }
+          );
+          return;
+        }
       }
     }
     // Surface the labeled extras to the composer so it can write a clear
