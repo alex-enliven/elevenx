@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="b9b228b4d391" data-build-time="2026-05-15T21:17:53.984Z">
+<meta name="elevenx-build" content="ec2988d4af6d" data-build-time="2026-05-15T22:19:16.629Z">
 <script>
 (function(){
-  var info = { hash: "b9b228b4d391", time: "2026-05-15T21:17:53.984Z" };
+  var info = { hash: "ec2988d4af6d", time: "2026-05-15T22:19:16.629Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: b9b228b4d391 @ 2026-05-15T21:17:53.984Z -->
+<!-- elevenx-build: ec2988d4af6d @ 2026-05-15T22:19:16.629Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -8957,27 +8957,60 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   function resolveExtraAssets(shotRefs, { characters, environments, assets }) {
     const out = [];
     for (const r of (shotRefs || [])) {
-      if (!r || !r.kind || !r.id) continue;
-      if (r.kind === "character") {
-        const c = characters.find(x => x.id === r.id);
+      if (!r) continue;
+      // v4.15: read id from any of the common key shapes that have appeared
+      // over the project's lifetime (`r.id` original, `r.asset_id` from
+      // Shot Doctor v4.13, `r.character_id` from older bibles, `r.ref_id`
+      // from the v4.14 migration). Without this fallback the resolver
+      // silently drops perfectly-valid refs.
+      const refId = (typeof r === "string") ? r : (r.id || r.asset_id || r.character_id || r.ref_id);
+      const refKind = (typeof r === "string") ? null : (r.kind || "").toLowerCase();
+      const refRole = (typeof r === "object") ? (r.role || "support") : "support";
+      if (!refId) continue;
+      // String-form refs have no kind; try each store in turn (character → env → asset).
+      if (!refKind) {
+        const c = characters.find(x => x.id === refId);
+        if (c) {
+          const url = refUrlFor(c, "three_quarter") || refUrlFor(c, "head_on") || refUrlFor(c, "full_body");
+          out.push({ kind: "character", id: c.id, display_name: c.display_name, dataUrl: url, role: refRole });
+          continue;
+        }
+        const e = environments.find(x => x.id === refId);
+        if (e) {
+          const refs = e.refs?.[ACTIVE_IMAGE_MODEL] || e.refs?.seedream || {};
+          const url = refs.wide?.dataUrl || refs.detail?.dataUrl || null;
+          out.push({ kind: "environment", id: e.id, display_name: e.display_name, dataUrl: url, role: refRole });
+          continue;
+        }
+        const a = assets.find(x => x.id === refId);
+        if (a) {
+          const url = a.refs?.[ACTIVE_IMAGE_MODEL]?.primary?.dataUrl
+                   || a.refs?.seedream?.primary?.dataUrl
+                   || a.refs?.gpt?.primary?.dataUrl
+                   || null;
+          out.push({ kind: "asset", kind_subtype: a.kind, id: a.id, display_name: a.display_name, dataUrl: url, role: refRole });
+        }
+        continue;
+      }
+      if (refKind === "character" || refKind === "char") {
+        const c = characters.find(x => x.id === refId);
         if (!c) continue;
-        // Pick the first available ref image as the rep portrait
         const url = refUrlFor(c, "three_quarter") || refUrlFor(c, "head_on") || refUrlFor(c, "full_body");
-        out.push({ kind: "character", id: c.id, display_name: c.display_name, dataUrl: url, role: r.role || "support" });
-      } else if (r.kind === "environment") {
-        const e = environments.find(x => x.id === r.id);
+        out.push({ kind: "character", id: c.id, display_name: c.display_name, dataUrl: url, role: refRole });
+      } else if (refKind === "environment" || refKind === "env") {
+        const e = environments.find(x => x.id === refId);
         if (!e) continue;
         const refs = e.refs?.[ACTIVE_IMAGE_MODEL] || e.refs?.seedream || {};
         const url = refs.wide?.dataUrl || refs.detail?.dataUrl || null;
-        out.push({ kind: "environment", id: e.id, display_name: e.display_name, dataUrl: url, role: r.role || "support" });
-      } else if (r.kind === "asset") {
-        const a = assets.find(x => x.id === r.id);
+        out.push({ kind: "environment", id: e.id, display_name: e.display_name, dataUrl: url, role: refRole });
+      } else if (refKind === "asset" || refKind === "style_frame") {
+        const a = assets.find(x => x.id === refId);
         if (!a) continue;
         const url = a.refs?.[ACTIVE_IMAGE_MODEL]?.primary?.dataUrl
                  || a.refs?.seedream?.primary?.dataUrl
                  || a.refs?.gpt?.primary?.dataUrl
                  || null;
-        out.push({ kind: "asset", kind_subtype: a.kind, id: a.id, display_name: a.display_name, dataUrl: url, role: r.role || "support" });
+        out.push({ kind: "asset", kind_subtype: a.kind, id: a.id, display_name: a.display_name, dataUrl: url, role: refRole });
       }
     }
     return out;
@@ -14626,22 +14659,27 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (!State.fal) throw new Error("No fal client (set worker URL first)");
     // Default project lookup so legacy callsites still work
     if (project == null) project = await Storage.Projects.getActive();
+    // v4.15: `castInFrame` is now actually `allCastForKeyframe` — the union
+    // of shot.cast_in_frame[*] and shot.references[].characters. Prefer a
+    // "speaking" role from cast_in_frame; otherwise first available.
     const speakingChar = castInFrame.find(c => {
       const inShot = (shot.cast_in_frame || []).find(x => x.character_id === c.id);
       return inShot?.role_in_shot === "speaking";
     }) || castInFrame[0];
     if (!speakingChar) {
-      // v4.5: distinguish "shot has no cast at all" from "cast IDs don't
-      // resolve in current bible". The latter is the cross-project mismatch
-      // pattern; the catch block in handleRollShot uses err.message verbatim
-      // in the toast, so make it specific.
-      const declaredIds = (shot.cast_in_frame || [])
-        .map(c => c.character_id)
+      // v4.15: throw text reflects that BOTH surfaces (cast_in_frame +
+      // references[].characters) are empty, not just cast_in_frame. The
+      // catch block in handleRollShot uses err.message verbatim in the toast.
+      const declaredCastIds = (shot.cast_in_frame || []).map(c => c.character_id).filter(Boolean);
+      const refCharIds = (shot.references || [])
+        .filter(r => r && typeof r === "object" && (r.kind === "character" || r.kind === "char"))
+        .map(r => r.character_id || r.ref_id || r.id)
         .filter(Boolean);
-      if (declaredIds.length === 0) {
-        throw new Error("shot has no cast_in_frame entries");
+      if (declaredCastIds.length === 0 && refCharIds.length === 0) {
+        throw new Error("shot has no character anchors (cast_in_frame is empty AND no character refs in references[])");
       }
-      throw new Error(`cast_in_frame IDs [${declaredIds.join(", ")}] not in current Cast Bible`);
+      const allIds = [...declaredCastIds, ...refCharIds];
+      throw new Error(`character anchors [${allIds.join(", ")}] don't resolve to characters with uploaded refs in the current Cast Bible`);
     }
     const charRef = refUrlFor(speakingChar, "three_quarter")
                  || refUrlFor(speakingChar, "head_on")
@@ -15002,6 +15040,33 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const shotRefs = Array.isArray(shot.references) ? shot.references : [];
     const extraAssets = resolveExtraAssets(shotRefs, { characters, environments: envs, assets: allAssets });
 
+    // v4.15: characters can also appear in references[] (e.g. "Veyr speaks
+    // from the throne" — Veyr is in references with kind=character, not in
+    // cast_in_frame). Build a unified anchor-character list so the keyframe
+    // generator and fallback ladder both see ALL character anchors, not just
+    // the cast_in_frame subset. Audit (2026-05-16) traced the Veyr/Hollow
+    // Guard auto-downgrade bug to this exact gap.
+    const refCharIds = shotRefs
+      .map(r => {
+        if (!r || typeof r !== "object") return null;
+        const kind = (r.kind || "").toLowerCase();
+        if (kind !== "character" && kind !== "char") return null;
+        return r.character_id || r.ref_id || r.id;
+      })
+      .filter(Boolean);
+    const refCastResolved = refCharIds
+      .map(id => characters.find(x => x.id === id))
+      .filter(Boolean)
+      .filter(rc => !castInFrame.some(c => c.id === rc.id));
+    const allCastForKeyframe = [...castInFrame, ...refCastResolved];
+    // v4.15: also surface asset refs separately so the fallback ladder can
+    // try them as anchors. resolveExtraAssets above already does the
+    // heavy lifting; we just classify here.
+    const refAssetsResolved = extraAssets.filter(a => {
+      const kind = (a.kind || "").toLowerCase();
+      return kind === "asset" || kind === "style_frame" || (!kind && a.dataUrl);
+    });
+
     // Resolve mode
     const previousShot = shot.shot_number ? (await Storage.getAll("shots")).find(x => x.shot_number === shot.shot_number - 1) : null;
     const previousHasApproved = !!previousShot?.takes?.find(t => t.status === "approved");
@@ -15020,23 +15085,26 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (!startImage) {
         setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, "seedream-v4.5 · cast-anchored", 30);
         try {
-          startImage = await generateKeyframeForShot(shot, castInFrame, environment, project);
+          // v4.15: pass allCastForKeyframe (cast_in_frame ∪ references[].chars)
+          // so generateKeyframeForShot finds Veyr-style anchors that live in
+          // references[] rather than cast_in_frame.
+          startImage = await generateKeyframeForShot(shot, allCastForKeyframe, environment, project);
           toast(`Keyframe ready for ${shot.display_name || shotId}`);
           if (State.activeShotId === shotId) renderShotEditor(shotId);
           renderStoryboard();
         } catch (err) {
-          // v4.5: the pre-fix catch advertised a cast-portrait fallback
-          // unconditionally, then tried refUrlFor(castInFrame[0], ...).
-          // When the throw fired because castInFrame was EMPTY (the common
-          // cross-bible case — shot.cast_in_frame references character_ids
-          // that don't exist in the currently loaded Cast Bible),
-          // castInFrame[0] was undefined, the advertised fallback was a
-          // no-op, and the next guard fired a contradictory second toast
-          // ("needs a keyframe… generate cast refs first").
-          //
-          // New behaviour: try a real fallback ladder, then emit a single
-          // accurate toast based on what actually happened.
-          console.warn("[keyframe] auto-gen failed; trying fallback ladder:", err);
+          // v4.15: extended fallback ladder. Previous order was
+          //   cast_in_frame → environment → diagnostic
+          // The audit (2026-05-16) showed this picks the env over a
+          // named character ref (Veyr) and over a thematically-matched
+          // asset ref (Hollow Guard lineup). New priority:
+          //   1. cast_in_frame[*] character portraits
+          //   2. references[] character portraits
+          //   3. references[] asset whose name token-matches focal_point
+          //   4. environment (wide → detail)
+          //   5. references[] asset without thematic match
+          //   6. diagnostic / auto-downgrade
+          console.warn("[keyframe] auto-gen failed; trying v4.15 fallback ladder:", err);
           // v4.9: persist the failure fingerprint on the shot so the Shot
           // Doctor can identify retry candidates without heuristics. Cleared
           // on the next successful keyframe gen.
@@ -15046,47 +15114,96 @@ JSON object only. No commentary. No fences. No trailing text.`;
           shot.keyframes.last_attempt_at = Date.now();
           try { await Storage.put("shots", shot); } catch {}
           let fallbackSource = null;
-          // 1. Cast portrait of any in-frame character (3/4 → head_on → full_body)
+          let fallbackKind = null;
+          // 1. cast_in_frame[*] portraits
           for (const c of castInFrame) {
             const url = refUrlFor(c, "three_quarter")
                      || refUrlFor(c, "head_on")
                      || refUrlFor(c, "full_body");
             if (url) {
               startImage = url;
-              fallbackSource = `cast portrait (${c.display_name || c.id})`;
+              fallbackKind = "character";
+              fallbackSource = `${c.display_name || c.id}`;
               break;
             }
           }
-          // 2. Environment ref (wide → detail) — useful when the shot is
-          //    location-driven and cast IDs don't resolve in this bible.
+          // 2. references[] characters — NEW in v4.15
+          if (!startImage) {
+            for (const rc of refCastResolved) {
+              const url = refUrlFor(rc, "three_quarter")
+                       || refUrlFor(rc, "head_on")
+                       || refUrlFor(rc, "full_body");
+              if (url) {
+                startImage = url;
+                fallbackKind = "character (from references)";
+                fallbackSource = `${rc.display_name || rc.id}`;
+                break;
+              }
+            }
+          }
+          // 3. references[] asset with thematic match to shot text — NEW in v4.15
+          if (!startImage && refAssetsResolved.length > 0 && NS.pickThematicEntityForShot) {
+            const shotText = [shot.display_name, shot.the_moment?.focal_point, shot.the_moment?.emotional_beat]
+              .filter(Boolean).join(" ").toLowerCase();
+            // Manual token-match: use the existing matcher's logic implicitly
+            // by tokenising each asset and checking against shotText words.
+            const shotWords = new Set((shotText.match(/[a-z0-9]+/g) || []).filter(w => w.length >= 4));
+            let bestMatch = null;
+            let bestScore = 0;
+            for (const a of refAssetsResolved) {
+              if (!a.dataUrl) continue;
+              const tokens = [a.id || "", a.display_name || ""].join(" ").toLowerCase().match(/[a-z0-9]+/g) || [];
+              const score = tokens.filter(t => t.length >= 4 && shotWords.has(t)).length;
+              if (score > bestScore) { bestScore = score; bestMatch = a; }
+            }
+            if (bestMatch) {
+              startImage = bestMatch.dataUrl;
+              fallbackKind = "asset (thematic-match)";
+              fallbackSource = `${bestMatch.display_name || bestMatch.id}`;
+            }
+          }
+          // 4. Environment ref (wide → detail)
           if (!startImage && environment) {
             const envUrl = refUrlFor(environment, "wide") || refUrlFor(environment, "detail");
             if (envUrl) {
               startImage = envUrl;
-              fallbackSource = `${environment.display_name || environment.id} (environment ref)`;
+              fallbackKind = "environment";
+              fallbackSource = `${environment.display_name || environment.id}`;
+            }
+          }
+          // 5. references[] asset without thematic match — NEW in v4.15
+          if (!startImage) {
+            for (const a of refAssetsResolved) {
+              if (a.dataUrl) {
+                startImage = a.dataUrl;
+                fallbackKind = "asset (no thematic match)";
+                fallbackSource = `${a.display_name || a.id}`;
+                break;
+              }
             }
           }
           if (startImage) {
-            toast(`Keyframe gen failed (${err.message}); anchored on ${fallbackSource} instead.`, { tone: "warn" });
+            toast(`Keyframe gen failed (${err.message}); anchored on ${fallbackKind} '${fallbackSource}' instead.`, { tone: "warn", duration: 8000 });
           } else {
-            // 3. Real diagnosis — what was actually wrong?
+            // 6. Real diagnosis — what was actually wrong? v4.15: consider
+            //    BOTH cast_in_frame and references[]-characters when deciding
+            //    if the shot is truly orphan vs has-but-can't-resolve.
             const declaredIds = (shot.cast_in_frame || [])
               .map(c => c.character_id)
               .filter(Boolean);
+            const refCharCount = refCastResolved.length;
+            const refAssetCount = refAssetsResolved.filter(a => a.dataUrl).length;
             const unresolvedIds = declaredIds.filter(id => !characters.find(x => x.id === id));
-            // v4.8: When the shot has NO cast_in_frame entries at all AND no
-            // environment ref to fall back on, an atmospheric / establishing
-            // shot is almost certainly what the director intended (e.g.
-            // "The fallen kingdom breathes"). text_to_video composes the
-            // scene from prompt directly — no keyframe needed. Auto-downgrade
-            // at roll time so the shot still rolls cleanly. The downgrade is
-            // PER-ROLL only: shot.generation.mode is not mutated, so the user
-            // can still edit the shot to lock it in via the Edit Shot modal.
+            // Auto-downgrade only when there's GENUINELY nothing to anchor on
+            // anywhere — no cast in frame, no character refs, no asset refs,
+            // no environment. Otherwise we keep i2v and surface the specific
+            // gap.
             const focal = shot.the_moment?.focal_point;
-            if (declaredIds.length === 0 && focal && String(focal).trim().length >= 5) {
-              console.warn(`[roll-gate] auto-downgrading ${shotId} to text_to_video (no cast, no env ref, atmospheric focal_point present)`);
+            const hasAnyAnchorable = declaredIds.length > 0 || refCharCount > 0 || refAssetCount > 0 || !!environment;
+            if (!hasAnyAnchorable && focal && String(focal).trim().length >= 5) {
+              console.warn(`[roll-gate] auto-downgrading ${shotId} to text_to_video (no anchors of any kind, atmospheric focal_point present)`);
               toast(
-                `Auto-switched "${shot.display_name || shotId}" to text_to_video — no cast or env ref to anchor on; this is an atmospheric beat. Edit the shot (generation.mode → text_to_video) to lock this in permanently.`,
+                `Auto-switched "${shot.display_name || shotId}" to text_to_video — no cast, no character refs, no asset refs, no env ref. Edit the shot (generation.mode → text_to_video) to lock in.`,
                 { tone: "warn", duration: 9000 }
               );
               // Force t2v for this roll; composeSeedance(text_to_video)
@@ -15245,10 +15362,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // Shot Doctor + storyboard ⚠ badges keep showing the old error
       // after the underlying problem was actually resolved — audit found
       // an approved-take shot still flagged as "last_attempt_failed: true".
-      if (shot.keyframes) {
-        shot.keyframes.last_attempt_failed = false;
-        shot.keyframes.last_error = null;
-      }
+      // v4.15: also stamp last_success_* so Shot Doctor can tell "succeeded
+      // after downgrade" from "never tried".
+      shot.keyframes = shot.keyframes || {};
+      shot.keyframes.last_attempt_failed = false;
+      shot.keyframes.last_error = null;
+      shot.keyframes.last_success_at = take.created_at || Date.now();
+      shot.keyframes.last_success_mode = take.mode || resolved.mode;
       await Storage.put("shots", shot);
       await trackCost(estCost, `seedance ${resolved.mode} ${shotId}`);
       toast(`Take rolled · ${fmtUsd(estCost)} · ${resolved.mode}`);
@@ -17916,6 +18036,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
       shotsTouched: 0,
       rewrites: [],
       unresolved: [],
+      // v4.15: stale flag clears applied to shots whose approved take
+      // pre-dates the v4.14 success-path-clearing fix. Surfaces in the
+      // boot console.log so users can see the cleanup happened.
+      staleFlagClears: [],
     };
     const allProjects = await Storage.getAllRaw("projects");
     const allShots    = await Storage.getAllRaw("shots");
@@ -18055,6 +18179,26 @@ JSON object only. No commentary. No fences. No trailing text.`;
             }
           }
         }
+        // v4.15: stale-flag sweep. If this shot has an approved take, the
+        // `keyframes.last_attempt_failed` flag is from a prior failed
+        // attempt (likely an i2v gate refusal before the auto-downgrade
+        // rolled it as t2v). Clear it so Shot Doctor / toast stop
+        // reanimating ghost-failures. Also stamp last_success_*.
+        const approvedTake = (shot.takes || []).find(t => t.status === "approved");
+        if (approvedTake && shot.keyframes?.last_attempt_failed) {
+          shot.keyframes.last_attempt_failed = false;
+          const staleError = shot.keyframes.last_error;
+          shot.keyframes.last_error = null;
+          shot.keyframes.last_success_at = approvedTake.created_at || Date.now();
+          shot.keyframes.last_success_mode = approvedTake.mode || null;
+          report.staleFlagClears.push({
+            shotId: shot.id,
+            projectId: projId,
+            staleError,
+            approvedMode: approvedTake.mode,
+          });
+          dirty = true;
+        }
         if (dirty) {
           await Storage.put("shots", shot);
           report.shotsTouched++;
@@ -18185,6 +18329,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (report.unresolved.length > 0) {
         console.warn(`[v4.14 integrity] ${report.unresolved.length} reference(s) couldn't be auto-fixed — left in place for preflight to surface:`);
         for (const u of report.unresolved.slice(0, 25)) console.warn(`  ${u.shotId} (${u.projectId}): ${u.field} "${u.value}" — ${u.reason}`);
+      }
+      // v4.15: stale-flag sweep
+      if (report.staleFlagClears?.length > 0) {
+        console.log(`[v4.15 stale-flag sweep] cleared ${report.staleFlagClears.length} ghost-failure fingerprint(s) on shots that have an approved take:`);
+        for (const c of report.staleFlagClears.slice(0, 25)) {
+          console.log(`  ${c.shotId}: cleared "${c.staleError}" (approved take is ${c.approvedMode})`);
+        }
       }
     } catch (err) {
       console.error("[v4.14 integrity] migration failed:", err);
