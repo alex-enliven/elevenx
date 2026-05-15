@@ -4141,11 +4141,11 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="d2a33646940c" data-build-time="2026-05-15T05:53:10.218Z">
-<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"d2a33646940c",time:"2026-05-15T05:53:10.218Z"};</script>
+<meta name="elevenx-build" content="932593236f99" data-build-time="2026-05-15T06:11:26.720Z">
+<script>(window.ElevenX=window.ElevenX||{}).BUILD_INFO={hash:"932593236f99",time:"2026-05-15T06:11:26.720Z"};</script>
 
 </head>
-<!-- elevenx-build: d2a33646940c @ 2026-05-15T05:53:10.218Z -->
+<!-- elevenx-build: 932593236f99 @ 2026-05-15T06:11:26.720Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11098,11 +11098,29 @@ JSON object only. No commentary. No fences. No trailing text.`;
     lines.push("");
 
     // ─── Shot fixes ──────────────────────────────────────────────────────
+    // v4.10: the Applied / Executed / Retried blocks render whenever a task
+    // has results, regardless of whether the audit still surfaces pending
+    // candidates. Prior version only printed the Applied block when there
+    // were also still-pending fixes, so a successful Task 1 looked like a
+    // silent no-op (caught in v4.9 QA report).
     lines.push("## Shot fixes");
     lines.push("");
+    if (task1Result?.diffs?.length) {
+      lines.push(`**✓ Applied ${task1Result.diffs.length} shot fix${task1Result.diffs.length === 1 ? "" : "es"}:**`);
+      lines.push("```");
+      for (const d of task1Result.diffs) lines.push(d);
+      lines.push("```");
+      lines.push("");
+    }
     if (plan.task1.length === 0) {
-      lines.push("_No shot fixes proposed. All shots have focal_point + either cast or environment_ref._");
+      if (task1Result?.diffs?.length) {
+        lines.push("_All previously-proposed fixes applied; no further shot fixes are needed._");
+      } else {
+        lines.push("_No shot fixes proposed. All shots have focal_point + either cast or environment_ref._");
+      }
     } else {
+      lines.push(task1Result?.diffs?.length ? "**Still pending after last apply:**" : "**Proposed:**");
+      lines.push("");
       lines.push("| Shot | Display name | Fix(es) |");
       lines.push("|---|---|---|");
       for (const entry of plan.task1) {
@@ -11110,13 +11128,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
         const fixSummary = entry.fixes.map(f => `\`${f.field}\` ← ${f.reason}`).join("<br>");
         lines.push(`| ${num} | ${entry.displayName} | ${fixSummary} |`);
       }
-      if (task1Result?.diffs?.length) {
-        lines.push("");
-        lines.push("**Applied:**");
-        lines.push("```");
-        for (const d of task1Result.diffs) lines.push(d);
-        lines.push("```");
-      } else {
+      if (!task1Result?.diffs?.length) {
         lines.push("");
         lines.push("_Not yet applied — click \"Apply Task 1\" in the Shot Doctor modal to commit._");
       }
@@ -11124,12 +11136,49 @@ JSON object only. No commentary. No fences. No trailing text.`;
     lines.push("");
 
     // ─── Refs generated ──────────────────────────────────────────────────
+    // v4.10: same Applied-block fix as Task 1 — show execution results
+    // independent of whether candidates still exist. Scope note: this section
+    // only audits R2V shots; if your project is mostly i2v / t2v, it stays
+    // empty by design.
     lines.push("## Refs generated");
     lines.push("");
+    // Execution summary (runs first so a successful Task 2 is visible
+    // immediately, even after the audit no longer surfaces candidates).
+    if (task2Result && (task2Result.generated.length || task2Result.skipped.length || task2Result.errors.length)) {
+      const counts = `**Last run:** ${task2Result.generated.length} generated · ${task2Result.skipped.length} flagged · ${task2Result.errors.length} error${task2Result.errors.length === 1 ? "" : "s"}.`;
+      lines.push(counts);
+      lines.push("");
+      if (task2Result.generated.length) {
+        lines.push("```");
+        for (const g of task2Result.generated) lines.push(`✓ ${g.kind}: ${g.id} (${g.displayName}) · ${g.angles.join(", ")}`);
+        lines.push("```");
+      }
+      if (task2Result.skipped.length) {
+        lines.push("Flagged (director-curated, not auto-generated):");
+        lines.push("```");
+        for (const s of task2Result.skipped) lines.push(`↷ ${s.kind}: ${s.id} (${s.displayName}) — ${s.reason}`);
+        lines.push("```");
+      }
+      if (task2Result.errors.length) {
+        lines.push("Errors (verbatim):");
+        lines.push("```");
+        for (const e of task2Result.errors) lines.push(`✗ ${e.id}: ${e.error}`);
+        lines.push("```");
+      }
+      lines.push("");
+    }
     const needs = plan.task2;
     if (needs.missingCast.size + needs.missingEnv.size + needs.missingAssets.size === 0) {
-      lines.push("_All R2V shots have full ref coverage. Nothing to generate._");
+      if (task2Result?.generated?.length) {
+        lines.push("_All R2V shots now have ref coverage._");
+      } else {
+        lines.push("_All R2V shots have full ref coverage. Nothing to generate._");
+        lines.push("");
+        lines.push("> _Scope note: Task 2 audits **reference_to_video** shots only. If the project is i2v/t2v, this section stays empty by design._");
+      }
     } else {
+      lines.push(task2Result ? "**Still pending after last run:**" : "**Proposed:**");
+      lines.push("");
       lines.push("| Kind | Id | Display name | Status | Notes |");
       lines.push("|---|---|---|---|---|");
       const statusFor = (kind, id) => {
@@ -11160,11 +11209,38 @@ JSON object only. No commentary. No fences. No trailing text.`;
     lines.push("");
 
     // ─── Keyframe retries ────────────────────────────────────────────────
+    // v4.10: same Applied-block fix. Scope note: Task 3 only retries
+    // image_to_video shots (keyframe gen is the i2v pre-step; t2v has no
+    // keyframe and r2v feeds the model ref images directly).
     lines.push("## Keyframe retries");
     lines.push("");
+    if (task3Result && (task3Result.succeeded.length || task3Result.failed.length)) {
+      lines.push(`**Last run:** ${task3Result.succeeded.length} succeeded · ${task3Result.failed.length} still failing.`);
+      lines.push("");
+      if (task3Result.succeeded.length) {
+        lines.push("```");
+        for (const s of task3Result.succeeded) lines.push(`✓ ${s.id}${s.displayName ? " (" + s.displayName + ")" : ""}`);
+        lines.push("```");
+      }
+      if (task3Result.failed.length) {
+        lines.push("Verbatim errors:");
+        lines.push("```");
+        for (const f of task3Result.failed) lines.push(`✗ ${f.id}: ${f.error}`);
+        lines.push("```");
+      }
+      lines.push("");
+    }
     if (plan.task3.length === 0) {
-      lines.push("_No keyframe retry candidates._");
+      if (task3Result?.succeeded?.length) {
+        lines.push("_All previously-failing keyframes are now ready._");
+      } else {
+        lines.push("_No keyframe retry candidates._");
+        lines.push("");
+        lines.push("> _Scope note: Task 3 only retries **image_to_video** shots. r2v shots don't have a keyframe gen step (they pass references directly to Seedance); t2v shots don't need one. If your failed shot was r2v/t2v, it won't appear here._");
+      }
     } else {
+      lines.push(task3Result ? "**Still pending after last retry:**" : "**Candidates:**");
+      lines.push("");
       lines.push("| Shot | Reason | Result | Error (verbatim, if any) |");
       lines.push("|---|---|---|---|");
       for (const entry of plan.task3) {
@@ -11206,6 +11282,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         </div>
         <div style="font-size:12px; color:#9a9aab; margin-bottom:14px; line-height:1.55;">
           Auto-fix authoring gaps + queue missing references + retry failed keyframes — all on the active project's shots. The audit is read-only; each task has its own Apply button. Budget cap: <span class="mono">$${SHOT_DOCTOR_BUDGET_CAP_USD}</span>/episode. Style/FX assets are flagged, not auto-generated.
+          <div style="margin-top:6px; padding:6px 10px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:4px; font-size:11px; color:#7a7a8a;">
+            <strong style="color:#9a9aab;">Scope:</strong> Task 1 runs on all non-built-in shots · Task 2 audits <span class="mono">reference_to_video</span> shots only · Task 3 retries <span class="mono">image_to_video</span> shots only. r2v/t2v don't have a keyframe-gen step. For QA without firing API calls, use <code style="color:#c9a25a;">await ElevenX.__shotDoctorDebug({…})</code> in the console.
+          </div>
         </div>
         <div id="elx-doctor-body" style="flex:1; overflow:auto; background:#0a0a0c; border:1px solid #2a2a35; border-radius:8px; padding:14px 16px; font-family:'JetBrains Mono', SFMono-Regular, Menlo, monospace; font-size:11.5px; line-height:1.55; color:#c9c9d0;">
           Loading audit…
@@ -11243,17 +11322,29 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const md = renderShotDoctorMarkdown({ plan, task1Result, task2Result, task3Result });
       body.textContent = md;
     }
-    async function rerunAudit() {
-      status.textContent = "Re-running audit…";
+    // v4.10: rerunAudit no longer touches status.textContent — the caller
+    // owns the status line so "✓ Applied N fixes" survives the post-apply
+    // re-audit. Without this, the success message was overwritten by the
+    // empty string at the end of rerunAudit (v4.9 QA regression).
+    async function rerunAudit({ preserveStatus = true } = {}) {
+      const savedStatus = preserveStatus ? status.textContent : null;
+      const savedColor  = preserveStatus ? status.style.color : null;
+      if (!preserveStatus) status.textContent = "Re-running audit…";
       plan = await runShotDoctorAudit();
       renderBody();
       refreshBudgetLine();
       $("#elx-doctor-apply-1", panel).disabled = plan.task1.length === 0;
       $("#elx-doctor-apply-2", panel).disabled = (plan.task2.missingCast.size + plan.task2.missingEnv.size) === 0 || plan.budget.overBudget;
       $("#elx-doctor-apply-3", panel).disabled = plan.task3.length === 0;
-      status.textContent = "";
+      if (preserveStatus && savedStatus) {
+        status.textContent = savedStatus;
+        if (savedColor) status.style.color = savedColor;
+      } else if (!preserveStatus) {
+        status.textContent = "";
+      }
     }
-    await rerunAudit();
+    // First run is the initial open — no prior status to preserve.
+    await rerunAudit({ preserveStatus: false });
 
     $("#elx-doctor-apply-1", panel).addEventListener("click", async () => {
       if (!plan?.task1?.length) return;
@@ -11332,6 +11423,131 @@ JSON object only. No commentary. No fences. No trailing text.`;
     });
   }
   NS.showShotDoctorModal = showShotDoctorModal;
+
+  // v4.10: QA debug helper. Seeds forced states for the Shot Doctor's
+  // detection branches without firing real API calls — addresses v4.9 QA
+  // feedback that IDB-injected flags weren't being picked up because the
+  // audit reads derived state (e.g. shot mode after resolveShotModeForAudit)
+  // rather than raw stored fields. Each option mutates IDB + State to
+  // create the EXACT condition the audit looks for.
+  //
+  // Usage examples (paste in DevTools console):
+  //   await ElevenX.__shotDoctorDebug({ clearShotForTask1: "the_boy_hides_the_shadow_2" })
+  //   await ElevenX.__shotDoctorDebug({ markKeyframeFailed: "ep01_s01_lionn_breathes", failureError: "Forced for QA" })
+  //   await ElevenX.__shotDoctorDebug({ wipeCharRefs: "lionn_2", ensureR2vShots: ["ep01_s02_the_first_team_2"] })
+  //   await ElevenX.__shotDoctorDebug({ setSpentUsd: 247 })
+  //   await ElevenX.__shotDoctorDebug({ restore: { shotId: "...", patch: {...} } })   // free-form patch
+  async function __shotDoctorDebug(opts = {}) {
+    const out = { applied: [], errors: [] };
+
+    // Force Task 1: clear focal_point, cast_in_frame, location on a shot so
+    // the audit must derive replacements.
+    if (opts.clearShotForTask1) {
+      try {
+        const shot = await Storage.get("shots", opts.clearShotForTask1);
+        if (!shot) throw new Error("shot not found");
+        shot.the_moment = { ...(shot.the_moment || {}), focal_point: "" };
+        shot.cast_in_frame = [];
+        shot.location = { location_id: null };
+        await Storage.put("shots", shot);
+        out.applied.push(`cleared focal_point + cast + location on ${opts.clearShotForTask1}`);
+      } catch (err) { out.errors.push(`clearShotForTask1 ${opts.clearShotForTask1}: ${err.message}`); }
+    }
+
+    // Force Task 3: mark a shot's keyframe gen as failed. Coerces the shot
+    // to image_to_video so the audit's i2v-only filter accepts it.
+    if (opts.markKeyframeFailed) {
+      try {
+        const shot = await Storage.get("shots", opts.markKeyframeFailed);
+        if (!shot) throw new Error("shot not found");
+        shot.generation = { ...(shot.generation || {}), mode: "image_to_video" };
+        shot.keyframes = shot.keyframes || {};
+        shot.keyframes.last_attempt_failed = true;
+        shot.keyframes.last_error = opts.failureError || "Forced via __shotDoctorDebug for QA";
+        shot.keyframes.last_attempt_at = Date.now();
+        shot.keyframes.startDataUrl = null;
+        await Storage.put("shots", shot);
+        out.applied.push(`marked ${opts.markKeyframeFailed} as i2v + last_attempt_failed=true`);
+      } catch (err) { out.errors.push(`markKeyframeFailed ${opts.markKeyframeFailed}: ${err.message}`); }
+    }
+
+    // Force Task 2 missing cast: wipe a character's refs bucket entirely so
+    // refUrlFor() returns null for every angle.
+    if (opts.wipeCharRefs) {
+      try {
+        const c = await Storage.get("characters", opts.wipeCharRefs);
+        if (!c) throw new Error("character not found");
+        c.refs = { user: {}, seedream: {}, gpt: {} };
+        c.chosenModel = null;
+        await Storage.put("characters", c);
+        out.applied.push(`wiped refs on character ${opts.wipeCharRefs}`);
+      } catch (err) { out.errors.push(`wipeCharRefs ${opts.wipeCharRefs}: ${err.message}`); }
+    }
+    if (opts.wipeEnvRefs) {
+      try {
+        const e = await Storage.get("environments", opts.wipeEnvRefs);
+        if (!e) throw new Error("environment not found");
+        e.refs = { user: {}, seedream: {}, gpt: {} };
+        e.chosenModel = null;
+        await Storage.put("environments", e);
+        out.applied.push(`wiped refs on environment ${opts.wipeEnvRefs}`);
+      } catch (err) { out.errors.push(`wipeEnvRefs ${opts.wipeEnvRefs}: ${err.message}`); }
+    }
+    if (opts.wipeAssetRefs) {
+      try {
+        const a = await Storage.get("assets", opts.wipeAssetRefs);
+        if (!a) throw new Error("asset not found");
+        a.refs = { user: {}, seedream: {}, gpt: {} };
+        a.chosenModel = null;
+        await Storage.put("assets", a);
+        out.applied.push(`wiped refs on asset ${opts.wipeAssetRefs}`);
+      } catch (err) { out.errors.push(`wipeAssetRefs ${opts.wipeAssetRefs}: ${err.message}`); }
+    }
+
+    // Coerce shot(s) to r2v mode so Task 2 audit picks them up. Without this,
+    // wiping a character's refs is invisible to Task 2 if no r2v shot
+    // actually references that character.
+    if (Array.isArray(opts.ensureR2vShots)) {
+      for (const sid of opts.ensureR2vShots) {
+        try {
+          const shot = await Storage.get("shots", sid);
+          if (!shot) throw new Error("shot not found");
+          shot.generation = { ...(shot.generation || {}), mode: "reference_to_video" };
+          await Storage.put("shots", shot);
+          out.applied.push(`set mode=reference_to_video on ${sid}`);
+        } catch (err) { out.errors.push(`ensureR2vShots ${sid}: ${err.message}`); }
+      }
+    }
+
+    // Force budget gate by setting spent total. Also updates State so the
+    // audit reads it immediately without a reload.
+    if (opts.setSpentUsd != null) {
+      const n = Number(opts.setSpentUsd);
+      if (!Number.isFinite(n) || n < 0) {
+        out.errors.push(`setSpentUsd must be non-negative number, got ${opts.setSpentUsd}`);
+      } else {
+        try {
+          await Storage.setSetting("cost_total", n);
+          State.costSpentUsd = n;
+          out.applied.push(`State.costSpentUsd + cost_total = $${n.toFixed(2)}`);
+        } catch (err) { out.errors.push(`setSpentUsd: ${err.message}`); }
+      }
+    }
+
+    // Free-form shot patch — escape hatch for restoring snapshots.
+    if (opts.restore?.shotId && opts.restore.patch) {
+      try {
+        const shot = await Storage.get("shots", opts.restore.shotId);
+        if (!shot) throw new Error("shot not found");
+        Object.assign(shot, opts.restore.patch);
+        await Storage.put("shots", shot);
+        out.applied.push(`restored shot ${opts.restore.shotId} with ${Object.keys(opts.restore.patch).length} field(s)`);
+      } catch (err) { out.errors.push(`restore ${opts.restore.shotId}: ${err.message}`); }
+    }
+
+    return out;
+  }
+  NS.__shotDoctorDebug = __shotDoctorDebug;
 
   // The Anchor Planner modal — the post-import landing.
   async function showAnchorPlannerModal(opts = {}) {
