@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="67116b323d20" data-build-time="2026-05-16T06:04:39.081Z">
+<meta name="elevenx-build" content="699243e5fc51" data-build-time="2026-05-16T06:20:26.875Z">
 <script>
 (function(){
-  var info = { hash: "67116b323d20", time: "2026-05-16T06:04:39.081Z" };
+  var info = { hash: "699243e5fc51", time: "2026-05-16T06:20:26.875Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 67116b323d20 @ 2026-05-16T06:04:39.081Z -->
+<!-- elevenx-build: 699243e5fc51 @ 2026-05-16T06:20:26.875Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11513,6 +11513,39 @@ JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.resolveShotAnchors = resolveShotAnchors;
 
+  // v4.24: extract a location phrase from prose. Used by the keyframe
+  // generator when shot.location.location_id is null AND no environment
+  // ref resolves — the description / prompt_override often names the
+  // location inline ("in a moonlit ruined palace courtyard"). Pre-v4.24
+  // that text only reached the Scene line; v4.24 also promotes it to the
+  // Location: line so Seedream gets the structured cue.
+  //
+  // Heuristic: match "in/at/inside/into a/the/an <phrase>" and "atop/
+  // across/on <phrase>". Phrase limited to ~60 chars, ends at sentence
+  // boundary or comma. Returns null if nothing matches — caller emits no
+  // Location: line in that case (which is correct behavior; the prose is
+  // still in the Scene line).
+  function extractLocationFromProse(text) {
+    if (!text || typeof text !== "string") return null;
+    const candidates = [];
+    // Pattern A: in/at/inside/into + a/the/an + phrase
+    const reA = /\b(?:in|inside|into|at)\s+(?:a|an|the)\s+([a-z][\w\s'\-]{4,60}?)(?=[.,;!?\n]|$)/gi;
+    let m;
+    while ((m = reA.exec(text)) !== null) {
+      if (m[1]) candidates.push(m[1].trim());
+    }
+    // Pattern B: atop/across/on the + phrase
+    const reB = /\b(?:atop|across|on)\s+(?:a|an|the)\s+([a-z][\w\s'\-]{4,60}?)(?=[.,;!?\n]|$)/gi;
+    while ((m = reB.exec(text)) !== null) {
+      if (m[1]) candidates.push(m[1].trim());
+    }
+    if (candidates.length === 0) return null;
+    // Prefer the LONGEST match (most descriptive) but cap at the first 80 chars.
+    candidates.sort((a, b) => b.length - a.length);
+    return candidates[0].slice(0, 80).trim();
+  }
+  NS.extractLocationFromProse = extractLocationFromProse;
+
   // v4.22: introspection helper. Returns the live shape of a shot's
   // keyframes block — which field names are present, which have data,
   // sizes — so QA can verify their synthetic probes match what the
@@ -13873,21 +13906,32 @@ JSON object only. No commentary. No fences. No trailing text.`;
         issues.push({ kind: "i2v_no_anchors", detail: null });
         validationReport.totals.i2vNoAnchors = (validationReport.totals.i2vNoAnchors || 0) + 1;
       }
-      // 11b. (v4.23) verb+beat-empty — if shot.the_moment.description is
-      //      written but verb AND emotional_beat are both empty, the
-      //      keyframe generator's pre-v4.23 prompts would fall back to
-      //      "the beat" / the shot title and ignore the rich description.
-      //      v4.23 fixes the generator side (reads description); the
-      //      validator surfaces the gap at import time too so the author
-      //      knows their description is the load-bearing field.
+      // 11b. (v4.23 → v4.24) verb+beat-empty. v4.23 introduced this flag;
+      // v4.24 audit found 10/10 shots flagged because the project uses
+      // rich `description` exclusively and never fills verb/emotional_beat.
+      // 100% flag rate = wallpaper. v4.24 narrows the trigger: only fire
+      // when description is ALSO weak/empty, since a rich description is
+      // sufficient signal for the v4.23 keyframe generator. The fields
+      // remain meaningful when description is missing — that's when the
+      // generator falls back to focal_point/display_name and needs the
+      // verb+beat for sharpness.
       const _verb = s.the_moment?.verb;
       const _beat = s.the_moment?.emotional_beat;
       const _desc = s.the_moment?.description;
-      const hasDesc = _desc && String(_desc).trim().length >= 5;
+      const hasRichDesc = _desc && String(_desc).trim().length >= 30;
+      const hasAnyDesc  = _desc && String(_desc).trim().length >= 5;
       const hasVerb = _verb && String(_verb).trim().length > 0;
       const hasBeat = _beat && String(_beat).trim().length > 0;
-      if (hasDesc && !hasVerb && !hasBeat) {
-        issues.push({ kind: "verb_and_beat_empty", detail: null });
+      // Only flag when neither rich description NOR verb NOR beat is present.
+      // A rich description (>=30 chars) is sufficient for the keyframe gen.
+      if (!hasRichDesc && !hasVerb && !hasBeat) {
+        // Distinguish two sub-cases for better diagnostics:
+        //   • has SOME description (5-29 chars): "description thin"
+        //   • no description at all: "moment fields empty"
+        issues.push({
+          kind: "verb_and_beat_empty",
+          detail: hasAnyDesc ? "description_thin" : "moment_fields_empty",
+        });
         validationReport.totals.verbAndBeatEmpty = (validationReport.totals.verbAndBeatEmpty || 0) + 1;
       }
       // 11. (v4.16) word-density overload — more speech than the clip can
@@ -15596,11 +15640,16 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // Resolve a usable location label, or null if we can't. Tries:
     //   1. environment from anchor (kind=environment) or shot.location_id
     //   2. references[].kind=environment that resolves in `environments`
-    //   3. references[].kind=asset whose entity has a display_name (last resort, used for prompt context only — not "Location: ...")
-    // If none → no Location: line is emitted.
+    //   3. (v4.24) extract from prose — the scene description / override
+    //      often names the location inline ("in a moonlit ruined palace
+    //      courtyard"). Promotes it to the Location: line so Seedream
+    //      gets the structured cue, not just the Scene-line embedding.
+    //   4. None → no Location: line is emitted.
     let resolvedLocationName = null;
+    let locationSource = null;
     if (environment?.display_name) {
       resolvedLocationName = environment.display_name;
+      locationSource = "shot.location.location_id";
     } else if (Array.isArray(shot.references)) {
       const envRef = shot.references.find(r =>
         r && typeof r === "object" && (r.kind === "environment" || r.kind === "env")
@@ -15608,11 +15657,27 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (envRef) {
         const envId = envRef.ref_id || envRef.id;
         const e = environments.find(x => x.id === envId);
-        if (e?.display_name) resolvedLocationName = e.display_name;
+        if (e?.display_name) {
+          resolvedLocationName = e.display_name;
+          locationSource = "shot.references[environment]";
+        }
       }
     }
     // Treat the legacy fallback string as a missing location (F3 fix)
-    if (resolvedLocationName === "the location") resolvedLocationName = null;
+    if (resolvedLocationName === "the location") {
+      resolvedLocationName = null;
+      locationSource = null;
+    }
+    // v4.24: prose extraction fallback. Run on sceneDescription if we
+    // have nothing better. This is the audit's recommended fix — the
+    // location IS in the text, the generator just wasn't extracting it.
+    if (!resolvedLocationName && sceneDescription) {
+      const extracted = extractLocationFromProse(sceneDescription);
+      if (extracted) {
+        resolvedLocationName = extracted;
+        locationSource = "extracted_from_prose";
+      }
+    }
 
     const slotLanguage = slot === "start"
       ? `Capture the moment BEFORE the action begins — initial state, before the beat described below`
@@ -16945,9 +17010,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // v4.16
       case "speech_overload":
         return `${issue.detail?.totalWords} words across ${issue.detail?.durationSeconds}s = ${issue.detail?.wordsPerSec} w/sec (recommended max ${issue.detail?.maxRecommended}). Either split into multiple shots or extend duration.`;
-      // v4.23
+      // v4.23 → v4.24: narrowed scope (only fires when no rich description either)
       case "verb_and_beat_empty":
-        return "the_moment has description but no verb AND no emotional_beat — keyframe generator now reads description directly (v4.23), but populating verb + emotional_beat improves prompt sharpness.";
+        if (issue.detail === "description_thin") {
+          return "the_moment.description is thin (<30 chars) AND no verb / emotional_beat — keyframe generator will fall back to focal_point or shot title. Fill description (preferred) or verb+beat.";
+        }
+        return "the_moment fields all empty (no description, verb, or emotional_beat) — keyframe generator has no scene signal beyond focal_point/display_name. Author at least description.";
       default:
         return issue.kind;
     }
