@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="307f2fcfc6ff" data-build-time="2026-05-16T05:37:46.531Z">
+<meta name="elevenx-build" content="b1c7b26cc1c5" data-build-time="2026-05-16T05:42:15.898Z">
 <script>
 (function(){
-  var info = { hash: "307f2fcfc6ff", time: "2026-05-16T05:37:46.531Z" };
+  var info = { hash: "b1c7b26cc1c5", time: "2026-05-16T05:42:15.898Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 307f2fcfc6ff @ 2026-05-16T05:37:46.531Z -->
+<!-- elevenx-build: b1c7b26cc1c5 @ 2026-05-16T05:42:15.898Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9156,12 +9156,41 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     } else if (mode === "reference_to_video") {
       const refs = [];
       const seenCastIds = new Set();
+      const seenUrls = new Set();
+
+      // v4.20 (audit 2026-05-17): the gate-approved keyframe(s) go to the
+      // FRONT of the reference list. Seedance r2v weights earlier
+      // references more heavily, so the director's deliberate choice
+      // should anchor the composition. Pre-v4.20 the gate-approved frame
+      // was never sent to Seedance r2v at all — the gate workflow was
+      // cosmetic. This was the headline integration bug the v4.19 audit
+      // caught: predicate ↔ buildComposerAssets seam closed for i2v but
+      // not r2v.
+      const approvedStart = shot?.keyframes?.start?.approved_dataUrl;
+      if (approvedStart) {
+        refs.push(approvedStart);
+        seenUrls.add(approvedStart);
+      }
+      const approvedEnd = shot?.keyframes?.end?.approved_dataUrl;
+      if (approvedEnd && shot?.keyframes?.has_state_change) {
+        // r2v can't tail-pin frames the way Kling dual-frame can, but
+        // sending the post-action visual as an additional reference still
+        // gives the model the temporal envelope to interpolate against.
+        if (!seenUrls.has(approvedEnd)) {
+          refs.push(approvedEnd);
+          seenUrls.add(approvedEnd);
+        }
+      }
+
       // 1. cast_in_frame portraits
       for (const c of (castInFrame || [])) {
         if (c?.id) seenCastIds.add(c.id);
         for (const angle of ["head_on", "three_quarter", "full_body"]) {
           const url = refUrlFor(c, angle);
-          if (url) refs.push(url);
+          if (url && !seenUrls.has(url)) {
+            refs.push(url);
+            seenUrls.add(url);
+          }
           if (refs.length >= 9) break;
         }
         if (refs.length >= 9) break;
@@ -9185,7 +9214,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           seenCastIds.add(id);
           for (const angle of ["head_on", "three_quarter", "full_body"]) {
             const url = refUrlFor(c, angle);
-            if (url) refs.push(url);
+            if (url && !seenUrls.has(url)) {
+              refs.push(url);
+              seenUrls.add(url);
+            }
             if (refs.length >= 9) break;
           }
           if (refs.length >= 9) break;
@@ -9199,7 +9231,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         // already pushed their angle-specific portraits).
         if ((a.kind || "").toLowerCase() === "character" && a.id && seenCastIds.has(a.id)) continue;
         if (refs.length >= 9) break;
+        if (seenUrls.has(a.dataUrl)) continue;
         refs.push(a.dataUrl);
+        seenUrls.add(a.dataUrl);
       }
       out.referenceImageUrls = refs;
     }
