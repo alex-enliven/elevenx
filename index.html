@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="b1c7b26cc1c5" data-build-time="2026-05-16T05:42:15.898Z">
+<meta name="elevenx-build" content="fcbcf76d4f7c" data-build-time="2026-05-16T05:50:55.006Z">
 <script>
 (function(){
-  var info = { hash: "b1c7b26cc1c5", time: "2026-05-16T05:42:15.898Z" };
+  var info = { hash: "fcbcf76d4f7c", time: "2026-05-16T05:50:55.006Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: b1c7b26cc1c5 @ 2026-05-16T05:42:15.898Z -->
+<!-- elevenx-build: fcbcf76d4f7c @ 2026-05-16T05:50:55.006Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11272,6 +11272,122 @@ JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.shotModeRequiresGate = shotModeRequiresGate;
 
+  // v4.21: UNIFIED anchor predicate. Caught by audit (2026-05-17): the
+  // "what anchors can this shot use?" question was answered by FOUR
+  // separate functions across the codebase, each with its own (subtly
+  // different) priority and each patched in isolation when a bug
+  // surfaced. v4.13 fixed the i2v gate. v4.17 fixed the anchor recipe.
+  // v4.18 fixed the auto-downgrade. v4.21's `generateKeyframeCandidates`
+  // was about to fail S01 (env-only) and S03 (asset-only) because it
+  // still asked "is there a character anchor?" without considering
+  // asset or environment fallbacks.
+  //
+  // This function is the single source of truth. Every site that needs
+  // to know "what can anchor a keyframe / reference for this shot?"
+  // calls this. Priority:
+  //   1. cast_in_frame[*] with uploaded refs       (kind="character")
+  //   2. references[].character with uploaded refs (kind="character")
+  //   3. references[].asset (thematic-match first) (kind="asset")
+  //   4. references[].environment with plate       (kind="environment")
+  //   5. shot.location.location_id with env plate  (kind="environment")
+  //   6. nothing                                    (kind="none")
+  //
+  // Returns: { kind, source, refImageUrl, entity, score? }
+  //   • kind        one of "character" | "asset" | "environment" | "none"
+  //   • source      "cast_in_frame" | "references" | "location"
+  //   • refImageUrl the dataURI to pass to Seedream as the visual anchor
+  //   • entity      the resolved bible row (char/asset/env) or null
+  //   • score       (asset only) thematic-token match count vs shot text
+  function resolveShotAnchors(shot, bible = {}) {
+    const { characters = [], environments = [], assets = [] } = bible;
+    if (!shot) return { kind: "none", source: null, refImageUrl: null, entity: null };
+
+    // Layer 1: cast_in_frame[*] with uploaded refs (any angle)
+    const castInFrameIds = (shot.cast_in_frame || [])
+      .map(c => typeof c === "string" ? c : c?.character_id)
+      .filter(Boolean);
+    for (const id of castInFrameIds) {
+      const c = characters.find(x => x.id === id);
+      if (!c) continue;
+      const url = refUrlFor(c, "three_quarter") || refUrlFor(c, "head_on") || refUrlFor(c, "full_body");
+      if (url) return { kind: "character", source: "cast_in_frame", refImageUrl: url, entity: c };
+    }
+
+    // Layer 2: references[].kind === "character" with uploaded refs
+    for (const r of (shot.references || [])) {
+      if (!r || typeof r !== "object") continue;
+      const k = (r.kind || "").toLowerCase();
+      if (k !== "character" && k !== "char") continue;
+      const cid = r.character_id || r.ref_id || r.id;
+      const c = characters.find(x => x.id === cid);
+      if (!c) continue;
+      const url = refUrlFor(c, "three_quarter") || refUrlFor(c, "head_on") || refUrlFor(c, "full_body");
+      if (url) return { kind: "character", source: "references", refImageUrl: url, entity: c };
+    }
+
+    // Layer 3: references[].kind === "asset" — thematic-match first.
+    // Token-overlap between the asset's display_name + id and the shot's
+    // display_name + focal_point. Same scoring as v4.13's matcher; reused
+    // here so the gate predicate and the candidate generator agree on
+    // which asset is "on-theme" for a given shot.
+    const shotText = [
+      shot.display_name || "",
+      shot.the_moment?.focal_point || "",
+      shot.the_moment?.emotional_beat || "",
+    ].join(" ").toLowerCase();
+    const shotWords = new Set((shotText.match(/[a-z0-9]+/g) || []).filter(w => w.length >= 4));
+    const assetMatches = [];
+    for (const r of (shot.references || [])) {
+      if (!r || typeof r !== "object") continue;
+      const k = (r.kind || "").toLowerCase();
+      if (k !== "asset" && k !== "style_frame") continue;
+      // Skip explicit negative references (anti-style refs)
+      if ((r.role || "").toLowerCase() === "negative") continue;
+      const aid = r.asset_id || r.ref_id || r.id;
+      const a = assets.find(x => x.id === aid);
+      if (!a) continue;
+      const url = refUrlFor(a, "primary")
+               || a?.refs?.user?.primary?.dataUrl
+               || a?.refs?.seedream?.primary?.dataUrl
+               || a?.refs?.gpt?.primary?.dataUrl
+               || null;
+      if (!url) continue;
+      const aTokens = (((a.display_name || "") + " " + (a.id || "")).toLowerCase().match(/[a-z0-9]+/g) || []).filter(w => w.length >= 4);
+      const score = aTokens.filter(t => shotWords.has(t)).length;
+      assetMatches.push({ asset: a, url, score });
+    }
+    if (assetMatches.length > 0) {
+      assetMatches.sort((a, b) => b.score - a.score);
+      const best = assetMatches[0];
+      return { kind: "asset", source: "references", refImageUrl: best.url, entity: best.asset, score: best.score };
+    }
+
+    // Layer 4: references[].kind === "environment" with plate
+    for (const r of (shot.references || [])) {
+      if (!r || typeof r !== "object") continue;
+      const k = (r.kind || "").toLowerCase();
+      if (k !== "environment" && k !== "env") continue;
+      const eid = r.ref_id || r.id;
+      const e = environments.find(x => x.id === eid);
+      if (!e) continue;
+      const url = refUrlFor(e, "wide") || refUrlFor(e, "detail");
+      if (url) return { kind: "environment", source: "references", refImageUrl: url, entity: e };
+    }
+
+    // Layer 5: shot.location.location_id with env plate
+    const locId = shot.location?.location_id;
+    if (locId) {
+      const e = environments.find(x => x.id === locId);
+      if (e) {
+        const url = refUrlFor(e, "wide") || refUrlFor(e, "detail");
+        if (url) return { kind: "environment", source: "location", refImageUrl: url, entity: e };
+      }
+    }
+
+    return { kind: "none", source: null, refImageUrl: null, entity: null };
+  }
+  NS.resolveShotAnchors = resolveShotAnchors;
+
   // Verb heuristic for has_state_change. State-change verbs imply a
   // distinct end frame is needed (clash, ignite, capture, etc.);
   // hold verbs imply a static moment (stand, hold, gaze). Default
@@ -15230,55 +15346,43 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const project = await Storage.Projects.getActive();
     const characters = await Storage.getAll("characters");
     const environments = await Storage.getAll("environments");
+    const assets = await Storage.getAll("assets");
 
-    // v4.15: cast = cast_in_frame ∪ references[].character
-    const castInFrame = (shot.cast_in_frame || [])
-      .map(c => characters.find(x => x.id === c.character_id))
-      .filter(Boolean);
-    const refCharIds = (shot.references || [])
-      .map(r => {
-        if (!r || typeof r !== "object") return null;
-        const k = (r.kind || "").toLowerCase();
-        if (k !== "character" && k !== "char") return null;
-        return r.character_id || r.ref_id || r.id;
-      })
-      .filter(Boolean);
-    const refCast = refCharIds.map(id => characters.find(x => x.id === id)).filter(Boolean);
-    const allCast = [...castInFrame, ...refCast.filter(rc => !castInFrame.some(c => c.id === rc.id))];
-    const environment = environments.find(x => x.id === shot.location?.location_id);
+    // v4.21: use the unified anchor predicate. Replaces the prior cast-only
+    // gate that refused S01 (atmospheric env-only) and S03 (asset-only
+    // faction-establishing) shots. Same predicate is used by the gate,
+    // the recipe, and the auto-downgrade — single source of truth, so
+    // this bug can no longer re-emerge in a fourth place.
+    const anchor = resolveShotAnchors(shot, { characters, environments, assets });
+    if (anchor.kind === "none") {
+      throw new Error("no anchor available — shot has no cast_in_frame, no character/asset references with uploaded images, and no environment plate. Upload refs via Cast & Locations or add to references[].");
+    }
+    const anchorImageUrl = anchor.refImageUrl;
+    const anchorEntity = anchor.entity;
+    const anchorKind = anchor.kind;
 
-    // Pick anchor character (speaking role first; first available otherwise)
-    const speakingChar = allCast.find(c => {
-      const inShot = (shot.cast_in_frame || []).find(x => x.character_id === c.id);
-      return inShot?.role_in_shot === "speaking" || inShot?.role_in_shot === "speaks";
-    }) || allCast[0];
-    if (!speakingChar) throw new Error("no character anchor available — add to cast_in_frame or shot.references[]");
-    const charRef = refUrlFor(speakingChar, "three_quarter")
-                 || refUrlFor(speakingChar, "head_on")
-                 || refUrlFor(speakingChar, "full_body");
-    if (!charRef) throw new Error(`no uploaded ref for ${speakingChar.display_name} — upload via Cast & Locations first`);
+    // Find an environment row for prompt context — used for palette /
+    // props / continuity_locks even when the anchor itself is a character.
+    const environment = anchor.kind === "environment"
+      ? anchorEntity
+      : environments.find(x => x.id === shot.location?.location_id);
 
-    // Build the slot-aware prompt. Re-uses generateKeyframeForShot's
-    // medium-aware language; v4.17 adds "moment BEFORE" vs "moment AFTER"
-    // framing so end candidates depict the post-action state.
+    // Build the slot-aware prompt. v4.21: prompt assembly branches by
+    // anchor kind. Character anchors get the identity-locked v4.6 prompt;
+    // asset anchors get a faction/style-establishing prompt; environment
+    // anchors get an atmospheric no-people prompt.
     const moment = shot.the_moment || {};
     const camera = shot.camera || {};
     const envName = environment?.display_name || "the location";
     const medium = project?.medium || "live_action";
     const styleSpec = composer.mediumPromptSpec
       ? composer.mediumPromptSpec(medium)
-      : { opening: "Cinematic still, identity-locked.", qualityCues: "", negativeCues: "" };
+      : { opening: "Cinematic still.", qualityCues: "", negativeCues: "", envOpening: "Cinematic establishing still.", envQuality: "", envNegative: "" };
 
     const slotLanguage = slot === "start"
-      ? `Capture the moment BEFORE the action begins — character in their initial state, before "${moment.verb || moment.focal_point || "the beat"}"`
-      : `Capture the moment AFTER the action completes — character in their resolved/aftermath state, having just completed "${moment.verb || moment.focal_point || "the beat"}"`;
+      ? `Capture the moment BEFORE the action begins — initial state, before "${moment.verb || moment.focal_point || "the beat"}"`
+      : `Capture the moment AFTER the action completes — resolved/aftermath state, having just completed "${moment.verb || moment.focal_point || "the beat"}"`;
 
-    const distinctiveFeatures = Array.isArray(speakingChar.physical?.distinctive_features)
-      ? speakingChar.physical.distinctive_features.filter(s => s && String(s).trim()).slice(0, 4)
-      : [];
-    const neverList = Array.isArray(speakingChar.never)
-      ? speakingChar.never.filter(s => s && String(s).trim()).slice(0, 4)
-      : [];
     const palette = Array.isArray(environment?.palette)
       ? environment.palette.filter(s => s && String(s).trim()).slice(0, 5).join(", ")
       : "";
@@ -15288,34 +15392,108 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const continuityLocks = Array.isArray(environment?.continuity_locks)
       ? environment.continuity_locks.filter(s => s && String(s).trim()).slice(0, 4)
       : [];
-
-    const allCastNames = allCast.map(c => c.display_name).filter(Boolean);
     let canon = project?.style_canon || "";
-    try {
-      if (canon && typeof NS.sanitizeStyleCanonForCharacter === "function") {
-        canon = NS.sanitizeStyleCanonForCharacter(canon, speakingChar.display_name, allCastNames);
-      }
-    } catch { /* keep raw */ }
 
-    const promptText = [
-      styleSpec.opening,
-      `${slotLanguage}.`,
-      `Frame: ${camera.framing || "medium shot"} of ${speakingChar.display_name}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
-      moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
-      distinctiveFeatures.length ? `Identity anchors (must be visible): ${distinctiveFeatures.join("; ")}.` : "",
-      `The character's face, hair, and wardrobe must match the reference image exactly. Identity-locked.`,
-      `Location: ${envName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}`,
-      environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}${environment.lighting.quality ? ", " + environment.lighting.quality : ""}.` : "",
-      palette ? `Color palette: ${palette}.` : "",
-      propsList ? `Props visible: ${propsList}.` : "",
-      continuityLocks.length ? `Continuity locks: ${continuityLocks.join("; ")}.` : "",
-      `Camera: ${camera.lens || "35mm equivalent"}, depth ${camera.depth || "shallow"}.`,
-      styleSpec.qualityCues || "",
-      canon ? `Style canon: ${canon}` : "",
-      project?.visual_rule ? `Visual rule: ${project.visual_rule}.` : "",
-      neverList.length ? `Never: ${neverList.join("; ")}.` : "",
-      `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare"}.`,
-    ].filter(s => s && s.length > 2).join(" ");
+    let promptText;
+    if (anchorKind === "character") {
+      const speakingChar = anchorEntity;
+      const distinctiveFeatures = Array.isArray(speakingChar.physical?.distinctive_features)
+        ? speakingChar.physical.distinctive_features.filter(s => s && String(s).trim()).slice(0, 4)
+        : [];
+      const neverList = Array.isArray(speakingChar.never)
+        ? speakingChar.never.filter(s => s && String(s).trim()).slice(0, 4)
+        : [];
+      // Sanitise style canon against ALL named cast (not just the anchor)
+      // so other characters' identity language doesn't leak in.
+      const allCastNames = [
+        ...(shot.cast_in_frame || []).map(c => {
+          const cc = characters.find(x => x.id === c.character_id);
+          return cc?.display_name;
+        }).filter(Boolean),
+        ...(shot.references || [])
+          .filter(r => r && typeof r === "object" && (r.kind === "character" || r.kind === "char"))
+          .map(r => {
+            const cc = characters.find(x => x.id === (r.character_id || r.ref_id || r.id));
+            return cc?.display_name;
+          }).filter(Boolean),
+      ];
+      try {
+        if (canon && typeof NS.sanitizeStyleCanonForCharacter === "function") {
+          canon = NS.sanitizeStyleCanonForCharacter(canon, speakingChar.display_name, allCastNames);
+        }
+      } catch { /* keep raw */ }
+
+      promptText = [
+        styleSpec.opening,
+        `${slotLanguage}.`,
+        `Frame: ${camera.framing || "medium shot"} of ${speakingChar.display_name}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
+        moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
+        distinctiveFeatures.length ? `Identity anchors (must be visible): ${distinctiveFeatures.join("; ")}.` : "",
+        `The character's face, hair, and wardrobe must match the reference image exactly. Identity-locked.`,
+        `Location: ${envName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}`,
+        environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}${environment.lighting.quality ? ", " + environment.lighting.quality : ""}.` : "",
+        palette ? `Color palette: ${palette}.` : "",
+        propsList ? `Props visible: ${propsList}.` : "",
+        continuityLocks.length ? `Continuity locks: ${continuityLocks.join("; ")}.` : "",
+        `Camera: ${camera.lens || "35mm equivalent"}, depth ${camera.depth || "shallow"}.`,
+        styleSpec.qualityCues || "",
+        canon ? `Style canon: ${canon}` : "",
+        project?.visual_rule ? `Visual rule: ${project.visual_rule}.` : "",
+        neverList.length ? `Never: ${neverList.join("; ")}.` : "",
+        `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare"}.`,
+      ].filter(s => s && s.length > 2).join(" ");
+    } else if (anchorKind === "asset") {
+      // v4.21 — asset-anchored keyframe (S03 "Hollow Guard awaken" class).
+      // Visual style is locked to the asset reference; the prompt
+      // describes the asset in the shot's environment without inventing
+      // characters that aren't in the bible.
+      promptText = [
+        styleSpec.opening,
+        `${slotLanguage}.`,
+        `Establish: ${camera.framing || "wide shot"} of ${anchorEntity.display_name || "the faction/asset"}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
+        moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
+        anchorEntity.description ? `Subject: ${String(anchorEntity.description).slice(0, 200)}.` : "",
+        `The composition is locked to the reference image — preserve the faction/asset's visual identity exactly.`,
+        environment ? `Location: ${envName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}` : "",
+        environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}${environment.lighting.quality ? ", " + environment.lighting.quality : ""}.` : "",
+        palette ? `Color palette: ${palette}.` : "",
+        propsList ? `Props visible: ${propsList}.` : "",
+        continuityLocks.length ? `Continuity locks: ${continuityLocks.join("; ")}.` : "",
+        `Camera: ${camera.lens || "35mm equivalent"}, depth ${camera.depth || "mid"}.`,
+        styleSpec.qualityCues || "",
+        canon ? `Style canon: ${canon}` : "",
+        project?.visual_rule ? `Visual rule: ${project.visual_rule}.` : "",
+        `Do NOT invent named characters not present in the reference.`,
+        `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare"}.`,
+      ].filter(s => s && s.length > 2).join(" ");
+    } else {
+      // anchorKind === "environment" — purely atmospheric establishing
+      // shot (S01 "The fallen kingdom breathes" class). No people, no
+      // characters. Visual is the env plate.
+      const envSpec = styleSpec.envOpening
+        ? { opening: styleSpec.envOpening, qualityCues: styleSpec.envQuality, negativeCues: styleSpec.envNegative }
+        : styleSpec;
+      const envEntity = anchorEntity;
+      promptText = [
+        envSpec.opening,
+        `${slotLanguage}.`,
+        `Establish: ${camera.framing || "wide shot"} of ${envEntity.display_name || "the location"}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
+        moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
+        envEntity.architecture?.type ? `Architecture: ${envEntity.architecture.type}.` : "",
+        envEntity.lighting?.primary_source ? `Lighting: ${envEntity.lighting.primary_source}${envEntity.lighting.quality ? ", " + envEntity.lighting.quality : ""}.` : "",
+        palette ? `Color palette: ${palette}.` : "",
+        propsList ? `Props visible: ${propsList}.` : "",
+        continuityLocks.length ? `Continuity locks: ${continuityLocks.join("; ")}.` : "",
+        `Camera: ${camera.lens || "35mm equivalent"}, depth ${camera.depth || "deep"}.`,
+        envSpec.qualityCues || "",
+        canon ? `Style canon: ${canon}` : "",
+        project?.visual_rule ? `Visual rule: ${project.visual_rule}.` : "",
+        `Atmospheric — no characters or figures in frame. The location IS the subject.`,
+        `Negative: ${envSpec.negativeCues || "people, characters, figures, faces, AI sheen, fisheye, lens flare"}.`,
+      ].filter(s => s && s.length > 2).join(" ");
+    }
+
+    const charRef = anchorImageUrl;
 
     // Generate N candidates with distinct seeds.
     const newCandidates = [];
@@ -15870,15 +16048,17 @@ JSON object only. No commentary. No fences. No trailing text.`;
             const declaredIds = (shot.cast_in_frame || [])
               .map(c => c.character_id)
               .filter(Boolean);
-            const refCharCount = refCastResolved.length;
-            const refAssetCount = refAssetsResolved.filter(a => a.dataUrl).length;
             const unresolvedIds = declaredIds.filter(id => !characters.find(x => x.id === id));
-            // Auto-downgrade only when there's GENUINELY nothing to anchor on
-            // anywhere — no cast in frame, no character refs, no asset refs,
-            // no environment. Otherwise we keep i2v and surface the specific
-            // gap.
+            // v4.21: auto-downgrade decision goes through the unified
+            // resolveShotAnchors predicate. Same single source of truth
+            // the keyframe generator + recipe use — if the predicate says
+            // there's no anchor, this branch downgrades; otherwise it
+            // surfaces a specific diagnostic. The pre-v4.21 inline
+            // computation (declaredIds/refCharCount/refAssetCount/env)
+            // was a fourth duplicate of the anchor-availability question.
             const focal = shot.the_moment?.focal_point;
-            const hasAnyAnchorable = declaredIds.length > 0 || refCharCount > 0 || refAssetCount > 0 || !!environment;
+            const anchorCheck = resolveShotAnchors(shot, { characters, environments: envs, assets: allAssets });
+            const hasAnyAnchorable = anchorCheck.kind !== "none";
             if (!hasAnyAnchorable && focal && String(focal).trim().length >= 5) {
               console.warn(`[roll-gate] auto-downgrading ${shotId} to text_to_video (no anchors of any kind, atmospheric focal_point present)`);
               toast(
