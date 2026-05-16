@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="42c4cd1f1ff4" data-build-time="2026-05-16T17:53:50.882Z">
+<meta name="elevenx-build" content="5ad495991388" data-build-time="2026-05-16T18:28:27.371Z">
 <script>
 (function(){
-  var info = { hash: "42c4cd1f1ff4", time: "2026-05-16T17:53:50.882Z" };
+  var info = { hash: "5ad495991388", time: "2026-05-16T18:28:27.371Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 42c4cd1f1ff4 @ 2026-05-16T17:53:50.882Z -->
+<!-- elevenx-build: 5ad495991388 @ 2026-05-16T18:28:27.371Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6110,6 +6110,47 @@ const KLING = {
   o1_dual_keyframe:   "/fal/fal-ai/kling-video/o1/image-to-video",
 };
 
+// v4.30: per-endpoint required-field schemas, used by #submitAndWait's
+// local pre-flight assertion. The point isn't to mirror fal's full schema
+// (their docs evolve); it's to catch the field-name drift class of bugs
+// that ate two Kling rolls — the router was emitting Seedance's image_url
+// into a Kling body that wanted start_image_url, and fal 422'd post-queue.
+// Pre-flighting locally turns those silent-then-422 failures into a stack
+// trace at the submit call site, with the actual missing field name in
+// the message. Add new entries as new endpoints land; missing entries
+// fall through unchecked (no false positives on un-mapped endpoints).
+const REQUIRED_FIELDS = {
+  [KLING.o1_dual_keyframe]:           ["prompt", "start_image_url", "tail_image_url"],
+  [KLING.pro_image_to_video]:         ["prompt", "image_url"],
+  [SEEDANCE.image_to_video]:          ["prompt", "image_url"],
+  [SEEDANCE.image_to_video_fast]:     ["prompt", "image_url"],
+  [SEEDANCE.reference_to_video]:      ["prompt", "reference_images"],
+  [SEEDANCE.reference_to_video_fast]: ["prompt", "reference_images"],
+  [SEEDANCE.text_to_video]:           ["prompt"],
+  [SEEDANCE.text_to_video_fast]:      ["prompt"],
+  [SEEDREAM.text_to_image]:           ["prompt"],
+  [SEEDREAM.edit]:                    ["prompt", "image_urls"],
+};
+function assertBodyShape(endpoint, body) {
+  const required = REQUIRED_FIELDS[endpoint];
+  if (!required) return;  // un-mapped endpoint → no pre-flight; defer to fal
+  const missing = [];
+  for (const field of required) {
+    const v = body?.[field];
+    const isEmpty =
+      v === undefined ||
+      v === null ||
+      (typeof v === "string" && v.length === 0) ||
+      (Array.isArray(v) && v.length === 0);
+    if (isEmpty) missing.push(field);
+  }
+  if (missing.length === 0) return;
+  const present = Object.keys(body || {});
+  throw new Error(
+    `falClient pre-flight: refusing to POST ${endpoint} — required field${missing.length > 1 ? "s" : ""} missing: [${missing.join(", ")}]. Body has: [${present.join(", ")}]. Fix the body builder (likely the v4.27 router for engine-routed shots).`
+  );
+}
+
 // Per-second pricing for Seedance (verified 2026-05-13 against fal.ai docs)
 const PRICING = {
   seedance_2_standard_720p_per_sec: 0.3034,  // text & reference modes
@@ -6364,6 +6405,16 @@ class FalClient {
     const submitUrl = `${this.workerUrl}${endpoint}`;
     const headers = { "Content-Type": "application/json" };
 
+    // v4.30: local pre-flight schema check. Throws BEFORE the network call
+    // when a required field is missing/empty for a known endpoint. The
+    // 2026-05-16 audit caught the v4.27 router emitting Seedance's
+    // `image_url` into a Kling body that wants `start_image_url` — fal
+    // 422'd post-queue, the queue marked COMPLETED, and the "✓ completed"
+    // log was misleading because no model ran. Pre-flighting locally turns
+    // that into a stack-trace at the call site with the actual missing
+    // field name.
+    assertBodyShape(endpoint, body);
+
     if (this.dryRun) {
       // Print the request shape and stop. Useful for prompt-iteration sessions.
       const dry = { endpoint: submitUrl, method: "POST", headers, body };
@@ -6441,7 +6492,16 @@ class FalClient {
       const sjson = await sres.json();
       // fal status values: IN_QUEUE, IN_PROGRESS, COMPLETED, FAILED
       if (sjson.status === "COMPLETED") {
-        this.onLog(`  ✓ completed in ${Math.round((Date.now() - start)/1000)}s`);
+        // v4.30: distinguish "queue finished its async wrapper" from
+        // "model output is valid and ready to use". Pre-v4.30 the log
+        // said "✓ completed in 5s" the moment the queue marked COMPLETED
+        // — but fal's queue COMPLETED can wrap a 422 schema rejection in
+        // the response payload (model never ran). Two separate log lines
+        // now: one for queue completion, one after the response is
+        // fetched + parsed. So "✓ completed" can no longer fire on a roll
+        // that didn't actually render.
+        const queueElapsed = Math.round((Date.now() - start)/1000);
+        this.onLog(`  fal queue: COMPLETED in ${queueElapsed}s — fetching final response…`);
         const respUrl = this.#rewriteToWorker(submitJson.response_url);
         // This is the fetch that hit "downstream_service_error" — most common
         // failure point. fal hosts the result for a while; retries are free.
@@ -6451,6 +6511,7 @@ class FalClient {
           throw new Error(`fal response fetch failed: ${rres.status} — ${t.slice(0, 300)}`);
         }
         const result = await rres.json();
+        this.onLog(`  ✓ response validated (${Math.round((Date.now() - start)/1000)}s total)`);
         result.__elevenx_meta = {
           request_id: submitJson.request_id,
           endpoint,
@@ -11636,14 +11697,26 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // 2. Gate-satisfied with BOTH frames + state-change → Kling dual-keyframe.
     //    This is the highest-fidelity path: both anchors are honored as
     //    actual frame positions, not as "style references".
+    //
+    // v4.30 field-name fix: Kling O1 dual-keyframe expects start_image_url
+    // (NOT image_url, which is Seedance's field). Audit (2026-05-16): both
+    // post-v4.27 rolls 422'd with "Field required: body.start_image_url"
+    // because the v4.17 code path reused Seedance's field names when it
+    // added Kling routing. body_overrides now carries the ENGINE-SPECIFIC
+    // dispatch field names (start_image_url + tail_image_url for Kling).
+    // The canonical "what URL is the start/end frame" lives at
+    // _anchors.{start,end} so consumers that need the frame URLs without
+    // caring about which engine (composer, prompt context, UI) read those
+    // and never touch body_overrides.
     if (startApproved && endApproved && stateChange) {
       return {
         engine: "kling-o1-dual",
         composer_mode: "image_to_video",  // i2v prompt language fits dual-keyframe
         body_overrides: {
-          image_url: startApproved,
-          tail_image_url: endApproved,
+          start_image_url: startApproved,   // Kling O1 schema field name
+          tail_image_url:  endApproved,     // Kling O1 schema field name
         },
+        _anchors: { start: startApproved, end: endApproved },
         reason: "gate-approved start + end frames with has_state_change=true → Kling dual-keyframe anchors both ends (overrides bible mode " + JSON.stringify(declaredMode) + ")",
       };
     }
@@ -11656,8 +11729,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         engine: "seedance-image_to_video",
         composer_mode: "image_to_video",
         body_overrides: {
-          image_url: startApproved,
+          image_url: startApproved,         // Seedance i2v schema field name
         },
+        _anchors: { start: startApproved },
         reason: stateChange
           ? "gate-approved start only (state-change on but end not approved) → Seedance i2v with single anchor"
           : "gate-approved start, no state-change → Seedance i2v (single anchor, hold-style motion)",
@@ -16756,15 +16830,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // dispatch keyed off the bible mode, not the gate state.
     let routing = resolveRenderEngine(shot, { previousShotHasApprovedTake: previousHasApproved });
 
-    // Map router body_overrides into the composer-facing `assets` shape.
-    // Composer.composeSeedance reads assets.startImageUrl / assets.endImageUrl
-    // for the i2v prompt branch; we mirror routing's image_url / tail_image_url
-    // there so an approved-gate shot doesn't have to also satisfy the legacy
-    // keyframe-gen ladder. (The router's body_overrides go ON TOP of
-    // composed.body at dispatch — these mirror lines just keep composer happy.)
+    // v4.30: read anchor URLs from routing._anchors (canonical), NOT
+    // body_overrides (engine-specific dispatch fields). Pre-v4.30 the
+    // assets mapping read routing.body_overrides.image_url / .tail_image_url
+    // — fine when both Kling and Seedance shared those names, broken the
+    // moment Kling's actual schema was discovered to use start_image_url.
+    // Audit (2026-05-16): fal 422'd both rolls with "Field required: body.
+    // start_image_url" because body_overrides was emitting Seedance's field
+    // names. The fix lives in resolveRenderEngine (engine-specific field
+    // names in body_overrides); this read path is decoupled from those
+    // names so a future engine field-name change can't silently desync
+    // the prompt context from the dispatch body again.
     let assets = { referenceImageUrls: [] };
-    if (routing.body_overrides?.image_url)      assets.startImageUrl = routing.body_overrides.image_url;
-    if (routing.body_overrides?.tail_image_url) assets.endImageUrl   = routing.body_overrides.tail_image_url;
+    if (routing._anchors?.start) assets.startImageUrl = routing._anchors.start;
+    if (routing._anchors?.end)   assets.endImageUrl   = routing._anchors.end;
 
     // MVP: image_to_video AUTO-GENERATES a keyframe via Seedream if the
     // gate didn't already supply one. This composes the scene from cast
@@ -18062,11 +18141,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
         extraAssets,
         characters: chars,
       });
-      // v4.29: mirror routing's body_overrides into the preview assets so
-      // the composer sees the gate-approved start/end frames and emits the
-      // [Anchor Frames] block — same plumbing as handleRollShot.
-      if (routing?.body_overrides?.image_url)      previewAssets.startImageUrl = routing.body_overrides.image_url;
-      if (routing?.body_overrides?.tail_image_url) previewAssets.endImageUrl   = routing.body_overrides.tail_image_url;
+      // v4.30: mirror routing's canonical _anchors (not engine-specific
+      // body_overrides) so the preview matches what the roll path now does.
+      // See the equivalent comment in handleRollShot for the field-name-
+      // decoupling rationale.
+      if (routing?._anchors?.start) previewAssets.startImageUrl = routing._anchors.start;
+      if (routing?._anchors?.end)   previewAssets.endImageUrl   = routing._anchors.end;
 
       const composed = composer.composeSeedance({
         shot, cast, environment, project,
