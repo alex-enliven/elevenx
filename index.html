@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="c75d45a85172" data-build-time="2026-05-16T03:31:15.212Z">
+<meta name="elevenx-build" content="307f2fcfc6ff" data-build-time="2026-05-16T05:37:46.531Z">
 <script>
 (function(){
-  var info = { hash: "c75d45a85172", time: "2026-05-16T03:31:15.212Z" };
+  var info = { hash: "307f2fcfc6ff", time: "2026-05-16T05:37:46.531Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: c75d45a85172 @ 2026-05-16T03:31:15.212Z -->
+<!-- elevenx-build: 307f2fcfc6ff @ 2026-05-16T05:37:46.531Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9129,13 +9129,36 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // preview threw "composeSeedance(reference_to_video): no reference images
   // resolved" even when the shot's refs all resolved cleanly. Sharing the
   // build logic makes preview = roll == composer.
-  function buildComposerAssets({ mode, castInFrame, environment, extraAssets, startImageUrl }) {
+  //
+  // v4.19 (audit 2026-05-17): two more seams plugged.
+  //   (a) When `shot` is provided, i2v auto-derives startImageUrl from
+  //       shot.keyframes.start.approved_dataUrl (or legacy startDataUrl).
+  //       This closes the gate ↔ composer seam: the gate writes to one
+  //       field, this function now reads it.
+  //   (b) Promotes shot.references[].kind==="character" entries into the
+  //       reference-image list for r2v mode, deduped against castInFrame.
+  //       Closes the cast-in-references seam: shots like S02 "The boy
+  //       hides the shadow" where the character anchor lives in
+  //       references[] (role=support) rather than cast_in_frame[] no
+  //       longer fall through to "no reference images resolved".
+  function buildComposerAssets({ shot, mode, castInFrame, environment, extraAssets, startImageUrl, characters }) {
     const out = { extraAssets: extraAssets || [] };
     if (mode === "image_to_video") {
-      out.startImageUrl = startImageUrl || null;
+      // v4.19: precedence — explicit startImageUrl > gate-approved frame
+      // (shot.keyframes.start.approved_dataUrl) > legacy startDataUrl.
+      // Without this, integrated callers had to know to compute startImageUrl
+      // themselves, and forgetting it threw "keyframe-gen failed to produce
+      // a start image" on shots whose gate explicitly said "approved".
+      out.startImageUrl = startImageUrl
+        || shot?.keyframes?.start?.approved_dataUrl
+        || shot?.keyframes?.startDataUrl
+        || null;
     } else if (mode === "reference_to_video") {
       const refs = [];
+      const seenCastIds = new Set();
+      // 1. cast_in_frame portraits
       for (const c of (castInFrame || [])) {
+        if (c?.id) seenCastIds.add(c.id);
         for (const angle of ["head_on", "three_quarter", "full_body"]) {
           const url = refUrlFor(c, angle);
           if (url) refs.push(url);
@@ -9143,9 +9166,38 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         }
         if (refs.length >= 9) break;
       }
-      // Append extra-asset dataUrls AFTER cast portraits (identity locks first)
+      // 2. v4.19: characters referenced via shot.references[] (kind=character)
+      //    that AREN'T already in cast_in_frame. Required for shots whose
+      //    cast anchor lives in references[] rather than cast_in_frame[].
+      if (shot && Array.isArray(characters)) {
+        const refCharIds = (shot.references || [])
+          .map(r => {
+            if (!r || typeof r !== "object") return null;
+            const k = (r.kind || "").toLowerCase();
+            if (k !== "character" && k !== "char") return null;
+            return r.character_id || r.ref_id || r.id;
+          })
+          .filter(Boolean)
+          .filter(id => !seenCastIds.has(id));
+        for (const id of refCharIds) {
+          const c = characters.find(x => x.id === id);
+          if (!c) continue;
+          seenCastIds.add(id);
+          for (const angle of ["head_on", "three_quarter", "full_body"]) {
+            const url = refUrlFor(c, angle);
+            if (url) refs.push(url);
+            if (refs.length >= 9) break;
+          }
+          if (refs.length >= 9) break;
+        }
+      }
+      // 3. Append extra-asset dataUrls AFTER cast portraits (identity locks first)
       for (const a of (extraAssets || [])) {
         if (!a?.dataUrl) continue;
+        // Skip character entries already covered above (resolveExtraAssets
+        // also surfaces them as kind=character with a dataUrl, but we've
+        // already pushed their angle-specific portraits).
+        if ((a.kind || "").toLowerCase() === "character" && a.id && seenCastIds.has(a.id)) continue;
         if (refs.length >= 9) break;
         refs.push(a.dataUrl);
       }
@@ -15357,6 +15409,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (!shot) throw new Error(`shot ${shotId} not found`);
     shot.keyframes = shot.keyframes || {};
     shot.keyframes.has_state_change = !!value;
+    // v4.19: user explicitly set the value, so the migration-default flag
+    // no longer applies. Clear it so the proposer-disagreement hint stops
+    // surfacing on subsequent renders.
+    if (shot.keyframes._migrated_has_state_change) {
+      shot.keyframes._migrated_has_state_change = false;
+    }
     if (value && !shot.keyframes.end) {
       shot.keyframes.end = { candidates: [], approved_id: null, approved_at: null, approved_dataUrl: null };
     }
@@ -15826,21 +15884,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
         return;
       }
     } else if (resolved.mode === "reference_to_video") {
-      assets.referenceImageUrls = [];
-      for (const c of castInFrame) {
-        for (const a of ["head_on", "three_quarter", "full_body"]) {
-          const url = refUrlFor(c, a);
-          if (url) assets.referenceImageUrls.push(url);
-          if (assets.referenceImageUrls.length >= 9) break;
-        }
-        if (assets.referenceImageUrls.length >= 9) break;
-      }
-      // v3: append extra-asset dataUrls AFTER cast portraits (identity locks first).
-      const extrasWithUrls = extraAssets.filter(a => a.dataUrl);
-      for (const a of extrasWithUrls) {
-        if (assets.referenceImageUrls.length >= 9) break;
-        assets.referenceImageUrls.push(a.dataUrl);
-      }
+      // v4.19: delegate to the shared buildComposerAssets helper so the
+      // roll path picks up the cast-in-references lift (S02-class fix).
+      // Previously this branch had inline duplicated logic that DIDN'T
+      // walk shot.references[] for character entries — same bug shape as
+      // the v4.16 preview-path bug, in a different place.
+      const r2vAssets = buildComposerAssets({
+        shot,
+        mode: "reference_to_video",
+        castInFrame,
+        environment,
+        extraAssets,
+        characters,
+      });
+      assets.referenceImageUrls = r2vAssets.referenceImageUrls || [];
       if (assets.referenceImageUrls.length === 0) {
         // v4.13: mirror of v4.8's i2v→t2v auto-downgrade. Same root cause:
         // the shot wants r2v but has no resolvable refs (either cross-bible
@@ -16511,6 +16568,15 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const startOK = !!startSlot.approved_dataUrl;
     const endOK   = !hasStateChange || !!endSlot.approved_dataUrl;
     const gateOK  = startOK && endOK;
+    // v4.19: detect migration-vs-proposer disagreement. The take-thumb
+    // backfill (v4.18) forces has_state_change=false to keep the gate
+    // satisfied on legacy approved shots, but for semantically state-change
+    // shots (e.g. S02 "The boy hides the shadow") that means Kling
+    // dual-keyframe routing is silently bypassed. Surface the proposer's
+    // verdict so the director can opt in.
+    const proposerVerdict = proposeHasStateChangeForShot(shot);
+    const showProposerHint = !!kf._migrated_has_state_change
+      && proposerVerdict !== hasStateChange;
 
     const renderCandidateStrip = (slot, slotData) => {
       const candidates = slotData.candidates || [];
@@ -16553,6 +16619,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
             Has state change (requires end frame · Kling dual-keyframe)
           </label>
         </div>
+        ${showProposerHint ? `
+        <!-- v4.19: proposer disagreement hint -->
+        <div style="margin-bottom:10px; padding:8px 10px; background:#1a1410; border:1px solid #5a4a25; border-radius:4px; font-size:11px; color:#e4cf80; line-height:1.45;">
+          🤖 Proposer suggests this is a <strong>${proposerVerdict ? "state-change" : "hold"}</strong> shot (current: ${hasStateChange ? "state-change" : "hold"}), based on the_moment text. The v4.18 migration forced "hold" on all legacy shots to keep the gate satisfied — if you intend this shot for Kling dual-keyframe motion, ${proposerVerdict ? "tick the checkbox above to apply" : "leave it as-is"}.
+        </div>` : ""}
         <!-- Start frame slot -->
         <div style="margin-bottom:${hasStateChange ? "12" : "0"}px;">
           <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
@@ -16766,12 +16837,16 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // roll path's r2v reference-resolution. Pre-v4.16 the preview only
       // passed `extraAssets` and threw "no reference images resolved" on
       // every r2v shot. Now it builds `referenceImageUrls` identically.
+      // v4.19: pass `shot` + `characters` so the helper can (a) derive
+      // startImageUrl from the gate-approved frame for i2v, and (b) lift
+      // character refs from shot.references[] for r2v.
       const previewAssets = buildComposerAssets({
+        shot,
         mode: resolvedMode,
         castInFrame: cast,
         environment,
         extraAssets,
-        startImageUrl: shot.keyframes?.startDataUrl || null,
+        characters: chars,
       });
       const composed = composer.composeSeedance({
         shot, cast, environment, project,
@@ -18995,8 +19070,16 @@ JSON object only. No commentary. No fences. No trailing text.`;
             // which then requires an end frame the recovery didn't produce,
             // and the gate refuses a shot whose take is already approved.
             // This was the exact failure mode caught by the v4.17 audit.
+            //
+            // v4.19: stamp _migrated_has_state_change so the UI can detect
+            // when the migration-forced value disagrees with the proposer's
+            // semantic verdict (e.g. S02 "The boy hides the shadow" is
+            // clearly a state-change shot but got forced false by backfill).
+            // The keyframe-gate UI surfaces a "Proposer suggests state-change
+            // — apply?" hint when this flag is set AND proposer disagrees.
             if (legacySource === "approved_take_thumb") {
               shot.keyframes.has_state_change = false;
+              shot.keyframes._migrated_has_state_change = true;
             }
             report.takeThumbRecoveries = (report.takeThumbRecoveries || []);
             if (legacySource === "approved_take_thumb") {
