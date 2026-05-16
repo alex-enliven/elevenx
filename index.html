@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="a9ec05fc5e3d" data-build-time="2026-05-16T18:36:29.033Z">
+<meta name="elevenx-build" content="04acaff3f2f5" data-build-time="2026-05-16T18:49:52.064Z">
 <script>
 (function(){
-  var info = { hash: "a9ec05fc5e3d", time: "2026-05-16T18:36:29.033Z" };
+  var info = { hash: "04acaff3f2f5", time: "2026-05-16T18:49:52.064Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: a9ec05fc5e3d @ 2026-05-16T18:36:29.033Z -->
+<!-- elevenx-build: 04acaff3f2f5 @ 2026-05-16T18:49:52.064Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6370,11 +6370,19 @@ class FalClient {
   /**
    * Upload a data: URI to fal storage and return the resulting https URL.
    * No-op for inputs that are already http/https URLs (returns input unchanged).
-   * @param {string} dataUrl   — data:image/png;base64,… (or https://… pass-through)
-   * @param {string} [filename] — for logging on fal's side; defaults to "anchor.png"
+   *
+   * v4.32 payload reduction: PNG inputs are transcoded to JPEG (quality
+   * 0.92) before upload. Seedream keyframes ship as ~4 MB PNGs; the
+   * 5–8× reduction (down to ~0.5–1 MB JPEG) dramatically improves upload
+   * reliability on flaky networks and reduces Cloudflare worker CPU time.
+   * Stylized renders are visually identical at quality 0.92 to the eye
+   * AND to the model (Kling/Seedance treat both as anchor frames).
+   *
+   * @param {string} dataUrl   — data:image/{png,jpeg};base64,… (or https://… pass-through)
+   * @param {string} [filename] — for logging on fal's side; defaults to "anchor.jpg"
    * @returns {Promise<string>} — https://v3.fal.media/files/…
    */
-  async uploadDataUrlToStorage(dataUrl, filename = "anchor.png") {
+  async uploadDataUrlToStorage(dataUrl, filename = "anchor.jpg") {
     if (typeof dataUrl !== "string") {
       throw new Error(`uploadDataUrlToStorage: expected string, got ${typeof dataUrl}`);
     }
@@ -6389,20 +6397,45 @@ class FalClient {
     if (!match) {
       throw new Error(`uploadDataUrlToStorage: malformed data URI (expected "data:<mime>;base64,<payload>")`);
     }
-    const [, mimeType, base64] = match;
-    // Convert base64 → Uint8Array → Blob
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const blob = new Blob([bytes], { type: mimeType });
+    const [, sourceMimeType, sourceBase64] = match;
+
+    let uploadBlob, uploadMimeType, uploadFilename;
+    // PNG inputs → JPEG (quality 0.92). Other formats pass through verbatim.
+    // Browser-only: canvas + toBlob. Falls back to verbatim if canvas isn't
+    // available (e.g. Node/jsdom tests).
+    const canTranscode = sourceMimeType === "image/png" &&
+                         typeof document !== "undefined" &&
+                         typeof Image !== "undefined";
+    if (canTranscode) {
+      try {
+        uploadBlob = await this.#transcodeDataUrlToJpegBlob(dataUrl, 0.92);
+        uploadMimeType = "image/jpeg";
+        uploadFilename = filename.replace(/\.png$/i, ".jpg");
+        const originalKB = Math.round((sourceBase64.length * 0.75) / 1024);  // base64 decoded size
+        const compressedKB = Math.round(uploadBlob.size / 1024);
+        this.onLog(`  transcoded PNG→JPEG: ${originalKB} KB → ${compressedKB} KB (${Math.round(100 - (compressedKB/originalKB)*100)}% smaller)`);
+      } catch (err) {
+        // Canvas transcoding can fail on huge images or in environments
+        // with strict canvas-tainting policies. Fall back to the raw PNG
+        // rather than blocking the upload entirely.
+        this.onLog(`  PNG→JPEG transcode failed (${err.message}); uploading PNG verbatim`);
+        uploadBlob = this.#base64ToBlob(sourceBase64, sourceMimeType);
+        uploadMimeType = sourceMimeType;
+        uploadFilename = filename;
+      }
+    } else {
+      uploadBlob = this.#base64ToBlob(sourceBase64, sourceMimeType);
+      uploadMimeType = sourceMimeType;
+      uploadFilename = filename;
+    }
 
     // Multipart form-data POST. fal's simple-upload endpoint accepts a
     // single "file" field and returns { url: "https://v3.fal.media/files/…" }.
     const formData = new FormData();
-    formData.append("file", blob, filename);
+    formData.append("file", uploadBlob, uploadFilename);
 
     const url = `${this.workerUrl}/fal-storage/storage/upload`;
-    this.onLog(`→ POST /fal-storage/storage/upload (${blob.size} bytes, ${mimeType})`);
+    this.onLog(`→ POST /fal-storage/storage/upload (${uploadBlob.size} bytes, ${uploadMimeType})`);
     const res = await this.fetch(url, {
       method: "POST",
       body: formData,
@@ -6422,6 +6455,47 @@ class FalClient {
     }
     this.onLog(`  ✓ uploaded → ${fileUrl}`);
     return fileUrl;
+  }
+
+  // Internal: base64 → Blob without touching the DOM. Used as fallback
+  // when canvas transcoding isn't available or fails.
+  #base64ToBlob(base64, mimeType) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mimeType });
+  }
+
+  // Internal: PNG dataURL → JPEG Blob via canvas. Browser-only.
+  // Quality 0.92 chosen empirically: visually identical to source for
+  // stylized AI renders, ~5-8× payload reduction vs PNG.
+  #transcodeDataUrlToJpegBlob(dataUrl, quality = 0.92) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext("2d");
+          // White background — JPEG doesn't support alpha. Without this,
+          // transparent PNGs would render with black backgrounds (canvas
+          // default fillStyle is "transparent" but JPEG composites onto
+          // black).
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0);
+          canvas.toBlob(blob => {
+            if (blob) resolve(blob);
+            else reject(new Error("canvas.toBlob returned null (browser may have rejected the encode)"));
+          }, "image/jpeg", quality);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      img.onerror = () => reject(new Error("Image load failed (data URL may be corrupted)"));
+      img.src = dataUrl;
+    });
   }
 
   // ─── Health check (no spend) ──────────────────────────────────────────
@@ -16551,6 +16625,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
     slotData.approved_id = candidateId;
     slotData.approved_at = Date.now();
     slotData.approved_dataUrl = candidate.dataUrl;
+    // v4.32: invalidate the cached fal_storage_url. The user just approved
+    // a different (or new) candidate, so the prior fal upload (if any)
+    // refers to a stale image. handleRollShot will re-upload on the next
+    // roll. Without this, switching keyframe candidates would silently
+    // ship the OLD frame to Kling because the cache was never busted.
+    slotData.fal_storage_url = null;
+    slotData.fal_storage_uploaded_at = null;
     // Back-compat: also stamp legacy startDataUrl so any code path that
     // still reads it (the v4.5 fallback ladder, etc.) sees the approved frame.
     if (slot === "start") {
@@ -17286,19 +17367,46 @@ JSON object only. No commentary. No fences. No trailing text.`;
         // data: URIs in start_image_url / tail_image_url. The Seedance/
         // Bytedance endpoints auto-handle data URIs in fal's queue layer;
         // Kling doesn't. So for Kling-routed shots we must upload the
-        // gate-approved Seedream keyframes (stored as data:image/jpeg;…
-        // in IndexedDB) to fal storage first, swap the resulting https
-        // URLs into the body, then submit. Without this step we'd 422
-        // post-queue on "fetch failed" or similar URL-format errors.
-        setGPS(true, `Uploading anchors to fal storage…`, "Kling needs https URLs (data: URIs not accepted)", 40);
-        const [startUrlHttps, endUrlHttps] = await Promise.all([
-          State.fal.uploadDataUrlToStorage(routing._anchors.start, `${shotId}-start.png`),
-          State.fal.uploadDataUrlToStorage(routing._anchors.end,   `${shotId}-end.png`),
-        ]);
+        // gate-approved Seedream keyframes to fal storage first.
+        //
+        // v4.32: cache the resulting fal URL on the keyframe slot so a
+        // re-roll of the same shot doesn't re-upload (~4 MB × 2 frames
+        // per roll). The cache is invalidated when the user approves a
+        // different candidate (approveKeyframeCandidate clears the URL).
+        const slotStart = shot.keyframes.start;
+        const slotEnd   = shot.keyframes.end;
+        let startUrlHttps = slotStart?.fal_storage_url;
+        let endUrlHttps   = slotEnd?.fal_storage_url;
+        const needStartUpload = !startUrlHttps;
+        const needEndUpload   = !endUrlHttps;
+        if (needStartUpload || needEndUpload) {
+          setGPS(true, `Uploading anchors to fal storage…`, "Kling needs https URLs (data: URIs not accepted)", 40);
+          const [s, e] = await Promise.all([
+            needStartUpload ? State.fal.uploadDataUrlToStorage(routing._anchors.start, `${shotId}-start.jpg`) : Promise.resolve(startUrlHttps),
+            needEndUpload   ? State.fal.uploadDataUrlToStorage(routing._anchors.end,   `${shotId}-end.jpg`)   : Promise.resolve(endUrlHttps),
+          ]);
+          startUrlHttps = s;
+          endUrlHttps   = e;
+          // Persist the fal URLs back onto the shot so the next roll
+          // (or a verifier inspection) skips the upload step.
+          if (needStartUpload && slotStart) {
+            slotStart.fal_storage_url = startUrlHttps;
+            slotStart.fal_storage_uploaded_at = Date.now();
+          }
+          if (needEndUpload && slotEnd) {
+            slotEnd.fal_storage_url = endUrlHttps;
+            slotEnd.fal_storage_uploaded_at = Date.now();
+          }
+          try { await Storage.put("shots", shot); } catch (err) {
+            console.warn("[v4.32] failed to persist fal_storage_url cache:", err);
+          }
+        } else {
+          console.log(`[v4.32] using cached fal_storage_url for both anchors — skipped upload (saved ~8 MB POST)`);
+        }
         setGPS(true, `Rolling Kling O1 dual-keyframe · <span class="mono">${esc(shotId)}</span>`, `${renderEngine} · est ${fmtUsd(estCost)}`, 55);
         const klingBody = {
           prompt: composed.prompt,
-          start_image_url: startUrlHttps,  // v4.30 field name + v4.31 https URL
+          start_image_url: startUrlHttps,  // v4.30 field name + v4.31 https URL + v4.32 cached
           tail_image_url:  endUrlHttps,
           duration: composed.body.duration,
           aspect_ratio: composed.body.aspect_ratio,
