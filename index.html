@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="e2f2da8d0b1b" data-build-time="2026-05-16T05:55:38.015Z">
+<meta name="elevenx-build" content="67116b323d20" data-build-time="2026-05-16T06:04:39.081Z">
 <script>
 (function(){
-  var info = { hash: "e2f2da8d0b1b", time: "2026-05-16T05:55:38.015Z" };
+  var info = { hash: "67116b323d20", time: "2026-05-16T06:04:39.081Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: e2f2da8d0b1b @ 2026-05-16T05:55:38.015Z -->
+<!-- elevenx-build: 67116b323d20 @ 2026-05-16T06:04:39.081Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6717,7 +6717,30 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
   // Seedance treats them as additional style guidance.
   const styleCanonParts = [];
   if (project.style_canon && String(project.style_canon).trim()) {
-    styleCanonParts.push(String(project.style_canon).trim());
+    // v4.23: sanitize project.style_canon against the cast actually
+    // IN-FRAME for this shot. Audit (2026-05-17): the project's canon
+    // included "Lionn's face must remain visible and emotionally readable"
+    // but Fynn-only shots inherited the line verbatim, telling Seedance
+    // to keep Lionn's face visible in a shot Lionn isn't in.
+    //
+    // Sanitization strips lines that reference other characters' names
+    // when they're not present in the shot's cast_in_frame OR references[].
+    let canon = String(project.style_canon).trim();
+    try {
+      // Collect the set of names that ARE valid in this shot
+      const inFrameNames = (cast || []).map(c => c.display_name).filter(Boolean);
+      // ALSO include the universal project cast (we don't have direct
+      // access here, but `cast` is passed in by the caller). If the
+      // sanitizer's "allCastNames" arg includes names not in inFrameNames,
+      // it'll strip lines that name THOSE characters.
+      // Caller passes cast = the cast IN-FRAME, so we treat them as
+      // current AND derive allCastNames from project if available.
+      const allCastNames = Array.isArray(project._all_cast_names_for_sanitization)
+        ? project._all_cast_names_for_sanitization
+        : inFrameNames;
+      canon = sanitizeStyleCanonForShot(canon, inFrameNames, allCastNames);
+    } catch { /* keep raw canon on sanitization failure */ }
+    styleCanonParts.push(canon);
   }
   if (Array.isArray(project.world_rules) && project.world_rules.length > 0) {
     const rules = project.world_rules.filter(r => r && String(r).trim()).map(r => `- ${String(r).trim()}`);
@@ -7491,6 +7514,48 @@ function sanitizeStyleCanonForCharacter(styleCanon, currentCharacterName, allCas
 }
 
 /**
+ * v4.23: sanitize a project's style_canon for use in a SPECIFIC SHOT.
+ * Strips sentences that name characters NOT in the shot's in-frame set.
+ *
+ * Different from sanitizeStyleCanonForCharacter (which strips against
+ * a single anchor character): this one strips against the full in-frame
+ * cast list. Used by composeSeedance so a shot with only Fynn doesn't
+ * inherit "Lionn's face must remain visible" from the project canon.
+ *
+ * @param {string} styleCanon — raw project.style_canon prose
+ * @param {string[]} inFrameNames — display_names of cast IN this shot
+ * @param {string[]} allCastNames — display_names of all cast in the project
+ *                                  (used to identify what to strip; absent
+ *                                  names that ARE in the canon are kept)
+ */
+function sanitizeStyleCanonForShot(styleCanon, inFrameNames, allCastNames) {
+  if (!styleCanon || typeof styleCanon !== "string") return "";
+  if (!allCastNames || allCastNames.length === 0) return styleCanon;
+  const inFrame = new Set(
+    (inFrameNames || []).map(n => String(n || "").trim().toLowerCase()).filter(Boolean)
+  );
+  const others = allCastNames
+    .map(n => String(n || "").trim())
+    .filter(n => n && !inFrame.has(n.toLowerCase()));
+  if (others.length === 0) return styleCanon;
+
+  const sentences = styleCanon
+    .split(/(?<=[.!?])\s+|(?<=[;—])\s+|\n+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const kept = sentences.filter(sentence => {
+    return !others.some(name => {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const wordRe = new RegExp(`\\b${escaped}\\b`, "i");
+      return wordRe.test(sentence);
+    });
+  });
+
+  return kept.join(" ").trim();
+}
+
+/**
  * Does this character have ENOUGH visual identity data for the composer to
  * produce a meaningful per-character prompt? "Meaningful" here means: the
  * prompt won't reduce to "12-year-old <name>." with empty wardrobe/hair.
@@ -7569,6 +7634,53 @@ function mediumPromptSpec(medium) {
     envOpening: "Photographic establishing wide shot, architectural photography style, 24mm wide, eye level, no people in frame.",
     envQuality: "Documentary realism. 35mm lens feel.",
     envNegative: "fisheye, dramatic lighting, neon, futuristic, sci-fi, empty soundstage feel, fake plants, lens flare",
+  };
+}
+
+/**
+ * v4.23: medium-aware spec for KEYFRAME GENERATION (not cast portraits).
+ *
+ * mediumPromptSpec() returns reference-sheet language ("single character on
+ * a clean neutral background") because it was designed for cast bible
+ * portraits. The keyframe-candidate generator inherited it in v4.17 and
+ * has been silently emitting reference-sheet prompts ever since, producing
+ * hero portraits instead of scene-composition frames. Audit caught it
+ * 2026-05-17: "Seedance interpolates between two reference sheets and you
+ * get two hero shots with a slight pose change."
+ *
+ * This spec returns the SAME medium language for opening/negatives but
+ * replaces the cast-portrait quality cues with scene-composition cues.
+ * A keyframe is a frame of a film, not a lookbook. Environment + action
+ * + props should be in frame; the character should NOT be on neutral
+ * background.
+ */
+function mediumPromptSpecForKeyframe(medium) {
+  if (medium === "animated_3d") {
+    return {
+      opening: "Premium stylized 3D animated cinematic still — a frame from a film, feature-film quality.",
+      qualityCues: "Polished PBR materials, stylized shading, expressive character animation. Cinematic lighting matched to the project style canon. Scene composition: character(s) integrated into the environment, with any action visible in frame. NOT a reference sheet — this is a single beat of a film.",
+      negativeCues: "photoreal, photograph, photorealistic, live-action, skin pores, lens flare, stock photo, plastic skin, AI sheen, makeup-heavy, exaggerated features, uncanny valley, neutral grey background, reference sheet, character lookbook, hero portrait isolated from scene, character floating in negative space",
+    };
+  }
+  if (medium === "animated_2d") {
+    return {
+      opening: "Stylized 2D animated cinematic still — a frame from a film, clean linework with painterly shading.",
+      qualityCues: "Expressive limited-frame animation aesthetic, flat-but-considered color. Scene composition: character(s) integrated into the environment with action visible. NOT a reference sheet.",
+      negativeCues: "photoreal, photograph, 3D render, skin pores, lens flare, stock photo, plastic, AI sheen, neutral background, reference sheet, character lookbook, isolated portrait",
+    };
+  }
+  if (medium === "documentary") {
+    return {
+      opening: "Observational documentary cinematic still — a frame mid-scene, available light.",
+      qualityCues: "Naturalistic, subtle camera presence. Scene composition: subject in their actual environment, mid-action. No studio lighting setup. Natural skin texture, real environment.",
+      negativeCues: "stock photo, plastic skin, over-smoothed, AI sheen, theatrical lighting, glossy, posed portrait, neutral background, reference sheet",
+    };
+  }
+  // live_action (default)
+  return {
+    opening: "Cinematic still — a single frame mid-scene, naturalistic.",
+    qualityCues: "Scene composition: subject in their environment, action visible. Soft naturalistic lighting matched to the scene's time of day. 35mm equivalent, depth of field appropriate to framing. Practical lighting; no studio setup.",
+    negativeCues: "stock photo, plastic skin, over-smoothed, makeup-heavy, AI sheen, glossy, posed portrait, neutral grey background, reference sheet, character floating in negative space",
   };
 }
 
@@ -7828,8 +7940,10 @@ window.ElevenX.resolveShotDuration = resolveShotDuration;
 window.ElevenX.clampDuration = clampDuration;
 window.ElevenX.resolveVoiceoverSpeakerName = resolveVoiceoverSpeakerName;
 window.ElevenX.sanitizeStyleCanonForCharacter = sanitizeStyleCanonForCharacter;
+window.ElevenX.sanitizeStyleCanonForShot = sanitizeStyleCanonForShot;
 window.ElevenX.characterHasVisualIdentity = characterHasVisualIdentity;
 window.ElevenX.mediumPromptSpec = mediumPromptSpec;
+window.ElevenX.mediumPromptSpecForKeyframe = mediumPromptSpecForKeyframe;
 window.ElevenX.composeCastReferencePrompt = composeCastReferencePrompt;
 window.ElevenX.composeCastReferenceEditPrompt = composeCastReferenceEditPrompt;
 window.ElevenX.composeEnvironmentReferenceEditPrompt = composeEnvironmentReferenceEditPrompt;
@@ -8458,6 +8572,11 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
     // can compose medium-aware prompts (animated projects no longer get a
     // photoreal "documentary-cinematic" keyframe).
     mediumPromptSpec:                      NS.mediumPromptSpec,
+    // v4.23: scene-composition spec for keyframe generation (the
+    // reference-sheet language in mediumPromptSpec was the wrong mental
+    // model — caught by audit when keyframes came back as hero portraits
+    // instead of scene frames).
+    mediumPromptSpecForKeyframe:           NS.mediumPromptSpecForKeyframe,
     // v4.16: composeVoiceover for the per-shot ElevenLabs plan
     composeVoiceover:                      NS.composeVoiceover,
   };
@@ -13754,6 +13873,23 @@ JSON object only. No commentary. No fences. No trailing text.`;
         issues.push({ kind: "i2v_no_anchors", detail: null });
         validationReport.totals.i2vNoAnchors = (validationReport.totals.i2vNoAnchors || 0) + 1;
       }
+      // 11b. (v4.23) verb+beat-empty — if shot.the_moment.description is
+      //      written but verb AND emotional_beat are both empty, the
+      //      keyframe generator's pre-v4.23 prompts would fall back to
+      //      "the beat" / the shot title and ignore the rich description.
+      //      v4.23 fixes the generator side (reads description); the
+      //      validator surfaces the gap at import time too so the author
+      //      knows their description is the load-bearing field.
+      const _verb = s.the_moment?.verb;
+      const _beat = s.the_moment?.emotional_beat;
+      const _desc = s.the_moment?.description;
+      const hasDesc = _desc && String(_desc).trim().length >= 5;
+      const hasVerb = _verb && String(_verb).trim().length > 0;
+      const hasBeat = _beat && String(_beat).trim().length > 0;
+      if (hasDesc && !hasVerb && !hasBeat) {
+        issues.push({ kind: "verb_and_beat_empty", detail: null });
+        validationReport.totals.verbAndBeatEmpty = (validationReport.totals.verbAndBeatEmpty || 0) + 1;
+      }
       // 11. (v4.16) word-density overload — more speech than the clip can
       //     hold. ~155 wpm natural speech = 2.6 words/sec. With a hard cap
       //     of duration_seconds × 2.5 words/sec we flag shots that bake
@@ -15412,21 +15548,75 @@ JSON object only. No commentary. No fences. No trailing text.`;
       ? anchorEntity
       : environments.find(x => x.id === shot.location?.location_id);
 
-    // Build the slot-aware prompt. v4.21: prompt assembly branches by
-    // anchor kind. Character anchors get the identity-locked v4.6 prompt;
-    // asset anchors get a faction/style-establishing prompt; environment
-    // anchors get an atmospheric no-people prompt.
+    // v4.23: prompt assembly fixes from audit (2026-05-17).
+    //
+    // Failure 1 (now fixed): use mediumPromptSpecForKeyframe (scene-
+    // composition language) instead of mediumPromptSpec (reference-sheet
+    // language). The reference-sheet boilerplate was emitting
+    // "Single character on a clean neutral background suitable as a
+    // reference sheet" — actively asking for hero portraits when the
+    // gate wanted scene composition.
+    //
+    // Failure 2 (now fixed): the actual scene description comes from
+    // multiple sources with precedence:
+    //   1. prompt_engineering.prompt_override (author's explicit override)
+    //   2. the_moment.description (the rich blocking)
+    //   3. the_moment.focal_point (the short signal — often just the title)
+    //   4. shot.display_name (last resort)
+    //
+    // Failure 3 (now fixed): when envName falls back to the literal
+    // string "the location" (because shot.location.location_id is null),
+    // OMIT the Location: line entirely. The placeholder "Location: the
+    // location" leak was reaching Seedream as a literal instruction.
     const moment = shot.the_moment || {};
     const camera = shot.camera || {};
-    const envName = environment?.display_name || "the location";
     const medium = project?.medium || "live_action";
-    const styleSpec = composer.mediumPromptSpec
-      ? composer.mediumPromptSpec(medium)
-      : { opening: "Cinematic still.", qualityCues: "", negativeCues: "", envOpening: "Cinematic establishing still.", envQuality: "", envNegative: "" };
+    // v4.23: use keyframe-specific spec (scene composition, not reference
+    // sheet). Falls back to the legacy cast-portrait spec if the new
+    // helper isn't on the composer namespace yet (defensive).
+    const styleSpec = (composer.mediumPromptSpecForKeyframe
+      ? composer.mediumPromptSpecForKeyframe(medium)
+      : (composer.mediumPromptSpec
+          ? composer.mediumPromptSpec(medium)
+          : { opening: "Cinematic still.", qualityCues: "", negativeCues: "" }));
+
+    // Scene description with priority order (see F2 above).
+    const sceneDescription =
+      (shot.prompt_engineering?.prompt_override && String(shot.prompt_engineering.prompt_override).trim())
+      || (moment.description && String(moment.description).trim())
+      || (moment.focal_point && String(moment.focal_point).trim())
+      || (shot.display_name && String(shot.display_name).trim())
+      || "";
+    const sceneSource =
+      shot.prompt_engineering?.prompt_override ? "prompt_override"
+      : moment.description ? "the_moment.description"
+      : moment.focal_point ? "the_moment.focal_point"
+      : "display_name";
+
+    // Resolve a usable location label, or null if we can't. Tries:
+    //   1. environment from anchor (kind=environment) or shot.location_id
+    //   2. references[].kind=environment that resolves in `environments`
+    //   3. references[].kind=asset whose entity has a display_name (last resort, used for prompt context only — not "Location: ...")
+    // If none → no Location: line is emitted.
+    let resolvedLocationName = null;
+    if (environment?.display_name) {
+      resolvedLocationName = environment.display_name;
+    } else if (Array.isArray(shot.references)) {
+      const envRef = shot.references.find(r =>
+        r && typeof r === "object" && (r.kind === "environment" || r.kind === "env")
+      );
+      if (envRef) {
+        const envId = envRef.ref_id || envRef.id;
+        const e = environments.find(x => x.id === envId);
+        if (e?.display_name) resolvedLocationName = e.display_name;
+      }
+    }
+    // Treat the legacy fallback string as a missing location (F3 fix)
+    if (resolvedLocationName === "the location") resolvedLocationName = null;
 
     const slotLanguage = slot === "start"
-      ? `Capture the moment BEFORE the action begins — initial state, before "${moment.verb || moment.focal_point || "the beat"}"`
-      : `Capture the moment AFTER the action completes — resolved/aftermath state, having just completed "${moment.verb || moment.focal_point || "the beat"}"`;
+      ? `Capture the moment BEFORE the action begins — initial state, before the beat described below`
+      : `Capture the moment AFTER the action completes — resolved/aftermath state, having just played the beat described below`;
 
     const palette = Array.isArray(environment?.palette)
       ? environment.palette.filter(s => s && String(s).trim()).slice(0, 5).join(", ")
@@ -15471,11 +15661,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
       promptText = [
         styleSpec.opening,
         `${slotLanguage}.`,
-        `Frame: ${camera.framing || "medium shot"} of ${speakingChar.display_name}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
+        // v4.23: scene description goes FIRST — this is what the keyframe
+        // is actually showing. The pre-v4.23 prompt used focal_point
+        // (which is often just the shot title) and dropped description
+        // entirely, producing reference-sheet hero shots that ignored
+        // the blocking the author wrote.
+        sceneDescription ? `Scene (${sceneSource}): ${sceneDescription}` : "",
+        `Frame: ${camera.framing || "medium shot"} featuring ${speakingChar.display_name}.`,
         moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
-        distinctiveFeatures.length ? `Identity anchors (must be visible): ${distinctiveFeatures.join("; ")}.` : "",
-        `The character's face, hair, and wardrobe must match the reference image exactly. Identity-locked.`,
-        `Location: ${envName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}`,
+        distinctiveFeatures.length ? `${speakingChar.display_name}'s identity anchors (must be visible): ${distinctiveFeatures.join("; ")}.` : "",
+        `${speakingChar.display_name}'s face, hair, and wardrobe must match the reference image exactly. Identity-locked.`,
+        // v4.23: only emit Location: when a real environment resolved.
+        resolvedLocationName
+          ? `Location: ${resolvedLocationName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}`
+          : "",
         environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}${environment.lighting.quality ? ", " + environment.lighting.quality : ""}.` : "",
         palette ? `Color palette: ${palette}.` : "",
         propsList ? `Props visible: ${propsList}.` : "",
@@ -15485,7 +15684,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
         canon ? `Style canon: ${canon}` : "",
         project?.visual_rule ? `Visual rule: ${project.visual_rule}.` : "",
         neverList.length ? `Never: ${neverList.join("; ")}.` : "",
-        `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare"}.`,
+        `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare, reference sheet, neutral background"}.`,
       ].filter(s => s && s.length > 2).join(" ");
     } else if (anchorKind === "asset") {
       // v4.21 — asset-anchored keyframe (S03 "Hollow Guard awaken" class).
@@ -15495,11 +15694,16 @@ JSON object only. No commentary. No fences. No trailing text.`;
       promptText = [
         styleSpec.opening,
         `${slotLanguage}.`,
-        `Establish: ${camera.framing || "wide shot"} of ${anchorEntity.display_name || "the faction/asset"}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
+        // v4.23: scene description first (override → description → focal → title)
+        sceneDescription ? `Scene (${sceneSource}): ${sceneDescription}` : "",
+        `Establish: ${camera.framing || "wide shot"} of ${anchorEntity.display_name || "the faction/asset"}.`,
         moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
         anchorEntity.description ? `Subject: ${String(anchorEntity.description).slice(0, 200)}.` : "",
         `The composition is locked to the reference image — preserve the faction/asset's visual identity exactly.`,
-        environment ? `Location: ${envName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}` : "",
+        // v4.23: only emit Location: when a real env name resolved (F3 fix)
+        resolvedLocationName
+          ? `Location: ${resolvedLocationName}.${environment?.architecture?.type ? " " + environment.architecture.type + "." : ""}`
+          : "",
         environment?.lighting?.primary_source ? `Lighting: ${environment.lighting.primary_source}${environment.lighting.quality ? ", " + environment.lighting.quality : ""}.` : "",
         palette ? `Color palette: ${palette}.` : "",
         propsList ? `Props visible: ${propsList}.` : "",
@@ -15509,20 +15713,26 @@ JSON object only. No commentary. No fences. No trailing text.`;
         canon ? `Style canon: ${canon}` : "",
         project?.visual_rule ? `Visual rule: ${project.visual_rule}.` : "",
         `Do NOT invent named characters not present in the reference.`,
-        `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare"}.`,
+        `Negative: ${styleSpec.negativeCues || "AI sheen, plastic skin, exaggerated, stock photo, fisheye, lens flare, reference sheet, neutral background"}.`,
       ].filter(s => s && s.length > 2).join(" ");
     } else {
       // anchorKind === "environment" — purely atmospheric establishing
       // shot (S01 "The fallen kingdom breathes" class). No people, no
       // characters. Visual is the env plate.
-      const envSpec = styleSpec.envOpening
-        ? { opening: styleSpec.envOpening, qualityCues: styleSpec.envQuality, negativeCues: styleSpec.envNegative }
+      // v4.23: use the keyframe spec's negatives (which now exclude
+      // "reference sheet"). The legacy env-specific opening from
+      // mediumPromptSpec is still useful for the openning line.
+      const legacyEnvSpec = composer.mediumPromptSpec ? composer.mediumPromptSpec(medium) : null;
+      const envSpec = legacyEnvSpec?.envOpening
+        ? { opening: legacyEnvSpec.envOpening, qualityCues: legacyEnvSpec.envQuality, negativeCues: styleSpec.negativeCues }
         : styleSpec;
       const envEntity = anchorEntity;
       promptText = [
         envSpec.opening,
         `${slotLanguage}.`,
-        `Establish: ${camera.framing || "wide shot"} of ${envEntity.display_name || "the location"}${moment.focal_point ? " — " + moment.focal_point : ""}.`,
+        // v4.23: scene description first
+        sceneDescription ? `Scene (${sceneSource}): ${sceneDescription}` : "",
+        `Establish: ${camera.framing || "wide shot"} of ${envEntity.display_name || "the location"}.`,
         moment.emotional_beat ? `Emotional beat: ${moment.emotional_beat}.` : "",
         envEntity.architecture?.type ? `Architecture: ${envEntity.architecture.type}.` : "",
         envEntity.lighting?.primary_source ? `Lighting: ${envEntity.lighting.primary_source}${envEntity.lighting.quality ? ", " + envEntity.lighting.quality : ""}.` : "",
@@ -16197,8 +16407,17 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // image yet (the composer will skip unlabeled slots gracefully).
     assets.extraAssets = extraAssets;
 
+    // v4.23: pass the project's full cast list so composeSeedance can
+    // sanitize style_canon against the in-frame cast — strips lines that
+    // mention characters NOT in this shot (audit fix for "Lionn's face
+    // must remain visible" leaking into Fynn-only shots).
+    const projectForCompose = {
+      ...project,
+      _all_cast_names_for_sanitization: characters.map(c => c.display_name).filter(Boolean),
+    };
+
     const composed = composer.composeSeedance({
-      shot, cast: castInFrame, environment, project, mode: resolved.mode, assets,
+      shot, cast: castInFrame, environment, project: projectForCompose, mode: resolved.mode, assets,
     });
 
     State.activeJobs++;
@@ -16726,6 +16945,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // v4.16
       case "speech_overload":
         return `${issue.detail?.totalWords} words across ${issue.detail?.durationSeconds}s = ${issue.detail?.wordsPerSec} w/sec (recommended max ${issue.detail?.maxRecommended}). Either split into multiple shots or extend duration.`;
+      // v4.23
+      case "verb_and_beat_empty":
+        return "the_moment has description but no verb AND no emotional_beat — keyframe generator now reads description directly (v4.23), but populating verb + emotional_beat improves prompt sharpness.";
       default:
         return issue.kind;
     }
