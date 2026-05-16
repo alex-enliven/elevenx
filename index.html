@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="699243e5fc51" data-build-time="2026-05-16T06:20:26.875Z">
+<meta name="elevenx-build" content="1242772ea5d1" data-build-time="2026-05-16T06:31:28.844Z">
 <script>
 (function(){
-  var info = { hash: "699243e5fc51", time: "2026-05-16T06:20:26.875Z" };
+  var info = { hash: "1242772ea5d1", time: "2026-05-16T06:31:28.844Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 699243e5fc51 @ 2026-05-16T06:20:26.875Z -->
+<!-- elevenx-build: 1242772ea5d1 @ 2026-05-16T06:31:28.844Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11513,36 +11513,67 @@ JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.resolveShotAnchors = resolveShotAnchors;
 
-  // v4.24: extract a location phrase from prose. Used by the keyframe
+  // v4.24/v4.25: extract a location phrase from prose. Used by the keyframe
   // generator when shot.location.location_id is null AND no environment
   // ref resolves — the description / prompt_override often names the
-  // location inline ("in a moonlit ruined palace courtyard"). Pre-v4.24
-  // that text only reached the Scene line; v4.24 also promotes it to the
-  // Location: line so Seedream gets the structured cue.
+  // location inline ("in a moonlit ruined palace courtyard").
   //
-  // Heuristic: match "in/at/inside/into a/the/an <phrase>" and "atop/
-  // across/on <phrase>". Phrase limited to ~60 chars, ends at sentence
-  // boundary or comma. Returns null if nothing matches — caller emits no
-  // Location: line in that case (which is correct behavior; the prose is
-  // still in the Scene line).
-  function extractLocationFromProse(text) {
+  // v4.25 improvements (from audit 2026-05-17 follow-up):
+  //   • Sentinel filter inside the function — if extracted text matches
+  //     placeholder strings ("the location", "a location", "this place",
+  //     "somewhere"), return null. Pre-v4.25 the sentinel filter lived
+  //     only at the caller (keyframe gen), so this function emitted
+  //     garbage on placeholder prose.
+  //   • preferEnd parameter — for the "end" slot in state-change shots,
+  //     prefer the LAST location mention (e.g. "starts in the garden, ends
+  //     in the throne room" → "throne room" for end-frame, "garden" for
+  //     start-frame). Default behaviour (preferEnd=false) takes the first.
+  //   • Secondary pattern: "in <Capitalized Proper Noun>" without article
+  //     — handles "in Ruined Lion Courtyard" and similar bible-named locs.
+  //
+  // Returns null when nothing matches — caller emits no Location: line
+  // (Scene-line prose still carries the inline mention).
+  function extractLocationFromProse(text, opts = {}) {
     if (!text || typeof text !== "string") return null;
+    const preferEnd = !!opts.preferEnd;
     const candidates = [];
     // Pattern A: in/at/inside/into + a/the/an + phrase
     const reA = /\b(?:in|inside|into|at)\s+(?:a|an|the)\s+([a-z][\w\s'\-]{4,60}?)(?=[.,;!?\n]|$)/gi;
     let m;
     while ((m = reA.exec(text)) !== null) {
-      if (m[1]) candidates.push(m[1].trim());
+      if (m[1]) candidates.push({ text: m[1].trim(), index: m.index });
     }
     // Pattern B: atop/across/on the + phrase
     const reB = /\b(?:atop|across|on)\s+(?:a|an|the)\s+([a-z][\w\s'\-]{4,60}?)(?=[.,;!?\n]|$)/gi;
     while ((m = reB.exec(text)) !== null) {
-      if (m[1]) candidates.push(m[1].trim());
+      if (m[1]) candidates.push({ text: m[1].trim(), index: m.index });
     }
-    if (candidates.length === 0) return null;
-    // Prefer the LONGEST match (most descriptive) but cap at the first 80 chars.
-    candidates.sort((a, b) => b.length - a.length);
-    return candidates[0].slice(0, 80).trim();
+    // Pattern C (v4.25): article-less proper-noun form — "in Ruined Lion
+    // Courtyard" / "at Shadow Gate". Captures 2-6 capitalized words.
+    // Stricter than A/B: requires the FIRST captured char to be capital,
+    // so generic lowercase prose won't false-positive here.
+    const reC = /\b(?:in|inside|into|at|atop|across|on)\s+([A-Z][A-Za-z][\w'\-]*(?:\s+[A-Z][A-Za-z][\w'\-]*){0,5})(?=[.,;!?\n\s]|$)/g;
+    while ((m = reC.exec(text)) !== null) {
+      if (m[1] && m[1].length >= 5) candidates.push({ text: m[1].trim(), index: m.index });
+    }
+    // v4.25: sentinel filter — reject captures that START with a generic
+    // placeholder word (the article was already consumed by the pattern,
+    // so the capture would be e.g. "location with characters present"
+    // after "the location with characters present"). Authors / earlier
+    // builds may emit these as fill-ins; we should NOT promote them to
+    // structured Location: lines.
+    const PLACEHOLDER_START = /^(location|place|spot|area|somewhere|nowhere|nothing|where|here|there)\b/i;
+    const filtered = candidates.filter(c => c.text.length >= 5 && !PLACEHOLDER_START.test(c.text.trim()));
+    if (filtered.length === 0) return null;
+    // v4.25: preferEnd directionality — for end-frame prompts, take the
+    // LAST mention (most likely the post-action location); for start-frame
+    // prompts, take the FIRST mention. Within the chosen end, prefer the
+    // longest (most descriptive) candidate.
+    filtered.sort((a, b) => preferEnd ? b.index - a.index : a.index - b.index);
+    // Break ties on length when index is equal (rare)
+    const pickedSide = filtered.filter(c => c.index === filtered[0].index);
+    pickedSide.sort((a, b) => b.text.length - a.text.length);
+    return pickedSide[0].text.slice(0, 80).trim();
   }
   NS.extractLocationFromProse = extractLocationFromProse;
 
@@ -15668,11 +15699,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
       resolvedLocationName = null;
       locationSource = null;
     }
-    // v4.24: prose extraction fallback. Run on sceneDescription if we
-    // have nothing better. This is the audit's recommended fix — the
-    // location IS in the text, the generator just wasn't extracting it.
+    // v4.24/v4.25: prose extraction fallback. Run on sceneDescription if
+    // we have nothing better. v4.25 adds directional preference — for
+    // "end" slot of state-change shots, take the LAST location mention
+    // (post-action); for "start" slot, take the first.
     if (!resolvedLocationName && sceneDescription) {
-      const extracted = extractLocationFromProse(sceneDescription);
+      const extracted = extractLocationFromProse(sceneDescription, { preferEnd: slot === "end" });
       if (extracted) {
         resolvedLocationName = extracted;
         locationSource = "extracted_from_prose";
