@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="3a91c9a8edf3" data-build-time="2026-05-15T23:14:46.863Z">
+<meta name="elevenx-build" content="c75d45a85172" data-build-time="2026-05-16T03:31:15.212Z">
 <script>
 (function(){
-  var info = { hash: "3a91c9a8edf3", time: "2026-05-15T23:14:46.863Z" };
+  var info = { hash: "c75d45a85172", time: "2026-05-16T03:31:15.212Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 3a91c9a8edf3 @ 2026-05-15T23:14:46.863Z -->
+<!-- elevenx-build: c75d45a85172 @ 2026-05-16T03:31:15.212Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11155,8 +11155,24 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // OR end.approved_dataUrl present). t2v/built_in_resolve shots are
   // exempt from the gate (no keyframe required by the underlying model).
   function isShotGateSatisfied(shot) {
+    // v4.18: t2v / built_in_resolve are trivially satisfied — no keyframe
+    // required by the underlying model. The predicate previously refused
+    // these and the Roll-path exemption (shotModeRequiresGate) only fired
+    // at roll time, so every other consumer (UI, Doctor, programmatic
+    // callers) saw t2v shots as ungated. Audit (2026-05-16) caught this
+    // — adding the exemption to the predicate itself makes the contract
+    // self-consistent.
+    const mode = shot?.generation?.mode;
+    if (mode === "text_to_video" || mode === "built_in_resolve") return true;
+
     const k = shot?.keyframes || {};
-    if (!k.start?.approved_dataUrl) return false;
+    // v4.18: legacy back-compat — accept `keyframes.startDataUrl` as a
+    // valid start anchor even when no `start.approved_dataUrl` exists.
+    // Pre-v4.17 shots stamped their approved keyframe to the flat field;
+    // the Roll path's startImage reader already falls back to it, the
+    // predicate now matches.
+    const hasStart = !!(k.start?.approved_dataUrl) || !!k.startDataUrl;
+    if (!hasStart) return false;
     if (k.has_state_change && !k.end?.approved_dataUrl) return false;
     return true;
   }
@@ -11175,8 +11191,19 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // hold verbs imply a static moment (stand, hold, gaze). Default
   // safe-side: TRUE — assume state change so the gate requires an end
   // frame. User can toggle off per shot via the gate UI.
-  const STATE_CHANGE_VERBS = /\b(ignit|lift|fall|fled|flee|take|taken|captur|snap|sprint|jump|land|clash|strike|hide|hides|reveal|rise|rises|calm|transform|melt|shatter|awaken|burst|break|crash|enter|exit|approach|chase|throw|catch|drop|cut|slash|attack|emerge|vanish|appear|step|run|race|move|turn|spin|punch|kick|grab|push|pull|pick|raise|lower|open|close|smash)/i;
-  const HOLD_VERBS = /\b(stand|standing|hold|holds|watch|watching|speak|speaks|speaking|sit|sitting|gaze|gazes|gazing|look|looks|looking|regard|regards|listen|listens|listening|breathe|breathes|breathing|wait|waits|waiting|pause|paus|consider|considers|considering|contemplate|rest|rests|resting)\b/i;
+  // v4.18: tightened verb regex. Audit (2026-05-16) caught the v4.17 list
+  // over-classifying:
+  //   • "fall" stem matched "fallen" (descriptive past-participle =
+  //     state, not action) → S01 "The fallen kingdom breathes"
+  //     misclassified as state-change even though "breathes" was the
+  //     primary verb.
+  //   • Both regexes lacked word-boundary on the END, allowing prefix
+  //     matches against any inflection.
+  // Fix: full inflected forms with explicit \b on both sides; drop bare
+  // "fall" (keep "falls"/"falling"/"fell"); HOLD checked FIRST so
+  // dialogue/atmospheric shots win on ambiguity.
+  const STATE_CHANGE_VERBS = /\b(ignites?|igniting|ignited|lifts?|lifting|lifted|flees?|fleeing|fled|takes|taking|captures?|capturing|captured|snaps?|snapping|snapped|sprints?|sprinting|sprinted|jumps?|jumping|jumped|lands?|landing|landed|clashes?|clashing|clashed|strikes?|striking|struck|reveals?|revealing|revealed|rises?|rising|risen|rose|transforms?|transforming|transformed|shatters?|shattering|shattered|awakens?|awakening|awakened|bursts?|bursting|crashes?|crashing|crashed|enters?|entering|entered|exits?|exiting|exited|approaches?|approaching|approached|chases?|chasing|chased|throws?|throwing|thrown|threw|catches?|catching|caught|drops?|dropping|dropped|cuts?|cutting|slashes?|slashing|slashed|attacks?|attacking|attacked|emerges?|emerging|emerged|vanishes?|vanishing|vanished|appears?|appearing|appeared|steps?|stepping|stepped|runs?|running|ran|races?|racing|raced|moves?|moving|moved|turns?|turning|turned|spins?|spinning|spun|punches?|punching|punched|kicks?|kicking|kicked|grabs?|grabbing|grabbed|pushes?|pushing|pushed|pulls?|pulling|pulled|picks?|picking|picked|raises?|raising|raised|lowers?|lowering|lowered|smashes?|smashing|smashed|melts?|melting|melted|breaks?|breaking|falls|falling|fell)\b/i;
+  const HOLD_VERBS = /\b(stands?|standing|stood|holds?|holding|held|watches?|watching|watched|speaks?|speaking|spoke|spoken|sits?|sitting|sat|gazes?|gazing|gazed|looks?|looking|looked|regards?|regarding|regarded|listens?|listening|listened|breathes?|breathing|breathed|waits?|waiting|waited|pauses?|pausing|paused|considers?|considering|considered|contemplates?|contemplating|contemplated|rests?|resting|rested|hovers?|hovering|hovered|fallen|broken|shattered|silent|still|motionless|frozen|quiet)\b/i;
   function proposeHasStateChangeForShot(shot) {
     const text = [
       shot.display_name || "",
@@ -11184,9 +11211,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
       shot.the_moment?.emotional_beat || "",
       shot.the_moment?.verb || "",
     ].join(" ").toLowerCase();
-    if (STATE_CHANGE_VERBS.test(text)) return true;
+    // v4.18: check HOLD first so descriptive language ("fallen kingdom
+    // breathes") wins over incidental movement verbs. Director's working
+    // assumption: if any clear hold language is present, the shot is a
+    // hold; state-change only triggers when ONLY state-change verbs match.
     if (HOLD_VERBS.test(text)) return false;
-    return true;  // default safe-side: require end frame
+    if (STATE_CHANGE_VERBS.test(text)) return true;
+    return true;  // default safe-side: require end frame on unknowns
   }
   NS.proposeHasStateChangeForShot = proposeHasStateChangeForShot;
 
@@ -18913,30 +18944,71 @@ JSON object only. No commentary. No fences. No trailing text.`;
           });
           dirty = true;
         }
-        // v4.17: backfill keyframes.start.approved_dataUrl from legacy
-        // keyframes.startDataUrl. Pre-v4.17 shots had a single startDataUrl
-        // field that the gate doesn't read directly. Wrap it in the new
-        // shape with a synthetic "legacy" candidate so the gate sees it as
-        // pre-approved (legacy_pre_gate takes are fine to keep; the gate
-        // applies to NEW rolls). Also seed has_state_change proposer.
-        const legacyStart = shot.keyframes?.startDataUrl;
-        if (legacyStart && !shot.keyframes?.start) {
-          shot.keyframes.start = {
-            candidates: [{
-              id: "legacy_pre_v417",
-              dataUrl: legacyStart,
-              model: "legacy",
-              seed: null,
-              prompt: shot.keyframes.prompt || null,
-              generated_at: shot.keyframes.start_generated_at || Date.now(),
-            }],
-            approved_id: "legacy_pre_v417",
-            approved_at: shot.keyframes.start_generated_at || Date.now(),
-            approved_dataUrl: legacyStart,
-          };
-          dirty = true;
+        // v4.17 + v4.18: backfill keyframes.start.approved_dataUrl from
+        // available legacy data. Two recovery paths:
+        //   (a) Pre-v4.17 shots had keyframes.startDataUrl as a single
+        //       approved frame — wrap it in the new shape.
+        //   (b) Shots with no startDataUrl but with an approved take (the
+        //       legacy ten that auto-downgraded to t2v in v4.8) — lift
+        //       the take's thumbDataUrl as the synthetic legacy frame.
+        //       This is the v4.17.1 audit fix: the v4.17 backfill assumed
+        //       every legacy shot had startDataUrl, but t2v-routed shots
+        //       never did, so the backfill never ran and the gate refused
+        //       every legacy approved shot.
+        shot.keyframes = shot.keyframes || {};
+        if (!shot.keyframes.start) {
+          let legacyDataUrl = shot.keyframes.startDataUrl || null;
+          let legacySource = legacyDataUrl ? "legacy_startDataUrl" : null;
+          let legacyTimestamp = shot.keyframes.start_generated_at || null;
+          let recoveredFromTakeId = null;
+          if (!legacyDataUrl) {
+            // (b) take-thumb recovery
+            const approvedTake = (shot.takes || []).find(t => t.status === "approved" && t.thumbDataUrl);
+            if (approvedTake) {
+              legacyDataUrl = approvedTake.thumbDataUrl;
+              legacySource = "approved_take_thumb";
+              legacyTimestamp = approvedTake.created_at || Date.now();
+              recoveredFromTakeId = approvedTake.id;
+            }
+          }
+          if (legacyDataUrl) {
+            shot.keyframes.start = {
+              candidates: [{
+                id: "legacy_pre_v417",
+                dataUrl: legacyDataUrl,
+                model: legacySource === "approved_take_thumb" ? "legacy_take_thumb" : "legacy",
+                seed: null,
+                prompt: shot.keyframes.prompt || null,
+                generated_at: legacyTimestamp || Date.now(),
+                recovered_from_take_id: recoveredFromTakeId,
+              }],
+              approved_id: "legacy_pre_v417",
+              approved_at: legacyTimestamp || Date.now(),
+              approved_dataUrl: legacyDataUrl,
+            };
+            // Also stamp the legacy flat field for any back-compat reader.
+            shot.keyframes.startDataUrl = legacyDataUrl;
+            // v4.18: legacy take-thumb recovery forces has_state_change = false.
+            // The user already approved the take — we're backfilling gate
+            // state, not asking for new approval. Running the verb proposer
+            // here would default unknown shot text to safe-side state-change,
+            // which then requires an end frame the recovery didn't produce,
+            // and the gate refuses a shot whose take is already approved.
+            // This was the exact failure mode caught by the v4.17 audit.
+            if (legacySource === "approved_take_thumb") {
+              shot.keyframes.has_state_change = false;
+            }
+            report.takeThumbRecoveries = (report.takeThumbRecoveries || []);
+            if (legacySource === "approved_take_thumb") {
+              report.takeThumbRecoveries.push({ shotId: shot.id, projectId: projId, takeId: recoveredFromTakeId });
+            }
+            dirty = true;
+          }
         }
-        if (shot.keyframes && shot.keyframes.has_state_change == null) {
+        // Run the proposer only when has_state_change is still null (i.e.
+        // not just forced false by the take-thumb recovery above, and not
+        // already set by a prior migration run).
+        if (shot.keyframes.has_state_change == null) {
           shot.keyframes.has_state_change = proposeHasStateChangeForShot(shot);
           dirty = true;
         }
@@ -19105,6 +19177,14 @@ JSON object only. No commentary. No fences. No trailing text.`;
         console.log(`[v4.15 stale-flag sweep] cleared ${report.staleFlagClears.length} ghost-failure fingerprint(s) on shots that have an approved take:`);
         for (const c of report.staleFlagClears.slice(0, 25)) {
           console.log(`  ${c.shotId}: cleared "${c.staleError}" (approved take is ${c.approvedMode})`);
+        }
+      }
+      // v4.18: take-thumb recoveries (gate state recovered from approved
+      // takes that lacked a keyframe)
+      if (report.takeThumbRecoveries?.length > 0) {
+        console.log(`[v4.18 take-thumb recovery] satisfied gate on ${report.takeThumbRecoveries.length} legacy approved shot(s) by lifting take.thumbDataUrl into keyframes.start:`);
+        for (const r of report.takeThumbRecoveries.slice(0, 25)) {
+          console.log(`  ${r.shotId} ← take ${r.takeId}`);
         }
       }
     } catch (err) {
