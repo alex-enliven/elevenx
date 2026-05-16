@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="5ad495991388" data-build-time="2026-05-16T18:28:27.371Z">
+<meta name="elevenx-build" content="a9ec05fc5e3d" data-build-time="2026-05-16T18:36:29.033Z">
 <script>
 (function(){
-  var info = { hash: "5ad495991388", time: "2026-05-16T18:28:27.371Z" };
+  var info = { hash: "a9ec05fc5e3d", time: "2026-05-16T18:36:29.033Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 5ad495991388 @ 2026-05-16T18:28:27.371Z -->
+<!-- elevenx-build: a9ec05fc5e3d @ 2026-05-16T18:36:29.033Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6348,6 +6348,80 @@ class FalClient {
 
   async klingDualKeyframe(body, opts = {}) {
     return this.#submitAndWait(KLING.o1_dual_keyframe, body, "video", opts);
+  }
+
+  // ─── v4.31 fal storage upload ─────────────────────────────────────────
+  //
+  // Some fal endpoints (Kling, in particular) fetch image inputs server-side
+  // from https URLs and don't accept data: URIs. The Seedance/Bytedance
+  // endpoints auto-handle data URIs in the queue layer, but Kling does not.
+  // For Kling-routed shots we have to pre-upload the gate-approved Seedream
+  // keyframes (which are stored as data: URIs in IndexedDB) to fal storage
+  // and put the resulting https://v3.fal.media/... URL in start_image_url.
+  //
+  // The route goes through /fal-storage/* on the worker — separate from the
+  // queue API route — because fal's storage host is rest.alpha.fal.ai, not
+  // queue.fal.run. The worker MUST have the /fal-storage/* route mapped
+  // (see proxy.worker.js); without it this method returns 404.
+  //
+  // Audit (2026-05-16): v4.30 fixed the field name from Seedance's image_url
+  // to Kling's start_image_url, but the value was still a data: URI →
+  // Kling's image fetch fails server-side. v4.31 closes the URL-format gap.
+  /**
+   * Upload a data: URI to fal storage and return the resulting https URL.
+   * No-op for inputs that are already http/https URLs (returns input unchanged).
+   * @param {string} dataUrl   — data:image/png;base64,… (or https://… pass-through)
+   * @param {string} [filename] — for logging on fal's side; defaults to "anchor.png"
+   * @returns {Promise<string>} — https://v3.fal.media/files/…
+   */
+  async uploadDataUrlToStorage(dataUrl, filename = "anchor.png") {
+    if (typeof dataUrl !== "string") {
+      throw new Error(`uploadDataUrlToStorage: expected string, got ${typeof dataUrl}`);
+    }
+    // Pass-through for already-uploaded URLs (idempotent)
+    if (dataUrl.startsWith("http://") || dataUrl.startsWith("https://")) {
+      return dataUrl;
+    }
+    if (!dataUrl.startsWith("data:")) {
+      throw new Error(`uploadDataUrlToStorage: input is not a data: URI (got "${dataUrl.slice(0, 60)}…")`);
+    }
+    const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+    if (!match) {
+      throw new Error(`uploadDataUrlToStorage: malformed data URI (expected "data:<mime>;base64,<payload>")`);
+    }
+    const [, mimeType, base64] = match;
+    // Convert base64 → Uint8Array → Blob
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mimeType });
+
+    // Multipart form-data POST. fal's simple-upload endpoint accepts a
+    // single "file" field and returns { url: "https://v3.fal.media/files/…" }.
+    const formData = new FormData();
+    formData.append("file", blob, filename);
+
+    const url = `${this.workerUrl}/fal-storage/storage/upload`;
+    this.onLog(`→ POST /fal-storage/storage/upload (${blob.size} bytes, ${mimeType})`);
+    const res = await this.fetch(url, {
+      method: "POST",
+      body: formData,
+      // CRITICAL: do NOT set Content-Type — the browser auto-sets it with
+      // the multipart boundary. Setting it manually breaks the upload.
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`fal storage upload failed: ${res.status} ${res.statusText} — ${t.slice(0, 400)}`);
+    }
+    const json = await res.json().catch(() => null);
+    // fal storage variants: some return { url }, some return { file_url },
+    // some return a bare string. Accept all three to be forgiving.
+    const fileUrl = json?.url || json?.file_url || (typeof json === "string" ? json : null);
+    if (!fileUrl || !/^https?:\/\//.test(fileUrl)) {
+      throw new Error(`fal storage upload returned unexpected payload: ${JSON.stringify(json).slice(0, 300)}`);
+    }
+    this.onLog(`  ✓ uploaded → ${fileUrl}`);
+    return fileUrl;
   }
 
   // ─── Health check (no spend) ──────────────────────────────────────────
@@ -17207,9 +17281,25 @@ JSON object only. No commentary. No fences. No trailing text.`;
         // FRAME ANCHORS (not style references). This is what the gate
         // workflow has promised since v4.17 and what r2v shots silently
         // didn't get pre-v4.27.
+        //
+        // v4.31: Kling fetches images server-side and DOES NOT accept
+        // data: URIs in start_image_url / tail_image_url. The Seedance/
+        // Bytedance endpoints auto-handle data URIs in fal's queue layer;
+        // Kling doesn't. So for Kling-routed shots we must upload the
+        // gate-approved Seedream keyframes (stored as data:image/jpeg;…
+        // in IndexedDB) to fal storage first, swap the resulting https
+        // URLs into the body, then submit. Without this step we'd 422
+        // post-queue on "fetch failed" or similar URL-format errors.
+        setGPS(true, `Uploading anchors to fal storage…`, "Kling needs https URLs (data: URIs not accepted)", 40);
+        const [startUrlHttps, endUrlHttps] = await Promise.all([
+          State.fal.uploadDataUrlToStorage(routing._anchors.start, `${shotId}-start.png`),
+          State.fal.uploadDataUrlToStorage(routing._anchors.end,   `${shotId}-end.png`),
+        ]);
+        setGPS(true, `Rolling Kling O1 dual-keyframe · <span class="mono">${esc(shotId)}</span>`, `${renderEngine} · est ${fmtUsd(estCost)}`, 55);
         const klingBody = {
           prompt: composed.prompt,
-          ...routing.body_overrides,  // image_url + tail_image_url
+          start_image_url: startUrlHttps,  // v4.30 field name + v4.31 https URL
+          tail_image_url:  endUrlHttps,
           duration: composed.body.duration,
           aspect_ratio: composed.body.aspect_ratio,
         };
