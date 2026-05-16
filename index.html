@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="1242772ea5d1" data-build-time="2026-05-16T06:31:28.844Z">
+<meta name="elevenx-build" content="016ee7de8689" data-build-time="2026-05-16T06:39:56.787Z">
 <script>
 (function(){
-  var info = { hash: "1242772ea5d1", time: "2026-05-16T06:31:28.844Z" };
+  var info = { hash: "016ee7de8689", time: "2026-05-16T06:39:56.787Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 1242772ea5d1 @ 2026-05-16T06:31:28.844Z -->
+<!-- elevenx-build: 016ee7de8689 @ 2026-05-16T06:39:56.787Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6179,7 +6179,10 @@ class FalClient {
     const refs = body.reference_images || [];
     if (refs.length > 9) throw new Error(`seedanceReferenceToVideo: max 9 reference_images (got ${refs.length})`);
     const endpoint = opts.fast ? SEEDANCE.reference_to_video_fast : SEEDANCE.reference_to_video;
-    return this.#submitAndWait(endpoint, body, "video", opts);
+    // v4.26: r2v with multiple ref images can legitimately take 6-8 min
+    // on a busy fal queue. Default 5-min poll cap was too tight; user
+    // hit timeout 2026-05-17. Bump to 10 min unless caller overrides.
+    return this.#submitAndWait(endpoint, body, "video", { maxWaitMs: 10 * 60 * 1000, ...opts });
   }
 
   // ─── Seedream (still images) ──────────────────────────────────────────
@@ -6209,6 +6212,66 @@ class FalClient {
   async seedreamEdit(body, opts = {}) {
     if (!body.image_urls?.length) throw new Error("seedreamEdit requires body.image_urls[]");
     return this.#submitAndWait(SEEDREAM.edit, body, "image", opts);
+  }
+
+  // ─── v4.26: resume a polling loop from a previously-submitted job ─────
+  // When a long-running Seedance r2v call times out client-side, the job
+  // may still be running on fal. The submit metadata is persisted to
+  // the shot (shot.keyframes._pending_seedance) so we can pick it up
+  // again instead of paying for a duplicate submission.
+  //
+  // Pass the saved { request_id, status_url, response_url, endpoint }
+  // bag. Behaves like the polling tail of #submitAndWait — same status
+  // semantics, same fetch flow, same maxWaitMs cap.
+  async resumeFalPolling(pending, opts = {}) {
+    if (!pending?.status_url || !pending?.response_url) {
+      throw new Error("resumeFalPolling: pending bag must include status_url + response_url");
+    }
+    const endpoint = pending.endpoint || "<unknown>";
+    this.onLog(`[resume] request_id=${pending.request_id || "?"} on ${endpoint}`);
+
+    const pollIntervalMs = opts.pollIntervalMs ?? 2000;
+    const maxWaitMs      = opts.maxWaitMs ?? 10 * 60 * 1000;
+    const start = Date.now();
+
+    while (true) {
+      if (Date.now() - start > maxWaitMs) {
+        const err = new Error(`fal resume poll timeout after ${maxWaitMs}ms for ${endpoint}`);
+        err._fal_pending = pending;
+        throw err;
+      }
+      const statusUrl = this.#rewriteToWorker(pending.status_url);
+      const sres = await this.#fetchWithRetry(statusUrl, {}, "fal resume status poll");
+      if (!sres.ok) {
+        if (sres.status === 404) {
+          throw new Error(`fal resume: job ${pending.request_id} no longer exists on fal (404). It may have completed and been garbage-collected, or never existed. Re-submit instead.`);
+        }
+        const t = await sres.text().catch(() => "");
+        throw new Error(`fal resume status poll failed: ${sres.status} — ${t.slice(0, 300)}`);
+      }
+      const sjson = await sres.json();
+      if (sjson.status === "COMPLETED") {
+        this.onLog(`[resume] ✓ completed (job was running ${Math.round((Date.now() - (pending.submitted_at || start))/1000)}s total)`);
+        const respUrl = this.#rewriteToWorker(pending.response_url);
+        const rres = await this.#fetchWithRetry(respUrl, {}, "fal resume response fetch");
+        if (!rres.ok) {
+          const t = await rres.text().catch(() => "");
+          throw new Error(`fal resume response fetch failed: ${rres.status} — ${t.slice(0, 300)}`);
+        }
+        const result = await rres.json();
+        result.__elevenx_meta = {
+          request_id: pending.request_id,
+          endpoint,
+          duration_ms: Date.now() - (pending.submitted_at || start),
+          resumed: true,
+        };
+        return result;
+      }
+      if (sjson.status === "FAILED") {
+        throw new Error(`fal resume: job ${pending.request_id} failed (status=FAILED). Inspect response_url for details.`);
+      }
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+    }
   }
 
   // ─── Kling fallback ────────────────────────────────────────────────────
@@ -6304,7 +6367,22 @@ class FalClient {
       return submitJson;
     }
 
-    this.onLog(`  request_id=${submitJson.request_id?.slice(0, 8) || "?"}, polling…`);
+    // v4.26: log the FULL request_id (was first 8 chars only — meant a
+    // timed-out job had no recoverable handle). Also fire an optional
+    // onSubmit callback so the caller can persist submit metadata for
+    // resume-after-timeout.
+    this.onLog(`  request_id=${submitJson.request_id || "?"}, polling… (cap ${Math.round((opts.maxWaitMs ?? 5*60*1000)/1000)}s)`);
+    if (typeof opts.onSubmit === "function") {
+      try {
+        opts.onSubmit({
+          request_id: submitJson.request_id,
+          status_url: submitJson.status_url,
+          response_url: submitJson.response_url,
+          endpoint,
+          submitted_at: Date.now(),
+        });
+      } catch { /* never let the caller's callback break the polling loop */ }
+    }
 
     // Polling. fal recommends 1-2s intervals.
     const pollIntervalMs = opts.pollIntervalMs ?? 2000;
@@ -6314,7 +6392,17 @@ class FalClient {
 
     while (true) {
       if (Date.now() - start > maxWaitMs) {
-        throw new Error(`fal poll timeout after ${maxWaitMs}ms for ${endpoint}`);
+        // v4.26: attach the submit metadata to the error so the caller
+        // can persist it + retry via resumeFalPolling.
+        const err = new Error(`fal poll timeout after ${maxWaitMs}ms for ${endpoint}`);
+        err._fal_pending = {
+          request_id: submitJson.request_id,
+          status_url: submitJson.status_url,
+          response_url: submitJson.response_url,
+          endpoint,
+          submitted_at: start,
+        };
+        throw err;
       }
       // status_url points to queue.fal.run absolute. Route through worker by
       // replacing the host with our worker base. fal returns status_url like
@@ -11577,6 +11665,96 @@ JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.extractLocationFromProse = extractLocationFromProse;
 
+  // v4.26: recover a take from a timed-out fal job. The submit metadata
+  // was persisted to shot.keyframes._pending_seedance the moment fal
+  // acknowledged the submission, so we have the request_id + status_url
+  // + response_url even after our polling loop gave up. This helper
+  // resumes the polling — if the job completed on fal's side, downloads
+  // the video and creates the take; if still running, keeps waiting up
+  // to 10 more minutes; if no longer available (404), surfaces clearly
+  // and clears the pending record.
+  //
+  // Idempotent: clears _pending_seedance only on completion or 404.
+  // Throwing leaves the record intact so the user can retry.
+  async function __recoverPendingTake(shotId) {
+    // v4.26: check the shot's state BEFORE the fal-client guard so the
+    // user gets a useful "nothing to recover" message even if their
+    // worker URL is unset. Reversed order would say "no fal client"
+    // when the real issue is "no job to recover" — confusing.
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) throw new Error(`shot ${shotId} not found`);
+    const pending = shot.keyframes?._pending_seedance;
+    if (!pending || !pending.request_id) {
+      throw new Error(`shot ${shotId} has no _pending_seedance record — nothing to recover`);
+    }
+    if (!State.fal) throw new Error("no fal client (set worker URL first)");
+    console.log(`[v4.26 recover] resuming fal job ${pending.request_id} for shot ${shotId} (${pending.endpoint})`);
+    setGPS(true, `Resuming fal job for <span class="mono">${esc(shotId)}</span>`, `${pending.render_engine || pending.endpoint} · ${pending.request_id.slice(0, 12)}…`, 30);
+    let result;
+    try {
+      result = await State.fal.resumeFalPolling(pending);
+    } catch (err) {
+      setGPS(false);
+      if (/no longer exists on fal/i.test(err.message || "")) {
+        // Clear the pending record — fal lost it, nothing to recover
+        const fresh = await Storage.get("shots", shotId);
+        if (fresh?.keyframes?._pending_seedance) {
+          delete fresh.keyframes._pending_seedance;
+          await Storage.put("shots", fresh);
+        }
+        toast(`Recovery failed: fal no longer has job ${pending.request_id.slice(0, 12)}…. Pending record cleared — re-roll if needed.`, { tone: "warn", duration: 9000 });
+        throw err;
+      }
+      toast(`Recovery still pending: ${err.message}. Try __recoverPendingTake again in a few minutes.`, { tone: "warn", duration: 9000 });
+      throw err;
+    }
+    // Job completed — turn the result into a take, same as the success
+    // path in handleRollShot.
+    const videoUrl = result?.video?.url;
+    if (!videoUrl) {
+      setGPS(false);
+      throw new Error("recovered job has no video URL in response");
+    }
+    setGPS(true, `Downloading recovered take`, "...", 90);
+    const blob = await fetch(videoUrl).then(r => r.blob());
+    const videoDataUrl = await blobToDataUrl(blob);
+    const thumbDataUrl = await extractFirstFrameDataUrl(videoDataUrl);
+    const take = {
+      id: (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `take_${Date.now()}`,
+      shotId,
+      mode: pending.mode || "reference_to_video",
+      render_engine: pending.render_engine || "seedance-recovered",
+      prompt: null,  // composed.prompt isn't available at recovery time
+      request: null, // request body isn't preserved (and we wouldn't want the dataURIs anyway)
+      videoDataUrl,
+      thumbDataUrl,
+      cost_usd: pending.cost_usd || 0,
+      status: "approved",
+      created_at: Date.now(),
+      seed: result.seed,
+      recovered_from_request_id: pending.request_id,
+      recovered_at: Date.now(),
+    };
+    const freshShot = await Storage.get("shots", shotId);
+    freshShot.takes = freshShot.takes || [];
+    for (const t of freshShot.takes) if (t.status === "approved") t.status = "rejected";
+    freshShot.takes.push(take);
+    freshShot.keyframes = freshShot.keyframes || {};
+    delete freshShot.keyframes._pending_seedance;
+    freshShot.keyframes.last_success_at = Date.now();
+    freshShot.keyframes.last_success_mode = take.mode;
+    freshShot.keyframes.last_attempt_failed = false;
+    freshShot.keyframes.last_error = null;
+    await Storage.put("shots", freshShot);
+    await trackCost(pending.cost_usd || 0, `seedance recovered ${freshShot.id}`);
+    setGPS(false);
+    toast(`✓ Recovered take from fal job ${pending.request_id.slice(0, 12)}…. No duplicate cost incurred.`, { duration: 8000 });
+    renderStoryboard();
+    if (State.activeShotId === shotId) renderShotEditor(shotId);
+    return take;
+  }
+  NS.__recoverPendingTake = __recoverPendingTake;
+
   // v4.22: introspection helper. Returns the live shape of a shot's
   // keyframes block — which field names are present, which have data,
   // sizes — so QA can verify their synthetic probes match what the
@@ -16557,8 +16735,31 @@ JSON object only. No commentary. No fences. No trailing text.`;
 
     try {
       let result;
+      // v4.26: onSubmit callback persists request_id + status/response
+      // URLs to the shot the moment fal acknowledges the submission. If
+      // polling times out client-side, the metadata is on disk and the
+      // user can recover via __recoverPendingTake(shotId) without paying
+      // for a duplicate roll.
+      const submitOpts = {
+        onSubmit: async (meta) => {
+          try {
+            const fresh = await Storage.get("shots", shotId);
+            fresh.keyframes = fresh.keyframes || {};
+            fresh.keyframes._pending_seedance = {
+              ...meta,
+              mode: resolved.mode,
+              render_engine: renderEngine,
+              cost_usd: estCost,
+            };
+            await Storage.put("shots", fresh);
+            console.log(`[v4.26] persisted pending seedance request_id=${meta.request_id} on shot ${shotId}`);
+          } catch (err) {
+            console.warn("[v4.26] failed to persist pending metadata:", err);
+          }
+        },
+      };
       if (resolved.mode === "text_to_video") {
-        result = await State.fal.seedanceTextToVideo(composed.body);
+        result = await State.fal.seedanceTextToVideo(composed.body, submitOpts);
       } else if (resolved.mode === "image_to_video") {
         if (useKlingDualFrame) {
           // Kling O1 dual-keyframe — start_image_url + tail_image_url.
@@ -16571,12 +16772,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
             duration: composed.body.duration,
             aspect_ratio: composed.body.aspect_ratio,
           };
-          result = await State.fal.klingDualKeyframe(klingBody);
+          result = await State.fal.klingDualKeyframe(klingBody, submitOpts);
         } else {
-          result = await State.fal.seedanceImageToVideo(composed.body);
+          result = await State.fal.seedanceImageToVideo(composed.body, submitOpts);
         }
       } else {
-        result = await State.fal.seedanceReferenceToVideo(composed.body);
+        result = await State.fal.seedanceReferenceToVideo(composed.body, submitOpts);
       }
 
       const videoUrl = result?.video?.url;
@@ -16636,7 +16837,21 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (State.activeShotId === shotId) renderShotEditor(shotId);
     } catch (err) {
       console.error(err);
-      toast(`Error: ${err.message}`, { tone: "err", duration: 8000 });
+      // v4.26: detect timeout-with-pending-job and surface the recovery
+      // affordance instead of treating it as a generic failure. The
+      // shot's _pending_seedance was already persisted via onSubmit, so
+      // the user can call __recoverPendingTake(shotId) to resume polling
+      // without paying for a duplicate submission.
+      if (err._fal_pending || /fal poll timeout/i.test(err.message || "")) {
+        const reqId = (err._fal_pending?.request_id || "").slice(0, 12);
+        toast(
+          `Polling timed out for ${shot.display_name || shotId} — but the fal job may still be running. The request_id is saved. Run: await ElevenX.__recoverPendingTake("${shotId}") to resume polling without re-submitting.${reqId ? " request_id=" + reqId + "…" : ""}`,
+          { tone: "warn", duration: 14000 }
+        );
+        console.warn(`[v4.26] pending fal job saved for ${shotId}: request_id=${err._fal_pending?.request_id || "?"}`);
+      } else {
+        toast(`Error: ${err.message}`, { tone: "err", duration: 8000 });
+      }
     } finally {
       setGPS(false);
       State.activeJobs--;
