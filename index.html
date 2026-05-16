@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="3196890d65d1" data-build-time="2026-05-16T17:18:22.304Z">
+<meta name="elevenx-build" content="e853f33eb81e" data-build-time="2026-05-16T17:24:15.784Z">
 <script>
 (function(){
-  var info = { hash: "3196890d65d1", time: "2026-05-16T17:18:22.304Z" };
+  var info = { hash: "e853f33eb81e", time: "2026-05-16T17:24:15.784Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 3196890d65d1 @ 2026-05-16T17:18:22.304Z -->
+<!-- elevenx-build: e853f33eb81e @ 2026-05-16T17:24:15.784Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -7179,6 +7179,50 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
     : "";
   const negative = `${GLOBAL_NEGATIVE}.${extraNeg ? " " + extraNeg : ""}${propReinforce}`;
   blocks.push(`[Negative Prompt] ${negative}`);
+
+  // ── v4.28 [Anchor Frames] block (image_to_video only) ────────────────
+  // Pre-v4.28 audit (2026-05-17): the i2v prompt was silent about the
+  // attached start_image / end_image — the API got the frames via body
+  // params, but the PROMPT TEXT never mentioned them. Result: the model
+  // treated the frames as soft style hints rather than hard temporal
+  // anchors, causing identity drift and "style not holding" between the
+  // attached anchor and the generated motion.
+  //
+  // The block prepends explicit anchor semantics + a hard NEGATIVE against
+  // redesigning anything the frames already define. Variants:
+  //   - dual anchor (Kling dual-keyframe OR Seedance i2v with end_image_url):
+  //     "open on Frame 1, close on Frame N, render only motion between"
+  //   - single anchor (Seedance i2v with image_url only):
+  //     "open on this frame, render motion from here"
+  //
+  // Note: this block applies to BOTH Kling-routed (composer_mode='image_to_video',
+  // body_overrides.image_url + .tail_image_url) AND Seedance i2v shots. The
+  // composer doesn't need to know which engine — both want the same "honor
+  // the anchors" prompt language. The router wires the body shape per-engine
+  // at dispatch.
+  if (mode === "image_to_video" && assets.startImageUrl) {
+    const hasEndAnchor = !!assets.endImageUrl;
+    // Use the shot's duration so the temporal language matches the body.
+    // dur isn't in scope yet at this point in composeSeedance — it's
+    // computed later via resolveShotDuration + clampDuration. Reuse the
+    // same resolution chain here so the [Anchor Frames] block agrees with
+    // [Production Brief] + [Action Sequence] downstream.
+    const _dur = clampDuration(resolveShotDuration(shot, project), project);
+    const _safeDur = (typeof _dur === "number") ? _dur : 8;
+    const lines = [];
+    if (hasEndAnchor) {
+      lines.push(`Frame 1 (start, t=0s) is attached as the FIRST frame of this clip.`);
+      lines.push(`Frame N (end, t=${_safeDur}s) is attached as the LAST frame of this clip.`);
+      lines.push(`The clip MUST open on Frame 1 and close on Frame N. Render the natural motion between them across the full ${_safeDur} seconds.`);
+    } else {
+      lines.push(`Frame 1 (start, t=0s) is attached as the FIRST frame of this clip.`);
+      lines.push(`The clip MUST open on this frame. Render the action described in [Action Sequence] proceeding from this anchor.`);
+    }
+    lines.push(
+      `Do NOT redesign characters, environment, lighting, props, wardrobe, framing, or composition shown in ${hasEndAnchor ? "the anchor frames" : "the anchor frame"} — ${hasEndAnchor ? "they" : "it"} define${hasEndAnchor ? "" : "s"} identity, location, and visual style EXACTLY. The prompt below describes only what changes (motion, performance, atmospheric details) between t=0 and t=${_safeDur}s.`
+    );
+    blocks.unshift(`[Anchor Frames]\n${lines.join("\n")}`);
+  }
 
   // ── Reference labelling (only for reference_to_video) ────────────────
   // The caller provides assets.referenceImageUrls (the actual image URLs
