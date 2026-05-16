@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="e853f33eb81e" data-build-time="2026-05-16T17:24:15.784Z">
+<meta name="elevenx-build" content="42c4cd1f1ff4" data-build-time="2026-05-16T17:53:50.882Z">
 <script>
 (function(){
-  var info = { hash: "e853f33eb81e", time: "2026-05-16T17:24:15.784Z" };
+  var info = { hash: "42c4cd1f1ff4", time: "2026-05-16T17:53:50.882Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: e853f33eb81e @ 2026-05-16T17:24:15.784Z -->
+<!-- elevenx-build: 42c4cd1f1ff4 @ 2026-05-16T17:53:50.882Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6806,7 +6806,7 @@ const GLOBAL_NEGATIVE =
  *                                      [{ kind: "asset"|"environment", display_name, dataUrl, role }]
  * @returns {{ prompt: string, body: object, attachmentsUsed: object }}
  */
-function composeSeedance({ shot, cast, environment, project, series, episode, mode, assets }) {
+function composeSeedance({ shot, cast, environment, project, series, episode, mode, assets, engine }) {
   if (!shot) throw new Error("composeSeedance: shot is required");
   if (!mode) throw new Error("composeSeedance: mode is required");
   cast = cast || [];
@@ -7264,7 +7264,64 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
     }
   }
 
-  const prompt = blocks.join("\n\n").trim();
+  // ─── v4.29 engine-aware prompt shaping (Kling 2500-char limit) ────────
+  // Kling O1 / 2.6 Pro enforces a hard 2500-character prompt limit and
+  // returns 422 if exceeded. The composer's full prompt — [Style Canon] +
+  // [Aesthetic] + [Storyline] + [Characters] + [Environment] + [Cast
+  // Distinctiveness] + [Identity Locks] + [Anti-Patterns] + [Action
+  // Sequence] + [Negative Prompt] + [Anchor Frames] — routinely runs
+  // 3500-5000 chars. Audit (2026-05-16): the v4.28 [Anchor Frames] fix
+  // shipped successfully but the first Kling call failed pre-charge with
+  // a 422 string_too_long. fal didn't charge (good), but the roll fails.
+  //
+  // Architecturally the fix isn't truncation — it's recognising that the
+  // anchor frames CARRY most of what those redundant blocks encode:
+  //   • [Style Canon] / [Aesthetic]        — pixel-locked in the frames
+  //   • [Characters] / [Identity Locks]    — pixel-locked in the frames
+  //   • [Environment]                      — pixel-locked in the frames
+  //   • [Cast Distinctiveness]             — pixel-locked in the frames
+  //   • [Anti-Patterns]                    — covered by [Anchor Frames] "Do NOT redesign"
+  //   • [Storyline]                        — narrative context; nice-to-have only
+  //   • [Character Arc Context]            — performance hint; covered by anchor frame's expression
+  // What MUST stay for a Kling call:
+  //   • [Anchor Frames]                    — temporal anchoring instruction
+  //   • [Action Sequence]                  — what motion happens between anchors
+  //   • [Production Brief]                 — duration + camera (Kling needs duration in prompt too)
+  //   • [Speech Timing]                    — if dialogue, model needs to leave audible space
+  //   • [Director Note]                    — one-line tone cue
+  //   • [Negative Prompt]                  — what to avoid
+  //   • [Known Failure Modes]              — per-shot watch_points
+  //
+  // The truncation safety-belt only fires if even this trimmed set
+  // somehow exceeds 2500 chars (e.g., a 15s shot with a very long
+  // action_sequence). It's belt-and-braces.
+  let finalBlocks = blocks;
+  const isKling = engine === "kling-o1-dual";
+  if (isKling) {
+    const KLING_KEEP = new Set([
+      "Anchor Frames",
+      "Action Sequence",
+      "Production Brief",
+      "Speech Timing",
+      "Director Note",
+      "Negative Prompt",
+      "Known Failure Modes",
+    ]);
+    finalBlocks = blocks.filter(b => {
+      const tag = /^\[([^\]]+)\]/.exec(b)?.[1] || "";
+      return KLING_KEEP.has(tag);
+    });
+  }
+
+  let prompt = finalBlocks.join("\n\n").trim();
+
+  // Safety-belt truncation — only for Kling, and only if the filtered
+  // blocks still somehow exceed 2500 (shouldn't happen for normal shots).
+  // Trim from the END (keep [Anchor Frames] at the top intact); append "…"
+  // so it's obviously truncated in logs.
+  if (isKling && prompt.length > 2500) {
+    prompt = prompt.slice(0, 2497) + "…";
+  }
 
   // ─── Build the call body per mode ────────────────────────────────────
   // `dur` is already clamped above (policy floor 15s) and is what the
@@ -16982,8 +17039,15 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // the prior duplicate calls ("earlyRouting" + a later "routing") were a
     // refactor leftover that could mask auto-downgrade mutations if the
     // function ever grew a branch between them.
+    // v4.29: pass routing.engine so the composer can engine-shape the prompt.
+    // Kling has a 2500-char hard limit; composer drops redundant blocks
+    // (style canon / aesthetic / identity locks / environment / etc.) since
+    // the anchor frames pixel-lock those already. Seedance/r2v/t2v get the
+    // full prompt as before (no length limit).
     const composed = composer.composeSeedance({
-      shot, cast: castInFrame, environment, project: projectForCompose, mode: routing.composer_mode, assets,
+      shot, cast: castInFrame, environment, project: projectForCompose,
+      mode: routing.composer_mode, assets,
+      engine: routing.engine,
     });
 
     State.activeJobs++;
@@ -17958,21 +18022,29 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const shotRefs   = Array.isArray(shot.references) ? shot.references : [];
       const extraAssets = resolveExtraAssets(shotRefs, { characters: chars, environments: envs, assets: allAssets });
 
-      // CRITICAL: `composeSeedance` doesn't accept `"auto"` as a mode — that's
-      // a UI sentinel meaning "let modeResolver decide". The import path sets
-      // generation.mode = "auto" by default, so we must resolve to a concrete
-      // mode (text_to_video / image_to_video / reference_to_video) before
-      // composing the preview. The roll path (handleRollShot) already does
-      // this; the preview path forgot to, hence the
-      // "(Could not preview prompt: composeSeedance: unknown mode 'auto')" bug.
-      const rawMode = shot.generation?.mode;
-      resolvedMode = rawMode;
-      if (!rawMode || rawMode === "auto") {
-        const decision = NS.modeResolver?.resolveMode(shot, {
-          previousShotHasApprovedTake: false,
-          currentShotHasKeyframe: !!shot.keyframes?.startDataUrl,
-        });
-        resolvedMode = decision?.mode || "text_to_video";
+      // v4.29: route preview through resolveRenderEngine — same single
+      // source of truth the roll path uses. Pre-v4.29 the preview used the
+      // legacy modeResolver, which returned "reference_to_video" for r2v-
+      // bibled shots even when the gate was approved (in which case the
+      // actual roll routes to Kling). Result: previewed prompt didn't match
+      // what was sent. Fixing this lets the user verify [Anchor Frames] +
+      // Kling-trimmed shape in the preview before paying.
+      const routing = NS.resolveRenderEngine
+        ? NS.resolveRenderEngine(shot, { previousShotHasApprovedTake: false })
+        : null;
+      if (routing) {
+        resolvedMode = routing.composer_mode;
+      } else {
+        // Fallback: legacy modeResolver path (shouldn't fire post-v4.27)
+        const rawMode = shot.generation?.mode;
+        resolvedMode = rawMode;
+        if (!rawMode || rawMode === "auto") {
+          const decision = NS.modeResolver?.resolveMode(shot, {
+            previousShotHasApprovedTake: false,
+            currentShotHasKeyframe: !!shot.keyframes?.startDataUrl,
+          });
+          resolvedMode = decision?.mode || "text_to_video";
+        }
       }
 
       // v4.16: use the shared asset-building helper so preview matches the
@@ -17990,10 +18062,19 @@ JSON object only. No commentary. No fences. No trailing text.`;
         extraAssets,
         characters: chars,
       });
+      // v4.29: mirror routing's body_overrides into the preview assets so
+      // the composer sees the gate-approved start/end frames and emits the
+      // [Anchor Frames] block — same plumbing as handleRollShot.
+      if (routing?.body_overrides?.image_url)      previewAssets.startImageUrl = routing.body_overrides.image_url;
+      if (routing?.body_overrides?.tail_image_url) previewAssets.endImageUrl   = routing.body_overrides.tail_image_url;
+
       const composed = composer.composeSeedance({
         shot, cast, environment, project,
         mode: resolvedMode,
         assets: previewAssets,
+        // v4.29: pass routing.engine so Kling-routed previews show the
+        // engine-trimmed prompt the actual roll will send.
+        engine: routing?.engine,
       });
       prompt = composed.prompt;
     } catch (err) {
