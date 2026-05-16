@@ -4141,10 +4141,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="fcbcf76d4f7c" data-build-time="2026-05-16T05:50:55.006Z">
+<meta name="elevenx-build" content="e2f2da8d0b1b" data-build-time="2026-05-16T05:55:38.015Z">
 <script>
 (function(){
-  var info = { hash: "fcbcf76d4f7c", time: "2026-05-16T05:50:55.006Z" };
+  var info = { hash: "e2f2da8d0b1b", time: "2026-05-16T05:55:38.015Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4164,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: fcbcf76d4f7c @ 2026-05-16T05:50:55.006Z -->
+<!-- elevenx-build: e2f2da8d0b1b @ 2026-05-16T05:55:38.015Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9032,6 +9032,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // an asset (style frame / prop / FX sheet).
   //
   // Returns: [{ kind, kind_subtype, id, display_name, dataUrl, role }, ...]
+  // v4.22: exposed on NS so QA / debugging can introspect what shape each
+  // shot's references[] resolves to. The audit (2026-05-17) noted the
+  // documented DevTools snippet used `ElevenX.resolveExtraAssets?.(...)`
+  // which silently no-op'd because the function wasn't on the public
+  // surface.
   function resolveExtraAssets(shotRefs, { characters, environments, assets }) {
     const out = [];
     for (const r of (shotRefs || [])) {
@@ -9093,6 +9098,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     }
     return out;
   }
+  NS.resolveExtraAssets = resolveExtraAssets;
 
   // Resolve a single ref URL for a character or environment given an
   // angle/kind. Priority order (since v3 upload path — 2026-05-14):
@@ -11387,6 +11393,45 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return { kind: "none", source: null, refImageUrl: null, entity: null };
   }
   NS.resolveShotAnchors = resolveShotAnchors;
+
+  // v4.22: introspection helper. Returns the live shape of a shot's
+  // keyframes block — which field names are present, which have data,
+  // sizes — so QA can verify their synthetic probes match what the
+  // production gate actually writes. Addresses the v4.20 audit point that
+  // "Seam E's green is theoretical" because the in-suite assertion used
+  // the writer's output shape rather than verifying writer-reader
+  // agreement on a real-world shape.
+  async function __inspectKeyframeShape(shotId) {
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) return { error: `shot ${shotId} not found` };
+    const k = shot.keyframes || {};
+    const describeSlot = (slot) => {
+      if (!slot) return { present: false };
+      return {
+        present: true,
+        keys: Object.keys(slot),
+        approved_id: slot.approved_id || null,
+        approved_at: slot.approved_at || null,
+        approved_dataUrl_present: !!slot.approved_dataUrl,
+        approved_dataUrl_sizeKb: slot.approved_dataUrl ? Math.round(slot.approved_dataUrl.length / 1024) : 0,
+        approved_dataUrl_preview: slot.approved_dataUrl ? slot.approved_dataUrl.slice(0, 60) + "…" : null,
+        candidates_count: (slot.candidates || []).length,
+        candidates_preview: (slot.candidates || []).slice(0, 3).map(c => ({ id: c.id, model: c.model, seed: c.seed })),
+      };
+    };
+    return {
+      shotId,
+      keyframes_root_keys: Object.keys(k),
+      has_state_change: k.has_state_change,
+      _migrated_has_state_change: k._migrated_has_state_change || false,
+      legacy_startDataUrl_present: !!k.startDataUrl,
+      legacy_startDataUrl_sizeKb: k.startDataUrl ? Math.round(k.startDataUrl.length / 1024) : 0,
+      start: describeSlot(k.start),
+      end: describeSlot(k.end),
+      gate_satisfied: isShotGateSatisfied(shot),
+    };
+  }
+  NS.__inspectKeyframeShape = __inspectKeyframeShape;
 
   // Verb heuristic for has_state_change. State-change verbs imply a
   // distinct end frame is needed (clash, ignite, capture, etc.);
