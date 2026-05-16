@@ -4070,7 +4070,32 @@ a { color: inherit; text-decoration: none; }
 .take.is-approved { border-color: #c9a25a; border-width: 2px; }
 .take.is-rejected { opacity: 0.5; border-color: rgba(248,113,113,0.4); }
 .take.is-rejected:hover { opacity: 0.9; }
-.take__thumb { aspect-ratio: 16/9; background-color: #0a0a0c; background-size: cover; background-position: center; border-radius: 3px; margin-bottom: 6px; }
+.take__thumb {
+  position: relative;
+  aspect-ratio: 16/9; background-color: #0a0a0c; background-size: cover; background-position: center;
+  border-radius: 3px; margin-bottom: 6px;
+  cursor: pointer;
+}
+.take__thumb::after {
+  content: "▶";
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; color: #0a0a0c;
+  background: rgba(201,162,90,0.92);
+  border-radius: 50%;
+  padding-left: 3px;  /* optical-centre the triangle */
+  opacity: 0.85;
+  transition: opacity .12s, transform .12s;
+  pointer-events: none;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.4);
+}
+.take__thumb:hover::after { opacity: 1; transform: translate(-50%, -50%) scale(1.08); }
+.take__video {
+  width: 100%; aspect-ratio: 16/9;
+  background-color: #0a0a0c; border-radius: 3px;
+  margin-bottom: 6px; display: block;
+}
 .take__id { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #c9a25a; }
 .take__cost { font-size: 11px; color: #9a9aab; }
 .take__status { font-size: 10px; color: #9a9aab; }
@@ -4141,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="016ee7de8689" data-build-time="2026-05-16T06:39:56.787Z">
+<meta name="elevenx-build" content="3196890d65d1" data-build-time="2026-05-16T17:18:22.304Z">
 <script>
 (function(){
-  var info = { hash: "016ee7de8689", time: "2026-05-16T06:39:56.787Z" };
+  var info = { hash: "3196890d65d1", time: "2026-05-16T17:18:22.304Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4164,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 016ee7de8689 @ 2026-05-16T06:39:56.787Z -->
+<!-- elevenx-build: 3196890d65d1 @ 2026-05-16T17:18:22.304Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11453,6 +11478,126 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // Gate satisfied = start.approved_dataUrl present AND (!has_state_change
   // OR end.approved_dataUrl present). t2v/built_in_resolve shots are
   // exempt from the gate (no keyframe required by the underlying model).
+  // ─── v4.27: unified render-engine routing ───────────────────────────────
+  // Caught by audit (2026-05-17 evening): the v4.17 routing only fired
+  // Kling for shots whose BIBLE-DECLARED mode was image_to_video. For
+  // r2v shots — even ones with both start + end frames approved via the
+  // gate, with has_state_change checked — the keyframes got demoted to
+  // entries in reference_images[]. Seedance r2v treats reference_images
+  // as style/identity guidance, NOT temporal anchors. The "approved
+  // keyframe" workflow has been architecturally cosmetic for r2v shots
+  // since v4.17.
+  //
+  // v4.27 inverts the precedence: GATE STATE overrides bible-declared
+  // mode for routing purposes. If both keyframes are approved + state-
+  // change is on, the engine is Kling O1 dual-keyframe — regardless of
+  // whether the shot was authored as r2v, i2v, or auto. The bible's
+  // mode field becomes a default for shots that HAVEN'T gone through
+  // the gate, not a hard constraint.
+  //
+  // Returns:
+  //   {
+  //     engine:        "kling-o1-dual" | "seedance-image_to_video"
+  //                  | "seedance-reference_to_video" | "seedance-text_to_video"
+  //                  | "built_in_resolve",
+  //     composer_mode: "image_to_video" | "reference_to_video" | "text_to_video"
+  //                    (what mode to compose the PROMPT for — not always the
+  //                    same as engine; e.g. Kling dual uses i2v prompt language),
+  //     body_overrides: {...},   // fields to merge over composed.body for the
+  //                              // chosen API call (e.g. image_url + tail_image_url
+  //                              // for Kling; image_url for i2v from gate-approved
+  //                              // start frame even if composer left a placeholder)
+  //     reason: string,          // human-readable route decision for logging + UI
+  //   }
+  function resolveRenderEngine(shot, ctx = {}) {
+    const declaredMode = shot?.generation?.mode;
+    const kf = shot?.keyframes || {};
+    const startApproved = kf.start?.approved_dataUrl;
+    const endApproved   = kf.end?.approved_dataUrl;
+    const stateChange   = !!kf.has_state_change;
+    // 1. t2v and built_in_resolve are bible-respected (no keyframe upgrade)
+    if (declaredMode === "text_to_video") {
+      return {
+        engine: "seedance-text_to_video",
+        composer_mode: "text_to_video",
+        body_overrides: {},
+        reason: "bible mode=text_to_video — no keyframe upgrade applicable",
+      };
+    }
+    if (declaredMode === "built_in_resolve") {
+      return {
+        engine: "built_in_resolve",
+        composer_mode: "text_to_video",  // unused
+        body_overrides: {},
+        reason: "bible mode=built_in_resolve — handled outside Seedance pipeline",
+      };
+    }
+    // 2. Gate-satisfied with BOTH frames + state-change → Kling dual-keyframe.
+    //    This is the highest-fidelity path: both anchors are honored as
+    //    actual frame positions, not as "style references".
+    if (startApproved && endApproved && stateChange) {
+      return {
+        engine: "kling-o1-dual",
+        composer_mode: "image_to_video",  // i2v prompt language fits dual-keyframe
+        body_overrides: {
+          image_url: startApproved,
+          tail_image_url: endApproved,
+        },
+        reason: "gate-approved start + end frames with has_state_change=true → Kling dual-keyframe anchors both ends (overrides bible mode " + JSON.stringify(declaredMode) + ")",
+      };
+    }
+    // 3. Gate-satisfied with START frame only → Seedance i2v. Single
+    //    anchor + model interpolation. Also fires when state-change was
+    //    set but end-frame wasn't approved (the gate would have blocked
+    //    the Roll, but defense-in-depth).
+    if (startApproved) {
+      return {
+        engine: "seedance-image_to_video",
+        composer_mode: "image_to_video",
+        body_overrides: {
+          image_url: startApproved,
+        },
+        reason: stateChange
+          ? "gate-approved start only (state-change on but end not approved) → Seedance i2v with single anchor"
+          : "gate-approved start, no state-change → Seedance i2v (single anchor, hold-style motion)",
+      };
+    }
+    // 4. No approved keyframes — fall back to bible-declared mode.
+    //    r2v: multiple cast / asset references for identity guidance.
+    //    i2v: needs startImage from somewhere (legacy startDataUrl fallback,
+    //         or keyframe-gen auto-fires before this point in handleRollShot).
+    //    auto: let modeResolver decide.
+    if (declaredMode === "reference_to_video") {
+      return {
+        engine: "seedance-reference_to_video",
+        composer_mode: "reference_to_video",
+        body_overrides: {},
+        reason: "no approved keyframes, bible mode=reference_to_video — using cast/asset refs for identity guidance",
+      };
+    }
+    if (declaredMode === "image_to_video") {
+      return {
+        engine: "seedance-image_to_video",
+        composer_mode: "image_to_video",
+        body_overrides: {},
+        reason: "no approved keyframes, bible mode=image_to_video — caller's keyframe-gen will supply startImageUrl",
+      };
+    }
+    // 5. Auto mode or unknown — let modeResolver decide (legacy path)
+    const decision = modeResolver?.resolveMode?.(shot, {
+      previousShotHasApprovedTake: ctx.previousShotHasApprovedTake,
+      currentShotHasKeyframe: !!startApproved,
+    });
+    const resolvedMode = decision?.mode || "text_to_video";
+    return {
+      engine: `seedance-${resolvedMode}`,
+      composer_mode: resolvedMode,
+      body_overrides: {},
+      reason: `auto-resolved via modeResolver → ${resolvedMode} (declared=${JSON.stringify(declaredMode)})`,
+    };
+  }
+  NS.resolveRenderEngine = resolveRenderEngine;
+
   function isShotGateSatisfied(shot) {
     // v4.18: t2v / built_in_resolve are trivially satisfied — no keyframe
     // required by the underlying model. The predicate previously refused
@@ -15115,6 +15260,30 @@ JSON object only. No commentary. No fences. No trailing text.`;
             ${t.status !== "rejected" ? `<button class="take__btn take__btn--reject" title="Reject this take">✗</button>` : ""}
           </div>
         `;
+        // v4.27: click-to-play on the thumb. Swaps the CSS-background thumb
+        // div for a real <video controls autoplay muted loop> from
+        // take.videoDataUrl. Audit (2026-05-17) caught that the take card
+        // showed the FIRST FRAME ONLY — no way to actually inspect the
+        // generated motion without leaving the app. The user couldn't tell
+        // whether Seedance produced motion or a near-still clip. Click the
+        // thumb → swap; click the thumb again (now a video) → pause via
+        // native controls. The play-icon overlay (::after on .take__thumb)
+        // is the affordance cue.
+        const thumbEl = tEl.querySelector(".take__thumb");
+        if (thumbEl && t.videoDataUrl) {
+          thumbEl.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const vid = document.createElement("video");
+            vid.className = "take__video";
+            vid.src = t.videoDataUrl;
+            vid.controls = true;
+            vid.autoplay = true;
+            vid.muted = true;       // autoplay only works muted in most browsers
+            vid.loop = true;
+            vid.playsInline = true; // iOS Safari: keep inline rather than fullscreen
+            thumbEl.replaceWith(vid);
+          });
+        }
         // Approve button — captures rating + optional reason at the moment
         // of approval. The rating feeds the future AI Producer's learning
         // loop: "what does the director actually like?"
@@ -16450,25 +16619,68 @@ JSON object only. No commentary. No fences. No trailing text.`;
       return kind === "asset" || kind === "style_frame" || (!kind && a.dataUrl);
     });
 
-    // Resolve mode
+    // Resolve previous-shot continuity for the router (used for auto-mode
+    // shots; the router calls modeResolver.resolveMode internally when
+    // declaredMode === "auto").
     const previousShot = shot.shot_number ? (await Storage.getAll("shots")).find(x => x.shot_number === shot.shot_number - 1) : null;
     const previousHasApproved = !!previousShot?.takes?.find(t => t.status === "approved");
-    const resolved = modeResolver.resolveMode(shot, {
-      previousShotHasApprovedTake: previousHasApproved,
-      currentShotHasKeyframe: !!shot.keyframes?.startDataUrl,
-    });
+    // v4.27: removed the standalone `const resolved = modeResolver.resolveMode(...)`
+    // call here. It was duplicating what resolveRenderEngine does internally
+    // for auto-mode shots, and its result was only used for the `resolved.mode`
+    // gates + mutations that are now driven by the routing object.
 
-    // MVP: image_to_video AUTO-GENERATES a keyframe via Seedream if one
-    // isn't already on the shot. This composes the scene from cast bible
-    // refs so the start image is identity- + location-locked before the
-    // (much more expensive) Seedance roll fires.
+    // v4.27: UNIFIED ROUTING — resolveRenderEngine is the single source of
+    // truth for "which API + which composer mode + which body overrides".
+    // It reads shot.generation.mode + the keyframe gate state and emits:
+    //   { engine, composer_mode, body_overrides, reason }
+    // The pre-v4.27 code computed the routing TWICE, once at line ~7704
+    // ("earlyRouting" for the composer) and once at line ~7743 ("routing"
+    // for dispatch). Both reads were AFTER the assets-build branches, so
+    // the legacy `resolved.mode = "text_to_video"` mutations inside those
+    // branches were dead code — the router re-read `shot` and never saw
+    // them. Auto-downgrade was silently broken whenever an i2v/r2v shot
+    // had no anchors.
+    //
+    // v4.27 hoists the routing call ABOVE the assets-build branches so:
+    //   1. all gates use routing.composer_mode (one read of one truth)
+    //   2. auto-downgrade mutates the routing object so the dispatch
+    //      actually changes engine ('routing = { engine: "seedance-text_to_video", ... }')
+    //   3. gate-approved frames flow through body_overrides → assets so
+    //      the composer's i2v branch (which reads assets.startImageUrl)
+    //      picks them up without a second translation step.
+    //
+    // Audit (2026-05-17 evening) caught the cosmetic-gate bug for S02:
+    // both keyframes approved + has_state_change → router would have
+    // picked Kling, but pre-v4.27 the call went to Seedance r2v because
+    // dispatch keyed off the bible mode, not the gate state.
+    let routing = resolveRenderEngine(shot, { previousShotHasApprovedTake: previousHasApproved });
+
+    // Map router body_overrides into the composer-facing `assets` shape.
+    // Composer.composeSeedance reads assets.startImageUrl / assets.endImageUrl
+    // for the i2v prompt branch; we mirror routing's image_url / tail_image_url
+    // there so an approved-gate shot doesn't have to also satisfy the legacy
+    // keyframe-gen ladder. (The router's body_overrides go ON TOP of
+    // composed.body at dispatch — these mirror lines just keep composer happy.)
     let assets = { referenceImageUrls: [] };
-    if (resolved.mode === "image_to_video") {
-      // v4.17: prefer approved gate frame; fall back to legacy startDataUrl.
-      // The gate write-path (approveKeyframeCandidate) also stamps the
-      // legacy field, so both reads stay in lockstep.
-      let startImage = shot.keyframes?.start?.approved_dataUrl
-                    || shot.keyframes?.startDataUrl;
+    if (routing.body_overrides?.image_url)      assets.startImageUrl = routing.body_overrides.image_url;
+    if (routing.body_overrides?.tail_image_url) assets.endImageUrl   = routing.body_overrides.tail_image_url;
+
+    // MVP: image_to_video AUTO-GENERATES a keyframe via Seedream if the
+    // gate didn't already supply one. This composes the scene from cast
+    // bible refs so the start image is identity- + location-locked before
+    // the (much more expensive) Seedance roll fires.
+    //
+    // v4.27 gate change: was `resolved.mode === "image_to_video"`, now
+    // `routing.composer_mode === "image_to_video" && !assets.startImageUrl`.
+    // The second clause means a gate-approved start frame (already mirrored
+    // into assets.startImageUrl above) SKIPS the auto-gen ladder entirely.
+    if (routing.composer_mode === "image_to_video" && !assets.startImageUrl) {
+      // v4.27: router already handled the approved_dataUrl path via
+      // body_overrides → assets.startImageUrl. If we got here, the gate
+      // did NOT supply an approved start frame. Fall back to the legacy
+      // shot.keyframes.startDataUrl (pre-gate continuity-chain seed) and,
+      // failing that, fire the Seedream auto-keyframe-gen ladder.
+      let startImage = shot.keyframes?.startDataUrl;
       if (!startImage) {
         setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, "seedream-v4.5 · cast-anchored", 30);
         try {
@@ -16595,12 +16807,23 @@ JSON object only. No commentary. No fences. No trailing text.`;
                 `Auto-switched "${shot.display_name || shotId}" to text_to_video — no cast, no character refs, no asset refs, no env ref. Edit the shot (generation.mode → text_to_video) to lock in.`,
                 { tone: "warn", duration: 9000 }
               );
-              // Force t2v for this roll; composeSeedance(text_to_video)
-              // ignores assets.startImageUrl entirely.
-              resolved.mode = "text_to_video";
-              // Set a placeholder so the post-block safety guard doesn't
-              // trip on undefined assets.startImageUrl. The t2v composer
-              // doesn't consult it.
+              // v4.27: mutate the ROUTING object, not the legacy resolved.mode.
+              // Pre-v4.27 this was dead code — the dispatch read routing.engine,
+              // not resolved.mode, so the downgrade had no effect and the call
+              // still went to seedance i2v with a placeholder startImageUrl
+              // ("auto-downgraded"). Now the dispatch picks up the new routing
+              // and composer is called with mode=text_to_video so it never
+              // reads assets.startImageUrl in the first place.
+              routing = {
+                engine: "seedance-text_to_video",
+                composer_mode: "text_to_video",
+                body_overrides: {},
+                reason: "auto-downgrade i2v→t2v: no anchors of any kind (no cast, no character refs, no asset refs, no env ref), atmospheric focal_point present",
+              };
+              // Empty assets so composer doesn't see stale state from earlier branches.
+              assets = { referenceImageUrls: [] };
+              // Placeholder for the safety guard below (it now never runs
+              // because the outer if-condition checks routing.composer_mode).
               startImage = "auto-downgraded";
             } else {
               let msg;
@@ -16618,16 +16841,24 @@ JSON object only. No commentary. No fences. No trailing text.`;
           }
         }
       }
-      assets.startImageUrl = startImage;
-      // Safety guard: above ladder always either sets startImage or returns,
-      // so this branch should be unreachable. Kept as a belt-and-braces fence
-      // against future refactors that might bypass the ladder.
-      if (!assets.startImageUrl) {
-        toast(`Shot ${shot.display_name || shotId} can't anchor an image_to_video keyframe — no shot.keyframes, no cast portrait, no environment ref.`, { tone: "warn" });
-        setGPS(false);
-        return;
+      // v4.27: only write assets.startImageUrl if routing is STILL i2v.
+      // The auto-downgrade branch above mutates routing → t2v + resets
+      // `assets`; we must not re-pollute that with the "auto-downgraded"
+      // placeholder. (Pre-v4.27 this re-pollution happened unconditionally
+      // and assets.startImageUrl=auto-downgraded propagated all the way
+      // to a Seedance i2v call with a literal string as image_url.)
+      if (routing.composer_mode === "image_to_video") {
+        assets.startImageUrl = startImage;
+        // Safety guard: above ladder always either sets startImage or returns,
+        // so this branch should be unreachable. Kept as a belt-and-braces fence
+        // against future refactors that might bypass the ladder.
+        if (!assets.startImageUrl) {
+          toast(`Shot ${shot.display_name || shotId} can't anchor an image_to_video keyframe — no shot.keyframes, no cast portrait, no environment ref.`, { tone: "warn" });
+          setGPS(false);
+          return;
+        }
       }
-    } else if (resolved.mode === "reference_to_video") {
+    } else if (routing.composer_mode === "reference_to_video") {
       // v4.19: delegate to the shared buildComposerAssets helper so the
       // roll path picks up the cast-in-references lift (S02-class fix).
       // Previously this branch had inline duplicated logic that DIDN'T
@@ -16666,8 +16897,18 @@ JSON object only. No commentary. No fences. No trailing text.`;
             `Auto-switched "${shot.display_name || shotId}" to text_to_video — ${reason}. Edit cast_in_frame or upload refs in Cast & Locations to keep reference_to_video.`,
             { tone: "warn", duration: 9000 }
           );
-          resolved.mode = "text_to_video";
-          // No assets to set — composeSeedance(text_to_video) ignores them.
+          // v4.27: mutate routing so dispatch actually picks text_to_video.
+          // Pre-v4.27 this set resolved.mode but dispatch read routing.engine
+          // (re-computed from `shot`), so the call still went to Seedance r2v
+          // with zero reference_images — guaranteed 400 from fal.
+          routing = {
+            engine: "seedance-text_to_video",
+            composer_mode: "text_to_video",
+            body_overrides: {},
+            reason: `auto-downgrade r2v→t2v: ${reason}`,
+          };
+          // Empty assets so composer doesn't see stale referenceImageUrls.
+          assets = { referenceImageUrls: [] };
         } else {
           toast(
             `Shot "${shot.display_name || shotId}" can't roll — reference_to_video has no resolvable refs and the shot has no focal_point to fall back on. Edit the shot to add focal_point + fix cast_in_frame.`,
@@ -16691,14 +16932,23 @@ JSON object only. No commentary. No fences. No trailing text.`;
       _all_cast_names_for_sanitization: characters.map(c => c.display_name).filter(Boolean),
     };
 
+    // v4.27: `routing` already resolved at the top of this function (above
+    // the assets-build branches) so the i2v/r2v gates + auto-downgrade
+    // mutations operate on the same routing object. No second call here —
+    // the prior duplicate calls ("earlyRouting" + a later "routing") were a
+    // refactor leftover that could mask auto-downgrade mutations if the
+    // function ever grew a branch between them.
     const composed = composer.composeSeedance({
-      shot, cast: castInFrame, environment, project: projectForCompose, mode: resolved.mode, assets,
+      shot, cast: castInFrame, environment, project: projectForCompose, mode: routing.composer_mode, assets,
     });
 
     State.activeJobs++;
     const estCost = NS.estimateSeedanceCost(
       typeof composed.body.duration === "number" ? composed.body.duration : 8,
-      "standard", resolved.mode === "image_to_video" ? "image" : resolved.mode === "reference_to_video" ? "reference" : "text"
+      "standard",
+      routing.composer_mode === "image_to_video" ? "image"
+        : routing.composer_mode === "reference_to_video" ? "reference"
+        : "text"
     );
 
     // v4.7: dry-run early-return. After composing the full prompt + cost
@@ -16706,40 +16956,44 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // calling Seedance. trackCost is NOT invoked so the cost ticker stays
     // honest. The shot gets a "dry_run" pseudo-take so the user can see it
     // landed in their session without burning credits.
+    // v4.27: dry-run reporting now reads routing.engine (the actual API
+    // we WOULD have called) so the user sees Kling-vs-Seedance routing
+    // decisions in the console, not just the composer mode.
     if (State.dryRun) {
-      console.group(`[dry-run] ${shotId} · ${resolved.mode} · est ${fmtUsd(estCost)}`);
+      console.group(`[dry-run] ${shotId} · ${routing.engine} (composer:${routing.composer_mode}) · est ${fmtUsd(estCost)}`);
+      console.log("routing:", routing);
       console.log("composed.prompt:", composed.prompt);
       console.log("composed.body:", composed.body);
       console.log("castInFrame:", castInFrame.map(c => c.id || c.display_name));
       console.log("environment:", environment?.id || environment?.display_name || "(none)");
       console.log("assets:", assets);
       console.groupEnd();
-      toast(`🧪 Dry-run · ${shot.display_name || shotId} · ${resolved.mode} · est ${fmtUsd(estCost)} (not fired). Prompt logged to console.`, { duration: 6000 });
+      toast(`🧪 Dry-run · ${shot.display_name || shotId} · ${routing.engine} · est ${fmtUsd(estCost)} (not fired). Prompt logged to console.`, { duration: 6000 });
       State.activeJobs--;
       setGPS(false);
       return;
     }
 
-    // v4.17 motion routing: i2v shots with has_state_change + both frames
-    // approved go through Kling O1 dual-keyframe (interpolates start → end).
-    // i2v hold shots stay on Seedance i2v (single start frame). t2v / r2v
-    // unchanged. Per audit (2026-05-16) recommendation: Kling's dual-frame
-    // mode is what the "constrained motion between approved anchors" goal
-    // actually needs — Seedance can't pin an end frame.
-    const useKlingDualFrame =
-      resolved.mode === "image_to_video"
-      && shot.keyframes?.has_state_change
-      && shot.keyframes?.end?.approved_dataUrl;
-    const renderEngine = useKlingDualFrame ? "kling-o1-dual" : `seedance-${resolved.mode}`;
-    setGPS(true, `Rolling ${useKlingDualFrame ? "Kling O1 dual-keyframe" : "Seedance"} · <span class="mono">${esc(shotId)}</span>`, `${renderEngine} · est ${fmtUsd(estCost)}`, 5);
+    // v4.27 unified routing: routing.engine is the dispatch decision.
+    // Gate state overrides bible-declared mode. The pre-v4.27 routing
+    // only fired Kling for shots whose bible mode was image_to_video, so
+    // r2v shots with both keyframes approved got demoted to "reference
+    // images" instead of being anchored as frames. Audit (2026-05-17
+    // evening) caught this — S02 had approved start + end + state-change
+    // checked, but the call still went to Seedance r2v.
+    const renderEngine = routing.engine;
+    console.log(`[v4.27 routing] ${shotId}: ${routing.reason}`);
+    setGPS(
+      true,
+      `Rolling ${renderEngine === "kling-o1-dual" ? "Kling O1 dual-keyframe" : "Seedance"} · <span class="mono">${esc(shotId)}</span>`,
+      `${renderEngine} · est ${fmtUsd(estCost)}`,
+      5
+    );
 
     try {
       let result;
       // v4.26: onSubmit callback persists request_id + status/response
-      // URLs to the shot the moment fal acknowledges the submission. If
-      // polling times out client-side, the metadata is on disk and the
-      // user can recover via __recoverPendingTake(shotId) without paying
-      // for a duplicate roll.
+      // URLs to the shot the moment fal acknowledges the submission.
       const submitOpts = {
         onSubmit: async (meta) => {
           try {
@@ -16747,7 +17001,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             fresh.keyframes = fresh.keyframes || {};
             fresh.keyframes._pending_seedance = {
               ...meta,
-              mode: resolved.mode,
+              mode: routing.composer_mode,
               render_engine: renderEngine,
               cost_usd: estCost,
             };
@@ -16758,26 +17012,34 @@ JSON object only. No commentary. No fences. No trailing text.`;
           }
         },
       };
-      if (resolved.mode === "text_to_video") {
-        result = await State.fal.seedanceTextToVideo(composed.body, submitOpts);
-      } else if (resolved.mode === "image_to_video") {
-        if (useKlingDualFrame) {
-          // Kling O1 dual-keyframe — start_image_url + tail_image_url.
-          // Re-uses the composed Seedance prompt for the visual direction;
-          // both anchors are gate-approved frames.
-          const klingBody = {
-            prompt: composed.prompt,
-            image_url: shot.keyframes.start.approved_dataUrl,
-            tail_image_url: shot.keyframes.end.approved_dataUrl,
-            duration: composed.body.duration,
-            aspect_ratio: composed.body.aspect_ratio,
-          };
-          result = await State.fal.klingDualKeyframe(klingBody, submitOpts);
-        } else {
-          result = await State.fal.seedanceImageToVideo(composed.body, submitOpts);
-        }
-      } else {
+
+      // v4.27: dispatch on engine, not composer_mode. The composer mode
+      // shaped the prompt; the engine shapes the API call + body.
+      if (renderEngine === "kling-o1-dual") {
+        // Kling O1 dual-keyframe — start + end frames are honored as
+        // FRAME ANCHORS (not style references). This is what the gate
+        // workflow has promised since v4.17 and what r2v shots silently
+        // didn't get pre-v4.27.
+        const klingBody = {
+          prompt: composed.prompt,
+          ...routing.body_overrides,  // image_url + tail_image_url
+          duration: composed.body.duration,
+          aspect_ratio: composed.body.aspect_ratio,
+        };
+        result = await State.fal.klingDualKeyframe(klingBody, submitOpts);
+      } else if (renderEngine === "seedance-image_to_video") {
+        // Merge body_overrides (e.g. gate-approved image_url overriding
+        // any composed.body.image_url placeholder).
+        const i2vBody = { ...composed.body, ...routing.body_overrides };
+        result = await State.fal.seedanceImageToVideo(i2vBody, submitOpts);
+      } else if (renderEngine === "seedance-reference_to_video") {
         result = await State.fal.seedanceReferenceToVideo(composed.body, submitOpts);
+      } else if (renderEngine === "seedance-text_to_video") {
+        result = await State.fal.seedanceTextToVideo(composed.body, submitOpts);
+      } else if (renderEngine === "built_in_resolve") {
+        throw new Error("built_in_resolve mode shouldn't reach the fal dispatch path (handled upstream)");
+      } else {
+        throw new Error(`v4.27 router emitted unknown engine: ${renderEngine}`);
       }
 
       const videoUrl = result?.video?.url;
@@ -16798,7 +17060,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const take = {
         id: crypto.randomUUID(),
         shotId,
-        mode: resolved.mode,
+        // v4.27: take.mode is the composer mode (prompt-shape intent),
+        // not the legacy modeResolver's view. For a Kling-routed shot
+        // composer_mode is "image_to_video" (i2v prompt language) and
+        // render_engine is "kling-o1-dual" — both ride along on the take
+        // so Exports can show "Kling dual-keyframe i2v".
+        mode: routing.composer_mode,
         // v4.17: explicit render engine so the storyboard / Exports can
         // tell Kling-routed takes apart from Seedance ones.
         render_engine: renderEngine,
@@ -16826,10 +17093,14 @@ JSON object only. No commentary. No fences. No trailing text.`;
       shot.keyframes.last_attempt_failed = false;
       shot.keyframes.last_error = null;
       shot.keyframes.last_success_at = take.created_at || Date.now();
-      shot.keyframes.last_success_mode = take.mode || resolved.mode;
+      shot.keyframes.last_success_mode = take.mode || routing.composer_mode;
       await Storage.put("shots", shot);
-      await trackCost(estCost, `seedance ${resolved.mode} ${shotId}`);
-      toast(`Take rolled · ${fmtUsd(estCost)} · ${resolved.mode}`);
+      // v4.27: cost ledger + toast surface the actual ENGINE used, not the
+      // composer mode. "seedance image_to_video" used to be reported for
+      // Kling-routed shots — confusing the cost trace. Now: "kling-o1-dual",
+      // "seedance reference_to_video", etc.
+      await trackCost(estCost, `${renderEngine} ${shotId}`);
+      toast(`Take rolled · ${fmtUsd(estCost)} · ${renderEngine}`);
       // CONTINUITY CHAIN — extract last frame, seed next shot's start image
       // if its continuity strategy is "inherit_end_of_previous".
       chainToNextShot(shot, take).catch(err => console.warn("[chain]", err));
@@ -17374,6 +17645,25 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const showProposerHint = !!kf._migrated_has_state_change
       && proposerVerdict !== hasStateChange;
 
+    // v4.27: surface the routing TARGET so the has_state_change checkbox
+    // isn't a black box. Pre-v4.27 audit caught that toggling the checkbox
+    // for r2v-bibled shots did NOTHING for dispatch — the gate was
+    // decoration. Now we run the same resolveRenderEngine the dispatch will
+    // and show the engine name + a one-line "why" so the director can SEE
+    // what the API call will be before they commit credits.
+    const routingPreview = resolveRenderEngine(shot, { previousShotHasApprovedTake: false });
+    const engineLabel = ({
+      "kling-o1-dual": "Kling O1 dual-keyframe",
+      "seedance-image_to_video": "Seedance i2v (single anchor)",
+      "seedance-reference_to_video": "Seedance r2v (reference images)",
+      "seedance-text_to_video": "Seedance t2v (prompt-only)",
+      "built_in_resolve": "Resolve (no model call)",
+    })[routingPreview.engine] || routingPreview.engine;
+    const engineColor = routingPreview.engine === "kling-o1-dual" ? "#c9a25a"
+                      : routingPreview.engine === "seedance-image_to_video" ? "#7eb3ff"
+                      : routingPreview.engine === "seedance-reference_to_video" ? "#9a9aab"
+                      : "#6a6a78";
+
     const renderCandidateStrip = (slot, slotData) => {
       const candidates = slotData.candidates || [];
       if (candidates.length === 0) {
@@ -17403,10 +17693,22 @@ JSON object only. No commentary. No fences. No trailing text.`;
 
     host.innerHTML = `
       <div style="background:#14141a; border:1px solid ${gateOK ? "#3a5a3a" : "#5a3a2a"}; border-radius:8px; padding:12px 14px;">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
-          <div style="display:flex; align-items:center; gap:10px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; gap:10px; flex-wrap:wrap;">
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
             <span style="font-size:13px; font-weight:600; color:#e8e8ee;">🎯 Keyframe gate</span>
             <span style="font-size:11px; color:${gateOK ? "#4ade80" : "#fbbf24"};">${gateOK ? "✓ satisfied — Roll Seedance enabled" : "Approve frames below before rolling"}</span>
+            <!-- v4.27: routing-target chip. Live preview of which engine the
+                 Roll button will dispatch to, given current gate state + bible
+                 mode. Toggling the has_state_change checkbox below updates this
+                 chip on re-render, so the user sees Kling-vs-Seedance flip in
+                 real time. -->
+            <span title="${esc(routingPreview.reason)}"
+                  style="font-family: 'JetBrains Mono', monospace; font-size:10px; letter-spacing:0.04em;
+                         color: ${engineColor}; background: rgba(255,255,255,0.04);
+                         border:1px solid ${engineColor}40; padding:2px 8px; border-radius:10px;
+                         cursor: help;">
+              → ${esc(engineLabel)}
+            </span>
           </div>
           <label style="display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; font-size:11px; color:#9a9aab;">
             <input type="checkbox" ${hasStateChange ? "checked" : ""}
