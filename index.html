@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="c12ff38c2d1d" data-build-time="2026-05-19T14:00:06.291Z">
+<meta name="elevenx-build" content="330bd08f82dc" data-build-time="2026-05-19T14:28:11.277Z">
 <script>
 (function(){
-  var info = { hash: "c12ff38c2d1d", time: "2026-05-19T14:00:06.291Z" };
+  var info = { hash: "330bd08f82dc", time: "2026-05-19T14:28:11.277Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: c12ff38c2d1d @ 2026-05-19T14:00:06.291Z -->
+<!-- elevenx-build: 330bd08f82dc @ 2026-05-19T14:28:11.277Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -7545,7 +7545,21 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
   // stage stitches video + per-shot VO. Ambient/SFX is on the prompt body
   // ([Audio] block earlier) and Seedance renders it silent unless the
   // user explicitly opts in via shot.audio.generate_native_override === true.
-  const genAudio = shot.audio?.generate_native_override === true;
+  //
+  // v4.36 hybrid audio routing: when the shot has NO speech (no in-frame
+  // dialogue AND no voiceover entries), Seedance generates native SFX
+  // (ambient/environmental sound) automatically. When the shot HAS speech,
+  // generate_audio stays false to preserve the v4.16 mode-mixing fix —
+  // ElevenLabs handles speech, video stays silent for ambient (future
+  // enhancement: layer ElevenLabs SFX on dialogue shots; logged as deferred).
+  const hasSpeech = (
+    (shot.cast_in_frame || []).some(c =>
+      c.dialogue?.en || (typeof c.dialogue === "string" && c.dialogue.trim())
+    ) ||
+    (Array.isArray(shot.voiceover) && shot.voiceover.length > 0)
+  );
+  const genAudio = shot.audio?.generate_native_override === true
+                || (!hasSpeech && shot.audio?.generate_native_override !== false);
   const resolution = shot.prompt_engineering?.seedance_param_overrides?.resolution || "720p";
 
   let body;
@@ -9063,7 +9077,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
 (() => {
   const NS = (window.ElevenX = window.ElevenX || {});
   const DB_NAME = "elevenx";
-  const DB_VER  = 3;
+  // v4: adds project.auto_roll_on_gate (default false; v4.33 introduced
+  // this as true, v4.36 flips it to false after user audit caught the
+  // cost-control regression) and project.auto_vo_overlay (default true;
+  // ElevenLabs auto-fires for dialogue shots after take is rolled).
+  const DB_VER  = 4;
 
   // The stores that get the project_id filter treatment.
   const PROJECT_SCOPED = ["characters", "environments", "assets", "shots", "takes", "conversations"];
@@ -9176,6 +9194,32 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
                 dirty = true;
               }
             }
+            if (dirty) c.update(row);
+            c.continue();
+          };
+        }
+        // v3 → v4: cost-control + audio defaults per the v4.36 audit.
+        // auto_roll_on_gate flips to false (user must click "Roll Seedance"
+        // even after gate is satisfied — the expensive step gets an
+        // explicit confirmation, while the cheap auto-approve chains
+        // unchanged). auto_vo_overlay defaults to true so dialogue shots
+        // automatically generate the ElevenLabs voice overlay after the
+        // take is rolled — no manual 🎙 click needed.
+        if (oldVersion < 4) {
+          const projOs = txn.objectStore("projects");
+          const cur = projOs.openCursor();
+          cur.onsuccess = (ev) => {
+            const c = ev.target.result;
+            if (!c) return;
+            const row = c.value;
+            let dirty = false;
+            // Force auto_roll_on_gate off (was on in v4.33; v4.36 inverts default).
+            // Even existing rows that had it set to true get flipped — the audit
+            // decided the cost-control regression overrides user-set preferences
+            // from the v4.33 window. Users who want auto-roll back on can flip
+            // it manually after upgrade.
+            if (row.auto_roll_on_gate !== false) { row.auto_roll_on_gate = false; dirty = true; }
+            if (row.auto_vo_overlay === undefined) { row.auto_vo_overlay = true; dirty = true; }
             if (dirty) c.update(row);
             c.continue();
           };
@@ -11224,15 +11268,22 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   //
   // Returns one normalized `{ dataUrl, seed, modelLabel, costUsd }` so
   // callers can persist a candidate without knowing which engine fired.
-  async function runIdentityAnchoredEdit({ prompt, refDataUrl, seed, modelKey, label }) {
+  async function runIdentityAnchoredEdit({ prompt, refDataUrl, seed, modelKey, label, compositionAnchorDataUrl }) {
     if (!prompt) throw new Error("runIdentityAnchoredEdit: prompt is required");
     if (!refDataUrl) throw new Error("runIdentityAnchoredEdit: refDataUrl is required");
     const key = modelKey || ACTIVE_IMAGE_MODEL;  // defaults to GPT post-A/B
     if (key === "gpt") {
       if (!State.openai) throw new Error(`${label || "edit"}: OpenAI client not configured. Set the OpenAI API key in Connection settings, or switch ACTIVE_IMAGE_MODEL to 'seedream'.`);
+      // v4.36: OpenAI's imageEdit takes a single reference image. When a
+      // compositionAnchorDataUrl is provided (end-frame gen anchored on
+      // start frame), prefer the composition anchor — it carries BOTH
+      // identity (the character is in it) AND composition. Single-image
+      // GPT edit can't combine two anchors; this is a Seedream-strength
+      // case. Falls back to character-only when composition is absent.
+      const gptAnchor = compositionAnchorDataUrl || refDataUrl;
       const result = await State.openai.imageEdit({
         prompt,
-        imageDataUrl: refDataUrl,
+        imageDataUrl: gptAnchor,
         size: "1024x1024",
         quality: "medium",
         n: 1,
@@ -11249,9 +11300,18 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // Fallback: Seedream (the pre-A/B-test default; still wired so a user can
     // flip back via ACTIVE_IMAGE_MODEL = "seedream" or per-call modelKey override)
     if (!State.fal) throw new Error(`${label || "edit"}: fal client not configured`);
+    // v4.36: when a compositionAnchorDataUrl is provided (typically the
+    // approved start frame, for end-frame gen), pass it as a SECOND
+    // image_url. Seedream's edit endpoint accepts string[] (verified in
+    // falClient.js:212) and blends multi-image guidance. The order matters:
+    // putting the composition anchor FIRST emphasises camera/environment
+    // continuity; refDataUrl (character portrait) reinforces identity.
+    const image_urls = compositionAnchorDataUrl
+      ? [compositionAnchorDataUrl, refDataUrl]
+      : [refDataUrl];
     const seedreamBody = {
       prompt,
-      image_urls: [refDataUrl],
+      image_urls,
       num_images: 1,
     };
     if (seed !== undefined && seed !== null) seedreamBody.seed = seed;
@@ -16619,6 +16679,35 @@ JSON object only. No commentary. No fences. No trailing text.`;
 
     const charRef = anchorImageUrl;
 
+    // v4.36: composition anchor for END-frame gen. When the user has
+    // already approved a START frame and is now generating END candidates,
+    // pass the approved start frame as a SECOND image to Seedream so the
+    // end frame inherits camera position, environment composition,
+    // lighting, and architecture. Without this, start and end frames
+    // generate independently → Seedance/Kling has to interpolate motion
+    // between visually divergent scenes → camera swaps sides, props move,
+    // architecture rearranges (the exact symptom S02 demonstrated post-v4.35).
+    //
+    // The anchor only applies for end-frame gen on a character-anchored
+    // shot. Asset/env anchored shots don't have a state-change duality.
+    const compositionAnchor = (
+      slot === "end" &&
+      anchorKind === "character" &&
+      shot.keyframes?.start?.approved_dataUrl
+    ) ? shot.keyframes.start.approved_dataUrl : null;
+
+    // v4.36: prepend an explicit composition-locking instruction to the
+    // prompt when a composition anchor is in play. The first image
+    // Seedream sees is the composition anchor (start frame), the second
+    // is the character ref. The model needs to know WHICH role each
+    // image plays — otherwise it might blend them naively.
+    const finalPromptText = compositionAnchor
+      ? [
+          `[Composition Lock] The first input image is the APPROVED START FRAME of this shot. Match its camera position, environment composition, lighting direction, and spatial arrangement of props/architecture EXACTLY. The second input image is the character's identity reference. Only the character's pose and the state described below change between start and end — every other visual element stays put.`,
+          promptText,
+        ].join("\n\n")
+      : promptText;
+
     // Generate N candidates with distinct seeds.
     const newCandidates = [];
     const placeholderDataUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
@@ -16631,10 +16720,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
           dataUrl: placeholderDataUrl,
           model: "dry-run-placeholder",
           seed,
-          prompt: promptText,
+          prompt: finalPromptText,
+          composition_anchored: !!compositionAnchor,
           generated_at: Date.now(),
         });
-        console.log(`[dry-run · keyframe-candidate] shot=${shot.id} slot=${slot} seed=${seed}`);
+        console.log(`[dry-run · keyframe-candidate] shot=${shot.id} slot=${slot} seed=${seed} composition_anchored=${!!compositionAnchor}`);
         continue;
       }
       try {
@@ -16642,22 +16732,27 @@ JSON object only. No commentary. No fences. No trailing text.`;
         // default) so candidates land inside Seedance's training
         // distribution. The seed is honoured by Seedream and produces
         // deterministic variation across the N candidates.
+        // v4.36: passes compositionAnchorDataUrl for end-frame gen so
+        // Seedream receives [startFrame, characterRef] and locks the
+        // end frame's composition to the start frame.
         const edit = await runIdentityAnchoredEdit({
-          prompt: promptText,
+          prompt: finalPromptText,
           refDataUrl: charRef,
+          compositionAnchorDataUrl: compositionAnchor,
           seed,
           modelKey: KEYFRAME_IMAGE_MODEL,
-          label: `keyframe-candidate ${shot.id}/${slot} ${i+1}/${n}`,
+          label: `keyframe-candidate ${shot.id}/${slot} ${i+1}/${n}${compositionAnchor ? " [composition-anchored]" : ""}`,
         });
         newCandidates.push({
           id: candidateId,
           dataUrl: edit.dataUrl,
           model: edit.modelLabel,
           seed: edit.seed,
-          prompt: promptText,
+          prompt: finalPromptText,
+          composition_anchored: !!compositionAnchor,  // v4.36 audit trail
           generated_at: Date.now(),
         });
-        await trackCost(edit.costUsd, `${edit.modelLabel} keyframe candidate ${shot.id}/${slot}`);
+        await trackCost(edit.costUsd, `${edit.modelLabel} keyframe candidate ${shot.id}/${slot}${compositionAnchor ? " [comp-anchored]" : ""}`);
       } catch (err) {
         console.warn(`[keyframe-candidate] ${slot} ${i+1}/${n} failed:`, err);
       }
@@ -16699,17 +16794,14 @@ JSON object only. No commentary. No fences. No trailing text.`;
         try {
           await approveKeyframeCandidate(shotId, slot, candidates[0].id);
           toast(`✓ Generated ${candidates.length} candidate(s) — top auto-approved for ${slot} (click another to override).`, { duration: 4500 });
-          // Mirror the post-approve cascade: re-render + maybe auto-roll
           if (State.activeShotId === shotId) renderShotEditor(shotId);
           renderStoryboard();
-          // Mirror auto-roll trigger from handleApproveCandidate. Without this,
-          // auto-approve still requires the user to click roll, which
-          // defeats the click-reduction purpose.
-          const freshShot = await Storage.get("shots", shotId);
-          if (freshShot && isShotGateSatisfied(freshShot)) {
-            const autoRoll = project?.auto_roll_on_gate !== false;  // default ON
-            if (autoRoll) handleRollShot(shotId);
-          }
+          // v4.36: REMOVED the v4.33 auto-roll-to-Seedance trigger.
+          // Image gen ($0.15) auto-chains; video gen ($2-3) requires
+          // explicit click. The "Roll Seedance" CTA inside the gate
+          // panel surfaces when the gate is satisfied (see
+          // renderKeyframeGate). Cost-control regression caught by
+          // user audit 2026-05-19.
           return;
         } catch (err) {
           // Auto-approve failed (shouldn't happen — we just generated them).
@@ -16733,23 +16825,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
       toast(`✓ ${slot[0].toUpperCase()}${slot.slice(1)} frame approved.`, { duration: 3000 });
       if (State.activeShotId === shotId) renderShotEditor(shotId);
       renderStoryboard();
-      // v4.33 Direction A: auto-roll on gate satisfaction. If approving this
-      // candidate just satisfied the gate AND the project allows auto-roll,
-      // fire handleRollShot immediately — saves the user a click per shot
-      // and aligns with the "review final take, not intermediate ceremony"
-      // UX direction. Project-level toggle (project.auto_roll_on_gate) lets
-      // a user turn this OFF for expensive batches where per-shot confirmation
-      // is still desired. Audit (2026-05-16): cuts ~11 clicks from an 11-shot film.
-      const freshShot = await Storage.get("shots", shotId);
-      if (freshShot && isShotGateSatisfied(freshShot)) {
-        const project = await Storage.Projects.getActive();
-        const autoRoll = project?.auto_roll_on_gate !== false;  // default ON
-        if (autoRoll) {
-          // Don't await — let the user keep interacting; the GPS overlay +
-          // toasts inside handleRollShot will signal progress.
-          handleRollShot(shotId);
-        }
-      }
+      // v4.36: REMOVED auto-roll-to-Seedance trigger. Approve is a CHEAP
+      // image-gen approval; rolling Seedance is the EXPENSIVE video-gen
+      // commit ($2-3). The gate panel surfaces a prominent
+      // "Roll Seedance · est $X.XX" CTA when the gate is satisfied;
+      // user explicitly clicks to commit. Cost-control regression
+      // caught by user audit 2026-05-19.
     } catch (err) {
       toast(`Approve failed: ${err.message}`, { tone: "warn" });
     }
@@ -17722,6 +17803,32 @@ JSON object only. No commentary. No fences. No trailing text.`;
       chainToNextShot(shot, take).catch(err => console.warn("[chain]", err));
       renderStoryboard();
       if (State.activeShotId === shotId) renderShotEditor(shotId);
+      // v4.36: auto-fire ElevenLabs voice overlay for dialogue shots.
+      // Audit (2026-05-19): "no audio on last take" surfaced that VO
+      // was a manual 🎙 click per take, and the button was easy to miss
+      // (or wasn't visible at all if the shot had no authored dialogue).
+      // Now: if the shot has any speech (dialogue OR voiceover) AND
+      // the project has auto_vo_overlay enabled (default true post-v4.36),
+      // automatically generate the overlay after the take is written.
+      // The 🎙 button stays for manual re-gen; default path requires no click.
+      // ~$0.10 per shot — cheap enough to auto-chain (consistent with
+      // "cheap auto-chains, expensive gates" rule, since the Seedance roll
+      // already gated explicitly via the v4.36 CTA).
+      const hasSpeechForVO = (
+        (shot.cast_in_frame || []).some(c =>
+          c.dialogue?.en || (typeof c.dialogue === "string" && c.dialogue.trim())
+        ) ||
+        (Array.isArray(shot.voiceover) && shot.voiceover.length > 0)
+      );
+      const autoVO = project?.auto_vo_overlay !== false;  // default ON
+      if (hasSpeechForVO && autoVO && State.eleven) {
+        // Fire-and-forget; the handler shows its own GPS overlay + toasts.
+        handleGenerateVoiceOverlay(shotId, take.id).catch(err => {
+          console.warn("[v4.36 auto-VO failed]", err);
+        });
+      } else if (hasSpeechForVO && autoVO && !State.eleven) {
+        toast(`Shot has dialogue but ElevenLabs isn't configured — set the API key in Connection to enable auto-VO.`, { tone: "warn", duration: 7000 });
+      }
     } catch (err) {
       console.error(err);
       // v4.26: detect timeout-with-pending-job and surface the recovery
@@ -18316,6 +18423,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // an "Advanced" disclosure so the default flow doesn't expose it.
     // Currently selected value:
     const currentDualEngine = shot?.generation?.dual_anchor_engine || "seedance";
+    // v4.36: pre-compute the Seedance cost estimate so the gate-satisfied
+    // CTA shows it inline ("Roll Seedance · est $X.XX"). Mirror the
+    // formula handleRollShot uses (composer body duration + i2v rate).
+    // Falls back to a flat ~$2-3 estimate if estimateSeedanceCost isn't
+    // exposed yet (defensive).
+    const ctaDur = shot.timecode?.duration_seconds_override
+                || shot.timecode?.duration_seconds
+                || 8;
+    const ctaMode = routingPreview.composer_mode === "reference_to_video" ? "reference"
+                  : routingPreview.composer_mode === "text_to_video" ? "text"
+                  : "image";
+    const ctaCostUsd = typeof NS.estimateSeedanceCost === "function"
+                    ? NS.estimateSeedanceCost(ctaDur, "standard", ctaMode)
+                    : ctaDur * 0.30;
 
     const renderCandidateStrip = (slot, slotData) => {
       const candidates = slotData.candidates || [];
@@ -18473,6 +18594,28 @@ JSON object only. No commentary. No fences. No trailing text.`;
             </div>
           </div>
         </details>` : ""}
+        ${gateOK ? `
+        <!-- v4.36: explicit "Roll Seedance" CTA. v4.33 auto-rolled video
+             the moment the gate satisfied; user audit (2026-05-19) caught
+             that as a cost-control regression — image gen is cheap, video
+             gen is $2-3. Now the user sees the estimated cost inline and
+             must explicitly commit. The button calls the same data-action
+             ("roll-shot") that the older Roll button uses, so all the
+             handleRollShot wiring (preflight gates, GPS overlay,
+             recovery on timeout) flows unchanged. -->
+        <div style="margin-top:12px; padding:12px 14px; background:#14241a; border:1px solid #4a8a4a; border-radius:6px; display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+          <div style="font-size:12.5px; color:#bce4be; line-height:1.45;">
+            <strong style="color:#e8e8ee;">✓ Gate satisfied.</strong>
+            Ready to render the take — this is the expensive step.
+            <span style="color:#9a9aab; font-size:11px;">Est cost: <span class="mono" style="color:#c9a25a;">${fmtUsd(ctaCostUsd)}</span></span>
+          </div>
+          <button type="button"
+                  data-action="roll-shot" data-shot-id="${esc(shot.id)}"
+                  style="background:#4a8a4a; color:#0a0a0c; border:none; padding:8px 16px; border-radius:5px; font-size:12.5px; font-weight:700; cursor:pointer; letter-spacing:0.02em;"
+                  title="Render the take via ${esc(engineLabel)} (will charge ${fmtUsd(ctaCostUsd)})">
+            Roll Seedance · ${fmtUsd(ctaCostUsd)}
+          </button>
+        </div>` : ""}
       </div>
     `;
     // v4.33: wire the Advanced dropdown's change event. The global click
