@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="2a0149a34d73" data-build-time="2026-05-19T13:33:55.830Z">
+<meta name="elevenx-build" content="8279ca35ae1e" data-build-time="2026-05-19T13:43:39.333Z">
 <script>
 (function(){
-  var info = { hash: "2a0149a34d73", time: "2026-05-19T13:33:55.830Z" };
+  var info = { hash: "8279ca35ae1e", time: "2026-05-19T13:43:39.333Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 2a0149a34d73 @ 2026-05-19T13:33:55.830Z -->
+<!-- elevenx-build: 8279ca35ae1e @ 2026-05-19T13:43:39.333Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11191,6 +11191,66 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   }
   NS.generateImageWithOptionalAnchor = generateImageWithOptionalAnchor;
 
+  // v4.34: model-aware IDENTITY-anchored image edit. Different semantics
+  // from generateImageWithOptionalAnchor — that one says "use the anchor
+  // as a STYLE reference, do NOT copy subjects" (for cast portraits with
+  // a style anchor). This one says "PRESERVE the character's identity
+  // from the reference, change the SCENE around them" (for shot keyframes
+  // where the anchor is a character portrait).
+  //
+  // Audit (2026-05-19): generateKeyframeForShot + generateKeyframeCandidates
+  // were hard-coded to State.fal.seedreamEdit since v4.5. After the May 2026
+  // A/B test ACTIVE_IMAGE_MODEL was set to "gpt", and cast/env refs migrated
+  // to gpt-image-2. Keyframe gen was left on Seedream by oversight. v4.34
+  // closes that gap.
+  //
+  // Returns one normalized `{ dataUrl, seed, modelLabel, costUsd }` so
+  // callers can persist a candidate without knowing which engine fired.
+  async function runIdentityAnchoredEdit({ prompt, refDataUrl, seed, modelKey, label }) {
+    if (!prompt) throw new Error("runIdentityAnchoredEdit: prompt is required");
+    if (!refDataUrl) throw new Error("runIdentityAnchoredEdit: refDataUrl is required");
+    const key = modelKey || ACTIVE_IMAGE_MODEL;  // defaults to GPT post-A/B
+    if (key === "gpt") {
+      if (!State.openai) throw new Error(`${label || "edit"}: OpenAI client not configured. Set the OpenAI API key in Connection settings, or switch ACTIVE_IMAGE_MODEL to 'seedream'.`);
+      const result = await State.openai.imageEdit({
+        prompt,
+        imageDataUrl: refDataUrl,
+        size: "1024x1024",
+        quality: "medium",
+        n: 1,
+      });
+      const dataUrl = result?.images?.[0]?.dataUrl;
+      if (!dataUrl) throw new Error(`${label || "edit"}: no image in OpenAI response`);
+      return {
+        dataUrl,
+        seed: seed ?? null,  // OpenAI gpt-image-2 doesn't accept a seed; ride along for traceability
+        modelLabel: "gpt-image-2",
+        costUsd: result.cost_usd_estimated || 0.042,
+      };
+    }
+    // Fallback: Seedream (the pre-A/B-test default; still wired so a user can
+    // flip back via ACTIVE_IMAGE_MODEL = "seedream" or per-call modelKey override)
+    if (!State.fal) throw new Error(`${label || "edit"}: fal client not configured`);
+    const seedreamBody = {
+      prompt,
+      image_urls: [refDataUrl],
+      num_images: 1,
+    };
+    if (seed !== undefined && seed !== null) seedreamBody.seed = seed;
+    const result = await State.fal.seedreamEdit(seedreamBody);
+    const imgUrl = result?.images?.[0]?.url;
+    if (!imgUrl) throw new Error(`${label || "edit"}: no image in Seedream response`);
+    const blob = await fetch(imgUrl).then(r => r.blob());
+    const dataUrl = await blobToDataUrl(blob);
+    return {
+      dataUrl,
+      seed: result.seed ?? seed ?? null,
+      modelLabel: "seedream-v4.5",
+      costUsd: 0.05,
+    };
+  }
+  NS.runIdentityAnchoredEdit = runIdentityAnchoredEdit;
+
   // ─── Anchor Planner (v4.2) ──────────────────────────────────────────
   // Bridges the gap between "bible imported" and "ready to generate". For
   // each entity (cast / env / asset), produces a deterministic recipe:
@@ -16242,15 +16302,14 @@ JSON object only. No commentary. No fences. No trailing text.`;
       return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
     }
 
-    const result = await State.fal.seedreamEdit({
+    // v4.34: route through the model-aware helper so the keyframe uses
+    // gpt-image-2 (post-A/B-test winner) instead of hard-coded Seedream.
+    const edit = await runIdentityAnchoredEdit({
       prompt: promptText,
-      image_urls: [charRef],
-      num_images: 1,
+      refDataUrl: charRef,
+      label: `keyframe-gen ${shot.id}`,
     });
-    const imgUrl = result?.images?.[0]?.url;
-    if (!imgUrl) throw new Error("Seedream returned no keyframe");
-    const blob = await fetch(imgUrl).then(r => r.blob());
-    const dataUrl = await blobToDataUrl(blob);
+    const dataUrl = edit.dataUrl;
     // Persist on the shot
     shot.keyframes = shot.keyframes || {};
     shot.keyframes.startDataUrl = dataUrl;
@@ -16261,11 +16320,14 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // the prompt from scratch.
     shot.keyframes.prompt = promptText;
     shot.keyframes.medium = medium;
+    // v4.34: record which model produced this keyframe so the take audit
+    // can tell gpt-image-2 keyframes apart from seedream-v4.5 keyframes.
+    shot.keyframes.start_model = edit.modelLabel;
     // v4.9: clear any prior failure fingerprint — this attempt succeeded.
     shot.keyframes.last_attempt_failed = false;
     shot.keyframes.last_error = null;
     await Storage.put("shots", shot);
-    await trackCost(0.05, `seedream keyframe ${shot.id}`);
+    await trackCost(edit.costUsd, `${edit.modelLabel} keyframe ${shot.id}`);
     return dataUrl;
   }
 
@@ -16554,25 +16616,25 @@ JSON object only. No commentary. No fences. No trailing text.`;
         continue;
       }
       try {
-        const result = await State.fal.seedreamEdit({
+        // v4.34: route through the model-aware helper. For GPT, `seed` is
+        // logged but doesn't drive variation (gpt-image-2 doesn't expose
+        // a seed knob); diversity comes from making N separate calls. For
+        // Seedream, the seed is honoured and produces deterministic variation.
+        const edit = await runIdentityAnchoredEdit({
           prompt: promptText,
-          image_urls: [charRef],
-          num_images: 1,
+          refDataUrl: charRef,
           seed,
+          label: `keyframe-candidate ${shot.id}/${slot} ${i+1}/${n}`,
         });
-        const imgUrl = result?.images?.[0]?.url;
-        if (!imgUrl) throw new Error("Seedream returned no image");
-        const blob = await fetch(imgUrl).then(r => r.blob());
-        const dataUrl = await blobToDataUrl(blob);
         newCandidates.push({
           id: candidateId,
-          dataUrl,
-          model: "seedream-v4.5",
-          seed,
+          dataUrl: edit.dataUrl,
+          model: edit.modelLabel,
+          seed: edit.seed,
           prompt: promptText,
           generated_at: Date.now(),
         });
-        await trackCost(0.05, `seedream keyframe candidate ${shot.id}/${slot}`);
+        await trackCost(edit.costUsd, `${edit.modelLabel} keyframe candidate ${shot.id}/${slot}`);
       } catch (err) {
         console.warn(`[keyframe-candidate] ${slot} ${i+1}/${n} failed:`, err);
       }
@@ -16596,7 +16658,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
   async function handleGenerateKeyframeCandidates(shotId, slot) {
     if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
     if (!shotId || !slot) return;
-    setGPS(true, `Generating 3 keyframe candidates for ${slot}`, "seedream-v4.5 · 3 seeds", 20);
+    setGPS(true, `Generating 3 keyframe candidates for ${slot}`, `${IMAGE_MODELS[ACTIVE_IMAGE_MODEL].label} · 3 variations`, 20);
     try {
       const candidates = await generateKeyframeCandidates(shotId, slot, 3);
       setGPS(false);
@@ -17084,7 +17146,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // failing that, fire the Seedream auto-keyframe-gen ladder.
       let startImage = shot.keyframes?.startDataUrl;
       if (!startImage) {
-        setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, "seedream-v4.5 · cast-anchored", 30);
+        setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, `${IMAGE_MODELS[ACTIVE_IMAGE_MODEL].label} · identity-anchored`, 30);
         try {
           // v4.15: pass allCastForKeyframe (cast_in_frame ∪ references[].chars)
           // so generateKeyframeForShot finds Veyr-style anchors that live in
