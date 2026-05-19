@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="319eb69f3157" data-build-time="2026-05-19T21:55:43.249Z">
+<meta name="elevenx-build" content="e459c06b51bc" data-build-time="2026-05-19T22:01:01.313Z">
 <script>
 (function(){
-  var info = { hash: "319eb69f3157", time: "2026-05-19T21:55:43.249Z" };
+  var info = { hash: "e459c06b51bc", time: "2026-05-19T22:01:01.313Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 319eb69f3157 @ 2026-05-19T21:55:43.249Z -->
+<!-- elevenx-build: e459c06b51bc @ 2026-05-19T22:01:01.313Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -17718,8 +17718,104 @@ JSON object only. No commentary. No fences. No trailing text.`;
     }
   }
 
+  // ─── v4.41 VALIDATOR-1: perceptual hash diff gate ───────────────────────
+  //
+  // Structural fix (Finding D): when `has_state_change=true` the user
+  // expects a visible change between start and end frames. v4.36's
+  // composition-anchor for end-frame gen made the two frames COMPOSITIONALLY
+  // identical by design — but if the prompt's state delta is also subtle,
+  // start and end can be near-duplicates (S04 case). User sees no motion.
+  //
+  // perceptualHashFromDataUrl uses the aHash algorithm:
+  //   1. Load image into <img>, draw scaled to 8×8 on canvas
+  //   2. Convert to grayscale (luminance)
+  //   3. Compute mean luminance
+  //   4. Build a 64-bit hash where bit_i = (pixel_i > mean ? 1 : 0)
+  //
+  // hammingDistance counts differing bits (XOR + popcount).
+  // diff fraction = distance / 64; 0 = identical, 0.5 = half flipped, 1 = inverse.
+  // Threshold default 0.15 → if diff ≤ 15%, warn the user that state-change
+  // may not be visible.
+  //
+  // Pure JS canvas, no API call, no cost.
+
+  function _hammingDistance64(aBig, bBig) {
+    let x = aBig ^ bBig;
+    let count = 0n;
+    while (x !== 0n) {
+      count += x & 1n;
+      x >>= 1n;
+    }
+    return Number(count);
+  }
+  NS._hammingDistance64 = _hammingDistance64;
+
+  async function perceptualHashFromDataUrl(dataUrl) {
+    if (!dataUrl || typeof dataUrl !== "string") return null;
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = 8;
+          canvas.height = 8;
+          const ctx = canvas.getContext("2d");
+          // Draw the image scaled-down to 8×8 — bilinear smoothing approximates
+          // a low-pass filter, which is what aHash needs.
+          ctx.drawImage(img, 0, 0, 8, 8);
+          const data = ctx.getImageData(0, 0, 8, 8).data;  // RGBA × 64 = 256 bytes
+          // ITU-R BT.601 luminance: 0.299·R + 0.587·G + 0.114·B
+          const lums = new Array(64);
+          let sum = 0;
+          for (let i = 0; i < 64; i++) {
+            const r = data[i * 4];
+            const g = data[i * 4 + 1];
+            const b = data[i * 4 + 2];
+            const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            lums[i] = lum;
+            sum += lum;
+          }
+          const mean = sum / 64;
+          let hash = 0n;
+          for (let i = 0; i < 64; i++) {
+            if (lums[i] > mean) hash |= (1n << BigInt(i));
+          }
+          resolve(hash);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      img.onerror = () => reject(new Error("Image load failed for perceptual hash"));
+      img.src = dataUrl;
+    });
+  }
+  NS.perceptualHashFromDataUrl = perceptualHashFromDataUrl;
+
+  // Compute the diff fraction (0..1) between two dataURL images. Lower =
+  // more similar. Returns null on hash failure for either side.
+  async function perceptualDiffFraction(dataUrlA, dataUrlB) {
+    const [a, b] = await Promise.all([
+      perceptualHashFromDataUrl(dataUrlA).catch(() => null),
+      perceptualHashFromDataUrl(dataUrlB).catch(() => null),
+    ]);
+    if (a === null || b === null) return null;
+    return _hammingDistance64(a, b) / 64;
+  }
+  NS.perceptualDiffFraction = perceptualDiffFraction;
+
+  // Default threshold — below this we surface the warning. Tunable in
+  // project schema later if 0.15 turns out to be too strict/lax in practice.
+  const PERCEPTUAL_DIFF_THRESHOLD = 0.15;
+
   // v4.17: approve a specific candidate for a slot. Sets approved_id +
   // approved_dataUrl (denormalised for fast reads). Idempotent.
+  //
+  // v4.41 update: when slot === "end" and start.approved_dataUrl exists,
+  // computes the perceptual diff between the two frames. If diff ≤ 0.15
+  // (i.e. ≥85% similar), persists a soft warning issue
+  // (kind: "end_frame_too_similar") on shot._validation.issues so the gate
+  // panel + storyboard ⚠ badge can flag it. Pure post-approval check —
+  // never blocks the gate.
   async function approveKeyframeCandidate(shotId, slot, candidateId) {
     if (slot !== "start" && slot !== "end") throw new Error(`invalid slot: "${slot}"`);
     const shot = await Storage.get("shots", shotId);
@@ -17743,7 +17839,45 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (slot === "start") {
       shot.keyframes.startDataUrl = candidate.dataUrl;
     }
+    // v4.41: clear any prior end_frame_too_similar issue on EITHER slot
+    // approval — a fresh approval supersedes the prior pair. Re-emit below
+    // if the new pair is still too similar.
+    shot._validation = shot._validation || { issues: [] };
+    shot._validation.issues = (shot._validation.issues || []).filter(i => i.kind !== "end_frame_too_similar");
     await Storage.put("shots", shot);
+
+    // v4.41 perceptual diff gate — fire-and-forget; doesn't block return.
+    // Only meaningful when state-change=true (the user EXPECTS a delta)
+    // and both anchors exist. Pure browser canvas; no API call; no cost.
+    const startUrl = shot.keyframes?.start?.approved_dataUrl;
+    const endUrl = shot.keyframes?.end?.approved_dataUrl;
+    const stateChange = !!shot.keyframes?.has_state_change;
+    if (stateChange && startUrl && endUrl && typeof document !== "undefined") {
+      perceptualDiffFraction(startUrl, endUrl)
+        .then(async (diff) => {
+          if (diff === null) return;
+          if (diff > PERCEPTUAL_DIFF_THRESHOLD) return;  // visibly different — all good
+          // Re-fetch the freshest shot (the user may have edited in the
+          // meantime) and append the warning.
+          const fresh = await Storage.get("shots", shotId);
+          if (!fresh) return;
+          fresh._validation = fresh._validation || { issues: [] };
+          fresh._validation.issues = (fresh._validation.issues || []).filter(i => i.kind !== "end_frame_too_similar");
+          fresh._validation.issues.push({
+            kind: "end_frame_too_similar",
+            detail: {
+              diff_fraction: Number(diff.toFixed(3)),
+              threshold: PERCEPTUAL_DIFF_THRESHOLD,
+              similarity_pct: Math.round((1 - diff) * 100),
+            },
+          });
+          await Storage.put("shots", fresh);
+          toast(`⚠ End frame is ${Math.round((1 - diff) * 100)}% similar to start — state-change may not be visible. Re-generate end?`, { tone: "warn", duration: 7000 });
+          if (State.activeShotId === shotId) renderShotEditor(shotId);
+          renderStoryboard();
+        })
+        .catch(err => console.warn("[v4.41 perceptual diff]", err));
+    }
     return { slot, approved_id: candidateId };
   }
   NS.approveKeyframeCandidate = approveKeyframeCandidate;
@@ -19621,6 +19755,62 @@ JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.validateCameraStyleConflict = validateCameraStyleConflict;
 
+  // v4.41 Rule 16: world_rule_violation.
+  //
+  // Detects two classes of style-canon mismatch that v4.38's existing rules
+  // don't catch:
+  //   • ENSEMBLE: cast_in_frame.length > 2 AND focal_point/description
+  //     contains a group-action verb (fight, gather, crowd, swarm, charge,
+  //     assemble, battle, brawl, stampede, riot). The project's style canon
+  //     is single-character storybook by Fork-1 commitment; ensemble shots
+  //     violate that implicitly even when no explicit "no ensembles" rule
+  //     is authored.
+  //   • DENY-LIST KEYWORDS: focal_point/description contains any keyword
+  //     from project.deny_keywords (new optional project field) OR a
+  //     conservative default set (`["blood", "gore", "violence", "horror",
+  //     "explicit", "torture", "gruesome"]`). Default protects the ages
+  //     10-14 audience profile common to Fork-1 projects.
+  //
+  // Reports each violation with a `reason` string. Severity: warn (soft) —
+  // never blocks the gate. User can amend canon/deny_keywords to allow
+  // exceptions per-project.
+  const _ENSEMBLE_VERBS = /\b(fight|fights|fighting|gather|gathers|gathering|crowd|crowds|crowding|swarm|swarms|swarming|charge|charges|charging|assemble|assembles|assembling|battle|battles|battling|brawl|brawls|brawling|stampede|stampedes|stampeding|riot|riots|rioting)\b/i;
+  const _DEFAULT_DENY_KEYWORDS = ["blood", "gore", "violence", "horror", "explicit", "torture", "gruesome"];
+  function validateWorldRuleConsistency(shot, { project } = {}) {
+    if (!shot) return null;
+    const moment = shot.the_moment || {};
+    const text = [moment.focal_point, moment.description].filter(Boolean).join(" ");
+    const violations = [];
+    // ENSEMBLE check
+    const castCount = Array.isArray(shot.cast_in_frame) ? shot.cast_in_frame.length : 0;
+    if (castCount > 2 && _ENSEMBLE_VERBS.test(text)) {
+      violations.push({
+        type: "ensemble",
+        reason: `${castCount} characters in frame with group-action verb (matched: ${(_ENSEMBLE_VERBS.exec(text) || [])[0] || "?"}) — exceeds single-protagonist scope`,
+      });
+    }
+    // DENY-LIST check — project override OR default conservative list
+    const deny = Array.isArray(project?.deny_keywords) && project.deny_keywords.length > 0
+      ? project.deny_keywords
+      : _DEFAULT_DENY_KEYWORDS;
+    const lowerText = text.toLowerCase();
+    const matchedDeny = deny.filter(kw => {
+      if (!kw || typeof kw !== "string") return false;
+      const re = new RegExp(`\\b${_escapeRegex(kw.toLowerCase())}\\b`, "i");
+      return re.test(lowerText);
+    });
+    if (matchedDeny.length > 0) {
+      violations.push({
+        type: "deny_keyword",
+        reason: `contains deny-listed keyword(s) [${matchedDeny.join(", ")}] — conflicts with project tone`,
+        matched: matchedDeny,
+      });
+    }
+    if (violations.length === 0) return null;
+    return { kind: "world_rule_violation", detail: { violations } };
+  }
+  NS.validateWorldRuleConsistency = validateWorldRuleConsistency;
+
   // Run all v4.38 authoring-quality rules against a shot. Returns the
   // array of triggered issues (possibly empty). Pure function — no
   // side effects, no Storage calls.
@@ -19631,6 +19821,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
       () => validateLocationDrift(shot, ctx),
       () => validateChoreographyOverload(shot, ctx),
       () => validateCameraStyleConflict(shot, ctx),
+      // v4.41: world-rule consistency (ensemble + deny-keyword)
+      () => validateWorldRuleConsistency(shot, ctx),
     ]) {
       const issue = rule();
       if (issue) out.push(issue);
@@ -19663,7 +19855,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
       for (const shot of shots) {
         // v4.40: bump schema gate to "v4.40" so shots that already passed
         // v4.38 still get the silent focal-cast auto-fix on next boot.
-        if (shot?._validation?.schema_version === "v4.40") continue;
+        // v4.41: bump to "v4.41" so v4.40 shots get the new
+        // world_rule_violation rule run against them.
+        if (shot?._validation?.schema_version === "v4.41") continue;
         // v4.40 COMPOSITION-1: silent auto-fix BEFORE re-running validators
         // so the fixed issue doesn't get re-added to the issues list.
         const fix = autoFixFocalCastSilent(shot, ctx);
@@ -19683,7 +19877,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
         ]);
         shot._validation.issues = shot._validation.issues.filter(i => !v438Kinds.has(i.kind));
         shot._validation.issues.push(...newIssues);
-        shot._validation.schema_version = "v4.40";
+        shot._validation.schema_version = "v4.41";
         added += newIssues.length;
         await Storage.put("shots", shot);
       }
@@ -19700,7 +19894,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
           if (summary) summariesFilled++;
         }
       }
-      console.log(`[v4.40] re-validated ${shots.length} shot(s); added ${added} issue(s); auto-fixed ${autoFixed} focal-cast omission(s)${autoFixed > 0 ? " for: " + Array.from(autoFixedNames).join(", ") : ""}; filled ${summariesFilled} shot summaries.`);
+      console.log(`[v4.41] re-validated ${shots.length} shot(s); added ${added} issue(s); auto-fixed ${autoFixed} focal-cast omission(s)${autoFixed > 0 ? " for: " + Array.from(autoFixedNames).join(", ") : ""}; filled ${summariesFilled} shot summaries.`);
       if (autoFixed > 0) {
         toast(`Auto-added focal-named characters to ${autoFixed} cast slot(s) (boot-time fix).`, { duration: 5000 });
       }
@@ -19957,10 +20151,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const v438Kinds = new Set([
         "focal_unsupported_by_cast", "location_drift",
         "choreography_overload", "camera_style_conflict",
+        // v4.41 — re-validation also clears world_rule_violation so it
+        // gets re-evaluated cleanly against the updated project canon.
+        "world_rule_violation",
       ]);
       shot._validation.issues = (shot._validation.issues || []).filter(i => !v438Kinds.has(i.kind));
       shot._validation.issues.push(...newIssues);
-      shot._validation.schema_version = "v4.40";
+      shot._validation.schema_version = "v4.41";
       await Storage.put("shots", shot);
       // v4.40 COMPOSITION-2: if any of the accepted proposals touched
       // focal_point or description, the existing summary is stale. Clear
@@ -20175,6 +20372,17 @@ JSON object only. No commentary. No fences. No trailing text.`;
         const movement = issue.detail?.movement || "?";
         const excerpt = issue.detail?.conflicts?.[0]?.canon_excerpt || "";
         return `camera.movement "${movement}" conflicts with style_canon ("${excerpt}…"). Seedance has to reconcile two opposing directives. Either align the movement to the canon or amend the canon to explicitly allow this shot's movement.`;
+      }
+      // v4.41: perceptual-hash gate on dual-anchor state-change shots
+      case "end_frame_too_similar": {
+        const pct = issue.detail?.similarity_pct ?? "?";
+        const diff = issue.detail?.diff_fraction ?? "?";
+        return `end frame is ${pct}% similar to start (perceptual diff ${diff}). state-change is on, but Seedance has nothing visible to interpolate — the video may look static. Re-generate the end candidate with a stronger state delta in the prompt, or turn off has_state_change.`;
+      }
+      // v4.41: world-rule violations (ensemble, grimdark, etc.)
+      case "world_rule_violation": {
+        const reasons = (issue.detail?.violations || []).map(v => v.reason).join("; ");
+        return `world-rule violation: ${reasons}. The shot's prose or cast composition contradicts the project's style canon. Either rewrite the shot to fit canon, or amend project.style_canon/deny_keywords to explicitly allow it.`;
       }
       default:
         return issue.kind;
