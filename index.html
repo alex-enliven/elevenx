@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="52870b7a2554" data-build-time="2026-05-19T19:24:07.581Z">
+<meta name="elevenx-build" content="d146ab1c64e8" data-build-time="2026-05-19T20:15:15.068Z">
 <script>
 (function(){
-  var info = { hash: "52870b7a2554", time: "2026-05-19T19:24:07.581Z" };
+  var info = { hash: "d146ab1c64e8", time: "2026-05-19T20:15:15.068Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 52870b7a2554 @ 2026-05-19T19:24:07.581Z -->
+<!-- elevenx-build: d146ab1c64e8 @ 2026-05-19T20:15:15.068Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -8823,6 +8823,92 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
         raw: json,
       };
     }
+
+    // v4.39: chat completion for the AI authoring layer. Used by
+    // aiAuthorShot to fill empty fields, propose validator-issue fixes,
+    // and auto-pick voices from the ElevenLabs voice library.
+    //
+    // POST /openai/v1/chat/completions via the existing worker proxy.
+    // No new auth needed — same OPENAI_API_KEY the worker already holds.
+    //
+    // Model: default is the AI_AUTHOR_MODEL constant ("gpt-4o" as of
+    // 2026-05-19). User can override per-call via body.model, or flip
+    // the constant to "gpt-4.1" / "gpt-5" / etc. when those become
+    // available in their account.
+    //
+    // response_format supports OpenAI's JSON mode (`{ type: "json_object" }`)
+    // which constrains the model to valid JSON output — critical for the
+    // structured-fix pipeline.
+    /**
+     * @param {object} body
+     * @param {string} [body.system]
+     * @param {string} body.user
+     * @param {string} [body.model]
+     * @param {object} [body.response_format]
+     * @param {number} [body.temperature]
+     * @param {number} [body.max_tokens]
+     * @returns {Promise<{ content: string, parsed: object|null, raw: object, cost_usd_estimated: number }>}
+     */
+    async chatCompletion(body) {
+      if (!body?.user) throw new Error("chatCompletion: body.user is required");
+      const model = body.model || AI_AUTHOR_MODEL;
+      const messages = [];
+      if (body.system) messages.push({ role: "system", content: body.system });
+      messages.push({ role: "user", content: body.user });
+
+      const requestBody = {
+        model,
+        messages,
+        temperature: typeof body.temperature === "number" ? body.temperature : 0.4,
+      };
+      if (typeof body.max_tokens === "number") requestBody.max_tokens = body.max_tokens;
+      if (body.response_format)               requestBody.response_format = body.response_format;
+
+      if (this.dryRun) {
+        this.onLog(`[dry-run] chatCompletion ${model} (${(body.user || "").length} chars)`);
+        return { dryRun: true, request: requestBody };
+      }
+
+      const url = `${this.workerUrl}/openai/v1/chat/completions`;
+      this.onLog(`→ POST /openai/v1/chat/completions (${model}, ${(body.user || "").length} chars in)`);
+
+      const res = await this._fetchWithRetry(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      }, "openai chat");
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`openai chat ${res.status}: ${text.slice(0, 400)}`);
+      }
+
+      const json = await res.json();
+      const content = json?.choices?.[0]?.message?.content || "";
+      // Try to parse as JSON if the caller requested JSON mode. Tolerant —
+      // if the model returns commentary outside the JSON block, regex-extract
+      // the first { ... } object.
+      let parsed = null;
+      if (body.response_format?.type === "json_object" || content.trim().startsWith("{")) {
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          const match = content.match(/\{[\s\S]*\}/);
+          if (match) {
+            try { parsed = JSON.parse(match[0]); } catch { /* leave null */ }
+          }
+        }
+      }
+
+      // Cost estimate from token usage if reported. Falls back to a
+      // conservative envelope estimate based on input length.
+      const usage = json?.usage || {};
+      const inputTokens = usage.prompt_tokens || Math.ceil((body.user || "").length / 4);
+      const outputTokens = usage.completion_tokens || 200;
+      const cost_usd_estimated = estimateOpenAIChatCost(model, inputTokens, outputTokens);
+
+      return { content, parsed, raw: json, cost_usd_estimated, model };
+    }
   }
 
   function estimateOpenAIImageCost(size = "1024x1024", quality = "medium") {
@@ -8834,8 +8920,35 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
     return tier * sizeMult;
   }
 
+  // v4.39: per-model chat pricing per 1k tokens (input / output).
+  // Verify at openai.com/api/pricing/. Defaults to gpt-4o rates if unknown.
+  // Reads at runtime so a user with access to gpt-5/4.1 can flip the
+  // AI_AUTHOR_MODEL constant + add a pricing entry without touching the
+  // call sites.
+  const CHAT_PRICING_PER_1K = {
+    "gpt-4o":      { in: 0.0025, out: 0.01 },
+    "gpt-4o-mini": { in: 0.00015, out: 0.0006 },
+    "gpt-4.1":     { in: 0.002,  out: 0.008 },     // approximate; verify
+    "gpt-4-turbo": { in: 0.01,   out: 0.03 },
+    "gpt-5":       { in: 0.005,  out: 0.02 },      // placeholder; verify when available
+    "gpt-5.5":     { in: 0.007,  out: 0.025 },     // placeholder; user-mentioned model
+  };
+  function estimateOpenAIChatCost(model, inputTokens, outputTokens) {
+    const rate = CHAT_PRICING_PER_1K[model] || CHAT_PRICING_PER_1K["gpt-4o"];
+    return (inputTokens / 1000) * rate.in + (outputTokens / 1000) * rate.out;
+  }
+
+  // v4.39: Default model for the AI authoring layer. Change this constant
+  // to flip the entire AI authoring layer to a newer model when one
+  // becomes available in the user's account. Empirically validated for
+  // structured-JSON outputs as of 2026-05-19.
+  const AI_AUTHOR_MODEL = "gpt-4o";
+
   NS.OpenAIClient = OpenAIClient;
   NS.estimateOpenAIImageCost = estimateOpenAIImageCost;
+  NS.estimateOpenAIChatCost = estimateOpenAIChatCost;
+  NS.AI_AUTHOR_MODEL = AI_AUTHOR_MODEL;
+  NS.CHAT_PRICING_PER_1K = CHAT_PRICING_PER_1K;
 })();
 
 })();
@@ -11854,6 +11967,182 @@ When the director gives you a story, scene, or beat-list, return ONE
 JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.buildProducerPromptText = buildProducerPromptText;
+
+  // ─── v4.39: AI authoring orchestrator ─────────────────────────────────
+  //
+  // Wraps openaiClient.chatCompletion with the right system prompt + project
+  // context for two modes:
+  //   - mode = "fill_empties"   → propose values for empty/thin textual
+  //     fields on the shot (focal_point, description, emotional_beat,
+  //     audio.ambient, watch_points, director_note, cast_in_frame[*].action,
+  //     cast_in_frame[*].delivery_note)
+  //   - mode = "fix_issue:<kind>" → propose a structured fix for one
+  //     v4.38 validator issue. Currently handles choreography_overload and
+  //     camera_style_conflict (the LLM-driven fixes; the other two are
+  //     rule-driven and don't call this orchestrator).
+  //
+  // Returns: { proposals: [{ field, current, proposed, rationale }], cost_usd, model }
+  //
+  // Always returns proposals as an array — the UI shows them in a preview
+  // modal with per-field Apply / Reject toggles. No silent persistence.
+  async function aiAuthorShot(shot, ctx, mode) {
+    if (!State.openai) {
+      throw new Error("aiAuthorShot: OpenAI client not configured. Set the OpenAI API key in Connection settings.");
+    }
+    if (!shot) throw new Error("aiAuthorShot: shot is required");
+    if (!mode) throw new Error("aiAuthorShot: mode is required");
+
+    const { project, characters, environments } = ctx || {};
+    const projCtx = {
+      display_name: project?.display_name || "",
+      medium: project?.medium || "live_action",
+      style_canon: project?.style_canon || "",
+      world_rules: project?.world_rules || [],
+      theme: project?.theme || "",
+      visual_rule: project?.visual_rule || "",
+      audience: project?.audience || "",
+    };
+    const castInBible = (characters || []).map(c => ({
+      id: c.id,
+      display_name: c.display_name,
+      archetype: c.identity?.archetype,
+      distinctive_features: c.physical?.distinctive_features?.slice(0, 4),
+      arc_belief: c.arc?.false_belief,
+      never: c.never?.slice(0, 3),
+    }));
+    const envsInBible = (environments || []).map(e => ({
+      id: e.id,
+      display_name: e.display_name,
+      architecture_type: e.architecture?.type,
+      lighting_primary: e.lighting?.primary_source,
+      palette: e.palette?.slice(0, 4),
+      props: e.props?.slice(0, 4),
+    }));
+
+    const shotSummary = {
+      id: shot.id,
+      display_name: shot.display_name,
+      shot_number: shot.shot_number,
+      duration_seconds: shot.timecode?.duration_seconds,
+      the_moment: shot.the_moment || {},
+      camera: shot.camera || {},
+      audio: { ambient: shot.audio?.ambient, score_cue: shot.audio?.score_cue },
+      location_id: shot.location?.location_id,
+      cast_in_frame: shot.cast_in_frame || [],
+      voiceover: shot.voiceover || [],
+      director_note: shot.director_note,
+      watch_points: shot.watch_points || [],
+    };
+
+    let system, user;
+    if (mode === "fill_empties") {
+      system = "You are an experienced film director's AI authoring assistant. " +
+        "Given a shot's current state, a project's style canon + world rules + bible, " +
+        "propose values for any EMPTY or THIN textual fields. Stay in the project's voice. " +
+        "Do NOT propose values for fields that already have meaningful content. " +
+        "Return ONLY a JSON object with this exact shape: " +
+        `{"proposals":[{"field":"the_moment.focal_point","current":"...","proposed":"...","rationale":"one-line why"}]}` +
+        " Field paths use dot notation (e.g., 'the_moment.focal_point', 'audio.ambient', " +
+        "'cast_in_frame[0].action', 'watch_points[0]'). Only include fields you're proposing CHANGES for. " +
+        "Limit proposals to 8 to keep the preview manageable.";
+      user = JSON.stringify({
+        project: projCtx,
+        cast_bible: castInBible,
+        env_bible: envsInBible,
+        shot: shotSummary,
+        instruction: "Fill empty/thin textual fields. Skip fields that already have meaningful content.",
+      });
+    } else if (mode.startsWith("fix_issue:")) {
+      const kind = mode.slice("fix_issue:".length);
+      if (kind === "choreography_overload") {
+        system = "You are an experienced film director. The user's shot has too many discrete action verbs in 6 seconds — Seedance will collapse or drop moves. " +
+          "Propose ONE of: (a) rewrite the_moment.focal_point to keep only the 2-3 most cinematic verbs, or (b) split this shot into two by proposing focal_point for the SECOND shot too. " +
+          "Return ONLY a JSON object: " +
+          `{"proposals":[{"field":"the_moment.focal_point","current":"...","proposed":"...","rationale":"..."}]} ` +
+          "Stay in the project's tone.";
+      } else if (kind === "camera_style_conflict") {
+        system = "You are an experienced film director. The shot's camera.movement conflicts with the project's style_canon. " +
+          "Propose an alternative camera.movement that achieves the SAME emotional intent but respects the canon. " +
+          "Return ONLY a JSON object: " +
+          `{"proposals":[{"field":"camera.movement","current":"...","proposed":"...","rationale":"..."}]}`;
+      } else {
+        throw new Error(`aiAuthorShot: unknown fix_issue kind "${kind}" (rule-driven kinds shouldn't call this orchestrator)`);
+      }
+      user = JSON.stringify({
+        project: projCtx,
+        shot: shotSummary,
+        issue_kind: kind,
+        instruction: "Propose a structured fix. Return JSON only.",
+      });
+    } else {
+      throw new Error(`aiAuthorShot: unknown mode "${mode}"`);
+    }
+
+    const result = await State.openai.chatCompletion({
+      system,
+      user,
+      response_format: { type: "json_object" },
+      temperature: 0.4,
+      max_tokens: 1200,
+    });
+    const proposals = Array.isArray(result.parsed?.proposals) ? result.parsed.proposals : [];
+    // Guard: drop proposals where current === proposed (no change).
+    const filtered = proposals.filter(p => p && p.field && p.proposed && p.current !== p.proposed);
+    return {
+      proposals: filtered,
+      cost_usd: result.cost_usd_estimated || 0,
+      model: result.model,
+    };
+  }
+  NS.aiAuthorShot = aiAuthorShot;
+
+  // v4.39: AI-pick a voice from the user's ElevenLabs library by matching
+  // against the character's voice.seedance_native_direction description.
+  // Used by the in-app voice-ID modal as a "Auto-pick" affordance.
+  async function aiAutoPickVoiceForCharacter(character, voices) {
+    if (!State.openai) {
+      throw new Error("aiAutoPickVoiceForCharacter: OpenAI client not configured");
+    }
+    if (!character) throw new Error("character required");
+    if (!Array.isArray(voices) || voices.length === 0) {
+      throw new Error("voices array required (call eleven.listVoices() first)");
+    }
+    const description = character?.voice?.seedance_native_direction
+                     || character?.voice?.description
+                     || character?.identity?.archetype
+                     || character?.display_name;
+    // Compact voice library payload — only fields the model needs to discriminate
+    const voiceCatalog = voices.slice(0, 100).map(v => ({
+      voice_id: v.voice_id,
+      name: v.name,
+      labels: v.labels || {},
+      description: (v.description || "").slice(0, 200),
+    }));
+    const system = "You are a casting director. Given a character's voice description and a list of available ElevenLabs voices, " +
+      "pick the BEST single match. Return ONLY a JSON object: " +
+      `{"voice_id":"<id>","name":"<voice name>","reason":"one-line why"}`;
+    const user = JSON.stringify({
+      character: { display_name: character.display_name, voice_description: description },
+      voices: voiceCatalog,
+    });
+    const result = await State.openai.chatCompletion({
+      system,
+      user,
+      response_format: { type: "json_object" },
+      temperature: 0.2,
+      max_tokens: 200,
+    });
+    const pick = result.parsed;
+    if (!pick?.voice_id) {
+      throw new Error("LLM didn't return a voice_id");
+    }
+    // Sanity: verify the picked voice_id exists in the catalog
+    if (!voices.some(v => v.voice_id === pick.voice_id)) {
+      throw new Error(`LLM picked an unknown voice_id "${pick.voice_id}" — falling back to manual entry`);
+    }
+    return { ...pick, cost_usd: result.cost_usd_estimated || 0 };
+  }
+  NS.aiAutoPickVoiceForCharacter = aiAutoPickVoiceForCharacter;
 
   // Modal: render the Producer prompt with the live bible baked in + a copy
   // button. Toolbar entry point on the Storyboard screen.
@@ -15779,6 +16068,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
           <span class="elx-shot-ctx__mode">${esc(shot.generation?.mode || "auto")}</span>
           ${verbProse ? `<span class="elx-shot-ctx__verb"><em>${esc(verbProse)}</em></span>` : ""}
           ${moment.focal_point ? `<div class="elx-shot-ctx__focal">${esc(moment.focal_point)}</div>` : ""}
+          <button data-action="ai-author-shot" data-shot-id="${esc(shot.id)}"
+                  title="Ask AI to fill empty/thin textual fields on this shot (focal_point, description, emotional_beat, audio.ambient, watch_points, director_note, cast actions/delivery_notes). Preview proposals before they're applied."
+                  style="position:absolute; top:6px; right:108px;
+                         background:transparent; color:#c9a25a; border:1px solid #c9a25a;
+                         padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">✨ Author with AI</button>
           <button data-action="edit-shot" data-shot-id="${esc(shot.id)}"
                   title="Edit shot bible (moment, camera, dialogue, voiceover, references, duration override)"
                   style="position:absolute; top:6px; right:6px;
@@ -15923,26 +16217,15 @@ JSON object only. No commentary. No fences. No trailing text.`;
             thumbEl.replaceWith(vid);
           });
         }
-        // Approve button — captures rating + optional reason at the moment
-        // of approval. The rating feeds the future AI Producer's learning
-        // loop: "what does the director actually like?"
+        // v4.39: Approve button — in-app modal replaces the native prompt()
+        // pair (rating + optional note). 5-star clickable widget + optional
+        // note textarea consolidated into ONE modal. User can click a star
+        // to set rating + optionally type a note + click Apply.
         tEl.querySelector(".take__btn--approve")?.addEventListener("click", async (e) => {
           e.stopPropagation();
-          const ratingRaw = prompt(
-            "Rate this take 1-5 (★):\n\n" +
-            "5 = perfect, ship it\n" +
-            "4 = great, minor nits\n" +
-            "3 = usable but could improve\n" +
-            "2 = approved for now, plan to re-roll\n" +
-            "1 = bare minimum, definitely re-roll",
-            "5"
-          );
-          if (ratingRaw === null) return; // user cancelled
-          const rating = Math.max(1, Math.min(5, parseInt(ratingRaw, 10) || 3));
-          let note = "";
-          if (rating <= 3) {
-            note = (prompt("What's not perfect? (optional)") || "").trim();
-          }
+          const result = await openTakeRatingModal({ shotNumber: shot.shot_number });
+          if (!result) return;  // user cancelled
+          const { rating, note } = result;
           for (const x of (shot.takes || [])) {
             if (x.id === t.id) {
               x.status = "approved";
@@ -15964,13 +16247,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
           e.stopPropagation();
           handleGenerateVoiceOverlay(shotId, t.id);
         });
-        // Reject button — prompt for reason
+        // v4.39: Reject button — in-app modal replaces native prompt(). Textarea
+        // + preset reason chips (click chip to populate; type to override).
         tEl.querySelector(".take__btn--reject")?.addEventListener("click", async (e) => {
           e.stopPropagation();
-          const reason = prompt(
-            "Why is this take rejected?\n\nCommon reasons: identity drift, wrong action, audio issue, framing off, motion glitch, prop missing",
-            t.rejection_reason || ""
-          );
+          const reason = await openTakeRejectModal({ currentReason: t.rejection_reason || "" });
           if (reason === null) return;
           const target = shot.takes.find(x => x.id === t.id);
           if (target) {
@@ -17287,34 +17568,41 @@ JSON object only. No commentary. No fences. No trailing text.`;
           voiceId = voEntry?.voice_id || voiceId;
         }
         if (!voiceId || voiceId === "TBD" || voiceId === "") {
-          // For multi-line shots with a missing voice ID, ask once and
-          // recurse (same UX as v4.36 single-line). The user only sees
-          // the prompt for the FIRST line that misses an ID; once they
-          // paste, the loop restarts and tries again.
-          const enteredVoiceId = prompt(
-            `${speakerDisplay}'s voice ID isn't set ${isNarrator ? "for this voiceover" : "in the cast bible (voice.elevenlabs_fallback.voice_id)"}.\n\nPaste an ElevenLabs voice ID to use:`,
-            ""
-          );
-          if (!enteredVoiceId) {
-            setGPS(false);
-            State.activeJobs--;
-            return;
+          // v4.39: in-app voice-picker modal replaces the native prompt().
+          // Pulls the user's ElevenLabs voice library + exposes an "AI
+          // auto-pick" affordance that matches the character's bible
+          // description against the library via GPT. Manual paste is
+          // available behind a disclosure for edge cases.
+          setGPS(false);
+          State.activeJobs--;
+          let voices = [];
+          try {
+            const listed = await State.eleven.listVoices();
+            voices = Array.isArray(listed?.voices) ? listed.voices : (Array.isArray(listed) ? listed : []);
+          } catch (err) {
+            console.warn("[v4.39 voice picker] listVoices failed:", err);
+            // Continue with empty voices; user can still paste manually
           }
+          const picked = await openVoiceIdPickerModal({
+            character: isNarrator ? null : character,
+            voices,
+            speakerDisplay,
+          });
+          if (!picked) return;
+          const trimmed = picked.trim();
           if (isNarrator) {
             shot.voiceover = (shot.voiceover || []).map(v =>
               (v.speaker_id || "narrator") === line.speakerId
-                ? { ...v, voice_id: enteredVoiceId.trim() }
+                ? { ...v, voice_id: trimmed }
                 : v
             );
             await Storage.put("shots", shot);
           } else if (character) {
             character.voice = character.voice || {};
             character.voice.elevenlabs_fallback = character.voice.elevenlabs_fallback || {};
-            character.voice.elevenlabs_fallback.voice_id = enteredVoiceId.trim();
+            character.voice.elevenlabs_fallback.voice_id = trimmed;
             await Storage.put("characters", character);
           }
-          setGPS(false);
-          State.activeJobs--;
           return handleGenerateVoiceOverlay(shotId, takeId);
         }
 
@@ -18246,6 +18534,267 @@ JSON object only. No commentary. No fences. No trailing text.`;
     });
   }
 
+  // ─── v4.39 in-app modal helpers (replace native prompt() modals) ──────
+  //
+  // Three modals replace the four pre-v4.39 native prompt() calls:
+  //   - openTakeRatingModal: 5-star widget + optional note (consolidates the
+  //     v4.36 "rating prompt → optional note prompt" two-step into one)
+  //   - openTakeRejectModal: textarea + preset reason chips
+  //   - openVoiceIdPickerModal: ElevenLabs voice library dropdown +
+  //     AI auto-pick affordance + manual entry (used from handleGenerateVoiceOverlay)
+  //
+  // Each returns a Promise that resolves to the user's choice (or null on
+  // cancel). The promise pattern mirrors what `await prompt(...)` returned,
+  // so call sites swap with minimal change.
+
+  function openTakeRatingModal({ shotNumber }) {
+    return new Promise((resolve) => {
+      const root = document.createElement("div");
+      root.style.cssText = `position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9600;
+        display: flex; align-items: center; justify-content: center; backdrop-filter: blur(6px);`;
+      const shotLabel = shotNumber != null ? `S${String(shotNumber).padStart(2,"0")}` : "this shot";
+      root.innerHTML = `
+        <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px; padding:24px 28px;
+                    max-width:480px; width:92%; font-family:Inter, system-ui, sans-serif; color:#e8e8ee;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
+          <h2 style="margin:0 0 6px; font-size:17px; font-weight:600;">★ Approve this take</h2>
+          <p style="margin:0 0 18px; font-size:12.5px; color:#9a9aab; line-height:1.5;">
+            Rate ${esc(shotLabel)}'s take. The rating feeds the AI Producer's "what does the director like?" loop.
+          </p>
+          <div id="elx-rating-stars" style="display:flex; gap:6px; justify-content:center; margin:0 0 6px; font-size:34px; cursor:pointer; user-select:none;">
+            ${[1,2,3,4,5].map(n => `<span class="elx-rating-star" data-rating="${n}" style="color:#404050; transition:color .12s; line-height:1;">★</span>`).join("")}
+          </div>
+          <div id="elx-rating-label" style="text-align:center; font-size:11.5px; color:#9a9aab; min-height:18px; margin-bottom:14px;">Click a star to rate</div>
+          <div id="elx-rating-note-wrap" style="display:none; margin-bottom:14px;">
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:4px; letter-spacing:0.04em; text-transform:uppercase;">What's not perfect? (optional)</label>
+            <textarea id="elx-rating-note" rows="3" placeholder="Identity drifted on Lionn / motion paused mid-clip / framing off…"
+                      style="width:100%; background:#0a0a0c; color:#e8e8ee; border:1px solid #2a2a35;
+                             border-radius:6px; padding:8px 10px; font-size:12.5px; resize:vertical;
+                             font-family:Inter, system-ui, sans-serif; box-sizing:border-box;"></textarea>
+          </div>
+          <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <button id="elx-rating-cancel" type="button"
+                    style="padding:8px 14px; background:transparent; color:#9a9aab; border:1px solid #2a2a35;
+                           border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+            <button id="elx-rating-apply" type="button" disabled
+                    style="padding:8px 16px; background:#c9a25a; color:#0a0a0c; border:none;
+                           border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; opacity:0.4;">
+              Apply rating
+            </button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(root);
+      let rating = 0;
+      const stars = root.querySelectorAll(".elx-rating-star");
+      const labelEl = root.querySelector("#elx-rating-label");
+      const noteWrap = root.querySelector("#elx-rating-note-wrap");
+      const applyBtn = root.querySelector("#elx-rating-apply");
+      const labels = {
+        1: "1 ★ — bare minimum, definitely re-roll",
+        2: "2 ★ — approved for now, plan to re-roll",
+        3: "3 ★ — usable but could improve",
+        4: "4 ★ — great, minor nits",
+        5: "5 ★ — perfect, ship it",
+      };
+      stars.forEach(starEl => {
+        const n = parseInt(starEl.dataset.rating, 10);
+        starEl.addEventListener("mouseenter", () => {
+          stars.forEach(s => {
+            s.style.color = parseInt(s.dataset.rating, 10) <= n ? "#c9a25a" : "#404050";
+          });
+        });
+        starEl.addEventListener("click", () => {
+          rating = n;
+          stars.forEach(s => {
+            s.style.color = parseInt(s.dataset.rating, 10) <= n ? "#c9a25a" : "#404050";
+          });
+          labelEl.textContent = labels[n];
+          labelEl.style.color = n >= 4 ? "#4ade80" : (n === 3 ? "#e8e8ee" : "#fbbf24");
+          // Surface the note textarea for low ratings (≤3) where context helps the learning loop
+          noteWrap.style.display = n <= 3 ? "block" : "none";
+          applyBtn.disabled = false;
+          applyBtn.style.opacity = "1";
+        });
+      });
+      root.querySelector("#elx-rating-stars").addEventListener("mouseleave", () => {
+        // Re-apply the locked rating after hover-out
+        stars.forEach(s => {
+          s.style.color = (rating > 0 && parseInt(s.dataset.rating, 10) <= rating) ? "#c9a25a" : "#404050";
+        });
+      });
+      const close = (value) => { root.remove(); resolve(value); };
+      root.querySelector("#elx-rating-cancel").addEventListener("click", () => close(null));
+      root.addEventListener("click", (e) => { if (e.target === root) close(null); });
+      applyBtn.addEventListener("click", () => {
+        if (rating === 0) return;
+        const note = root.querySelector("#elx-rating-note")?.value || "";
+        close({ rating, note: note.trim() });
+      });
+    });
+  }
+  NS.openTakeRatingModal = openTakeRatingModal;
+
+  function openTakeRejectModal({ currentReason = "" } = {}) {
+    return new Promise((resolve) => {
+      const root = document.createElement("div");
+      root.style.cssText = `position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9600;
+        display: flex; align-items: center; justify-content: center; backdrop-filter: blur(6px);`;
+      const presets = [
+        "identity drift",
+        "audio issue",
+        "framing off",
+        "motion glitch",
+        "prop missing",
+        "wrong action",
+        "style break",
+      ];
+      root.innerHTML = `
+        <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px; padding:24px 28px;
+                    max-width:520px; width:92%; font-family:Inter, system-ui, sans-serif; color:#e8e8ee;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
+          <h2 style="margin:0 0 6px; font-size:17px; font-weight:600;">✗ Reject take</h2>
+          <p style="margin:0 0 14px; font-size:12.5px; color:#9a9aab; line-height:1.5;">
+            Capture the reason so the next roll has signal. Click a preset chip to populate, or type your own.
+          </p>
+          <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px;">
+            ${presets.map(p => `<button type="button" class="elx-reject-chip" data-text="${esc(p)}"
+              style="background:transparent; color:#c0c0ce; border:1px solid #2a2a35; padding:4px 10px;
+                     border-radius:14px; font-size:11px; cursor:pointer;">${esc(p)}</button>`).join("")}
+          </div>
+          <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:4px; letter-spacing:0.04em; text-transform:uppercase;">Reason</label>
+          <textarea id="elx-reject-text" rows="3" placeholder="What went wrong with this take?"
+                    style="width:100%; background:#0a0a0c; color:#e8e8ee; border:1px solid #2a2a35;
+                           border-radius:6px; padding:8px 10px; font-size:12.5px; resize:vertical;
+                           font-family:Inter, system-ui, sans-serif; box-sizing:border-box;">${esc(currentReason)}</textarea>
+          <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
+            <button id="elx-reject-cancel" type="button"
+                    style="padding:8px 14px; background:transparent; color:#9a9aab; border:1px solid #2a2a35;
+                           border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+            <button id="elx-reject-apply" type="button"
+                    style="padding:8px 16px; background:#f87171; color:#0a0a0c; border:none;
+                           border-radius:6px; font-size:12px; font-weight:600; cursor:pointer;">
+              Reject take
+            </button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(root);
+      const textarea = root.querySelector("#elx-reject-text");
+      root.querySelectorAll(".elx-reject-chip").forEach(chip => {
+        chip.addEventListener("click", () => {
+          const cur = textarea.value.trim();
+          textarea.value = cur ? `${cur}, ${chip.dataset.text}` : chip.dataset.text;
+          textarea.focus();
+        });
+      });
+      const close = (value) => { root.remove(); resolve(value); };
+      root.querySelector("#elx-reject-cancel").addEventListener("click", () => close(null));
+      root.addEventListener("click", (e) => { if (e.target === root) close(null); });
+      root.querySelector("#elx-reject-apply").addEventListener("click", () => {
+        close(textarea.value || "");
+      });
+    });
+  }
+  NS.openTakeRejectModal = openTakeRejectModal;
+
+  // v4.39: voice-ID picker. Replaces the prompt() that asked the user to
+  // paste a raw voice_id. Shows a dropdown of the user's ElevenLabs library
+  // + an "AI auto-pick" button that calls aiAutoPickVoiceForCharacter to
+  // match the character's voice description against the library.
+  function openVoiceIdPickerModal({ character, voices, speakerDisplay }) {
+    return new Promise((resolve) => {
+      const root = document.createElement("div");
+      root.style.cssText = `position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 9600;
+        display: flex; align-items: center; justify-content: center; backdrop-filter: blur(6px);`;
+      const charDesc = character?.voice?.seedance_native_direction
+                    || character?.voice?.description
+                    || character?.identity?.archetype
+                    || "";
+      // Limit the dropdown to the first 50 voices for UI sanity (search is deferred to v4.40)
+      const voiceList = (Array.isArray(voices) ? voices : []).slice(0, 50);
+      root.innerHTML = `
+        <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px; padding:24px 28px;
+                    max-width:560px; width:92%; font-family:Inter, system-ui, sans-serif; color:#e8e8ee;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
+          <h2 style="margin:0 0 6px; font-size:17px; font-weight:600;">🎙 Pick a voice for ${esc(speakerDisplay || "this character")}</h2>
+          ${charDesc ? `<p style="margin:0 0 14px; font-size:12px; color:#9a9aab; line-height:1.5;">
+            Bible description: <em style="color:#c0c0ce;">${esc(charDesc.slice(0, 240))}</em>
+          </p>` : `<p style="margin:0 0 14px; font-size:12px; color:#9a9aab;">No description in cast bible. Pick manually or paste an ID.</p>`}
+          <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:4px; letter-spacing:0.04em; text-transform:uppercase;">Voice library (${voiceList.length} ${voices?.length > 50 ? "of " + voices.length + ", showing first 50" : ""})</label>
+          <select id="elx-voice-select" style="width:100%; background:#0a0a0c; color:#e8e8ee; border:1px solid #2a2a35;
+                       border-radius:6px; padding:8px 10px; font-size:12.5px; font-family:Inter, system-ui, sans-serif;
+                       margin-bottom:12px;">
+            <option value="">— Select a voice —</option>
+            ${voiceList.map(v => `<option value="${esc(v.voice_id)}">${esc(v.name || v.voice_id)}${v.labels?.gender ? ` · ${esc(v.labels.gender)}` : ""}${v.labels?.accent ? ` · ${esc(v.labels.accent)}` : ""}</option>`).join("")}
+          </select>
+          <div style="display:flex; gap:6px; align-items:center; margin-bottom:12px; flex-wrap:wrap;">
+            <button id="elx-voice-autopick" type="button"
+                    style="background:#14141a; color:#c9a25a; border:1px solid #c9a25a; padding:6px 12px;
+                           border-radius:5px; font-size:11.5px; cursor:pointer;">
+              ✨ AI auto-pick from bible description
+            </button>
+            <span id="elx-voice-autopick-status" style="font-size:11px; color:#9a9aab;"></span>
+          </div>
+          <details style="margin-bottom:12px;">
+            <summary style="cursor:pointer; font-size:11px; color:#9a9aab; user-select:none;">⚙ Paste a voice ID manually</summary>
+            <input id="elx-voice-manual" type="text" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM"
+                   style="width:100%; background:#0a0a0c; color:#e8e8ee; border:1px solid #2a2a35;
+                          border-radius:6px; padding:8px 10px; font-size:12.5px; margin-top:6px;
+                          font-family:'JetBrains Mono', monospace; box-sizing:border-box;">
+          </details>
+          <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <button id="elx-voice-cancel" type="button"
+                    style="padding:8px 14px; background:transparent; color:#9a9aab; border:1px solid #2a2a35;
+                           border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+            <button id="elx-voice-apply" type="button"
+                    style="padding:8px 16px; background:#c9a25a; color:#0a0a0c; border:none;
+                           border-radius:6px; font-size:12px; font-weight:600; cursor:pointer;">Use this voice</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(root);
+      const close = (value) => { root.remove(); resolve(value); };
+      const select = root.querySelector("#elx-voice-select");
+      const manual = root.querySelector("#elx-voice-manual");
+      const autoBtn = root.querySelector("#elx-voice-autopick");
+      const autoStatus = root.querySelector("#elx-voice-autopick-status");
+      autoBtn.addEventListener("click", async () => {
+        if (!character) {
+          autoStatus.textContent = "No character record — pick manually.";
+          autoStatus.style.color = "#f87171";
+          return;
+        }
+        autoStatus.textContent = "Asking GPT to match…";
+        autoStatus.style.color = "#9a9aab";
+        autoBtn.disabled = true;
+        try {
+          const pick = await aiAutoPickVoiceForCharacter(character, voices || []);
+          select.value = pick.voice_id;
+          autoStatus.innerHTML = `✓ Picked <strong>${esc(pick.name || pick.voice_id)}</strong> — ${esc(pick.reason || "no reason")}`;
+          autoStatus.style.color = "#4ade80";
+        } catch (err) {
+          autoStatus.textContent = `Auto-pick failed: ${err.message}`;
+          autoStatus.style.color = "#f87171";
+        } finally {
+          autoBtn.disabled = false;
+        }
+      });
+      root.querySelector("#elx-voice-cancel").addEventListener("click", () => close(null));
+      root.addEventListener("click", (e) => { if (e.target === root) close(null); });
+      root.querySelector("#elx-voice-apply").addEventListener("click", () => {
+        const picked = (manual?.value || "").trim() || select.value;
+        if (!picked) {
+          autoStatus.textContent = "Pick a voice from the dropdown, auto-pick, or paste an ID.";
+          autoStatus.style.color = "#fbbf24";
+          return;
+        }
+        close(picked);
+      });
+    });
+  }
+  NS.openVoiceIdPickerModal = openVoiceIdPickerModal;
+
   // ─── Lightbox: tap a thumb in a cast card to view it full-size ─────
   function openLightbox(srcDataUrl, title) {
     const lb = document.createElement("div");
@@ -18347,6 +18896,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
     else if (action === "delete-candidate")    handleDeleteCandidate(target.dataset.shotId, target.dataset.slot, target.dataset.candidateId);
     else if (action === "clear-unapproved-candidates") handleClearUnapprovedCandidates(target.dataset.shotId, target.dataset.slot);
     else if (action === "toggle-state-change") handleToggleStateChange(target.dataset.shotId, target.checked);
+    else if (action === "suggest-fix")        handleSuggestFix(target.dataset.shotId, target.dataset.issueKind);
+    else if (action === "ai-author-shot")     handleAIAuthorShot(target.dataset.shotId);
     else if (action === "finish-play-all")    playSequenceFromIdx(0);
     else if (action === "finish-pause") {
       $("#elx-finish-video")?.pause();
@@ -18727,6 +19278,295 @@ JSON object only. No commentary. No fences. No trailing text.`;
     }
   }
   NS.rerunAuthoringQualityValidatorsAllShots = rerunAuthoringQualityValidatorsAllShots;
+
+  // ─── v4.39: per-issue fix strategies ──────────────────────────────────
+  //
+  // Registry mapping issue kind → strategy. Each strategy is a function:
+  //   (shot, issue, ctx) => Promise<{ proposals: [{field, current, proposed, rationale}], cost_usd?: number }>
+  //
+  // Two flavors:
+  //   - Rule-driven: synchronous, no LLM call. focal_unsupported_by_cast
+  //     reuses pickThematicEntityForShot; location_drift just repoints
+  //     location_id to the env named in prose.
+  //   - LLM-driven: delegates to aiAuthorShot for prose rewrites
+  //     (choreography_overload, camera_style_conflict).
+  //
+  // The UI calls strategy(...) → opens openFixPreviewModal with the
+  // proposals → on Apply, writes the proposed values back to the shot.
+  // Critical: NO silent persistence. Every change shows preview first.
+
+  const SUGGEST_FIX_STRATEGIES = {
+    focal_unsupported_by_cast: async (shot, issue, ctx) => {
+      // The validator's issue.detail is [{ character_id, display_name }].
+      // Propose adding each missing character to cast_in_frame with a
+      // role_in_shot inferred from focal verb (default "observing" — the
+      // safest assumption when we can't tell the actual role from prose).
+      const missing = Array.isArray(issue.detail) ? issue.detail : [];
+      if (missing.length === 0) {
+        return { proposals: [], cost_usd: 0 };
+      }
+      const current = JSON.stringify(shot.cast_in_frame || [], null, 2);
+      const proposedCast = [
+        ...(shot.cast_in_frame || []),
+        ...missing.map(m => ({
+          character_id: m.character_id,
+          role_in_shot: "observing",  // safe default; user can edit
+          action: "",
+        })),
+      ];
+      const proposed = JSON.stringify(proposedCast, null, 2);
+      return {
+        proposals: [{
+          field: "cast_in_frame",
+          current,
+          proposed,
+          rationale: `Add ${missing.map(m => m.display_name).join(" + ")} to cast_in_frame so the composer can layer Identity Locks. Default role_in_shot="observing" — edit if they should be speaking or have an explicit action.`,
+        }],
+        cost_usd: 0,
+      };
+    },
+    location_drift: async (shot, issue, ctx) => {
+      const proseLoc = issue?.detail?.prose_location;
+      if (!proseLoc?.id) return { proposals: [], cost_usd: 0 };
+      return {
+        proposals: [{
+          field: "location.location_id",
+          current: shot?.location?.location_id || "(none)",
+          proposed: proseLoc.id,
+          rationale: `Prose names "${proseLoc.display_name}" — repoint location_id so [Environment] block matches.`,
+        }],
+        cost_usd: 0,
+      };
+    },
+    choreography_overload: async (shot, issue, ctx) => {
+      const result = await aiAuthorShot(shot, ctx, "fix_issue:choreography_overload");
+      return { proposals: result.proposals || [], cost_usd: result.cost_usd || 0 };
+    },
+    camera_style_conflict: async (shot, issue, ctx) => {
+      const result = await aiAuthorShot(shot, ctx, "fix_issue:camera_style_conflict");
+      return { proposals: result.proposals || [], cost_usd: result.cost_usd || 0 };
+    },
+  };
+  NS.SUGGEST_FIX_STRATEGIES = SUGGEST_FIX_STRATEGIES;
+
+  // v4.39: preview modal that shows the proposed-vs-current diff for a
+  // fix (or for an Author-with-AI batch). User clicks Apply per proposal
+  // or Apply All. Returns a Promise resolving to the accepted proposals
+  // array (only the ones user clicked Apply on).
+  function openFixPreviewModal({ title, subtitle, proposals, cost_usd }) {
+    return new Promise((resolve) => {
+      if (!Array.isArray(proposals) || proposals.length === 0) {
+        toast("No proposals to preview.", { tone: "warn" });
+        resolve([]);
+        return;
+      }
+      const root = document.createElement("div");
+      root.style.cssText = `position: fixed; inset: 0; background: rgba(0,0,0,0.78); z-index: 9600;
+        display: flex; align-items: center; justify-content: center; backdrop-filter: blur(6px); padding: 24px;`;
+      const renderProposal = (p, idx) => `
+        <div class="elx-prop" data-idx="${idx}" style="border:1px solid #2a2a35; border-radius:8px; padding:12px 14px; margin-bottom:10px; background:#0e0e12;">
+          <div style="display:flex; align-items:baseline; justify-content:space-between; gap:10px;">
+            <code style="color:#c9a25a; font-size:11px; font-family:'JetBrains Mono', monospace;">${esc(p.field)}</code>
+            <label style="display:flex; align-items:center; gap:5px; font-size:11px; color:#9a9aab; cursor:pointer; user-select:none;">
+              <input type="checkbox" class="elx-prop-accept" checked style="width:13px; height:13px; cursor:pointer;">
+              Accept
+            </label>
+          </div>
+          ${p.rationale ? `<div style="font-size:11px; color:#9a9aab; line-height:1.5; margin:6px 0 8px;">${esc(p.rationale)}</div>` : ""}
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; font-size:11px;">
+            <div>
+              <div style="color:#f87171; margin-bottom:2px; font-size:10px; letter-spacing:0.04em; text-transform:uppercase;">Current</div>
+              <pre style="background:#0a0a0c; color:#c0c0ce; padding:6px 8px; border:1px solid #2a2a35; border-radius:4px; font-family:'JetBrains Mono', monospace; font-size:10.5px; white-space:pre-wrap; word-break:break-word; max-height:160px; overflow:auto; margin:0;">${esc(String(p.current ?? "(empty)"))}</pre>
+            </div>
+            <div>
+              <div style="color:#4ade80; margin-bottom:2px; font-size:10px; letter-spacing:0.04em; text-transform:uppercase;">Proposed</div>
+              <pre style="background:#0a0a0c; color:#e8e8ee; padding:6px 8px; border:1px solid #4ade80; border-radius:4px; font-family:'JetBrains Mono', monospace; font-size:10.5px; white-space:pre-wrap; word-break:break-word; max-height:160px; overflow:auto; margin:0;">${esc(String(p.proposed ?? "(empty)"))}</pre>
+            </div>
+          </div>
+        </div>
+      `;
+      root.innerHTML = `
+        <div style="background:#14141a; border:1px solid #2a2a35; border-radius:12px; padding:20px 24px;
+                    max-width:760px; width:96%; max-height:90vh; overflow:auto;
+                    font-family:Inter, system-ui, sans-serif; color:#e8e8ee;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.6);">
+          <div style="display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:6px;">
+            <h2 style="margin:0; font-size:16px; font-weight:600;">${esc(title || "Preview proposed changes")}</h2>
+            <span style="font-size:11px; color:#9a9aab;">${proposals.length} proposal${proposals.length === 1 ? "" : "s"}${cost_usd ? ` · ${fmtUsd(cost_usd)} AI cost` : ""}</span>
+          </div>
+          ${subtitle ? `<p style="margin:0 0 14px; font-size:12px; color:#9a9aab; line-height:1.5;">${esc(subtitle)}</p>` : `<div style="margin-bottom:14px;"></div>`}
+          <div id="elx-fix-list">${proposals.map(renderProposal).join("")}</div>
+          <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:8px;">
+            <button id="elx-fix-cancel" type="button"
+                    style="padding:8px 14px; background:transparent; color:#9a9aab; border:1px solid #2a2a35;
+                           border-radius:6px; font-size:12px; cursor:pointer;">Cancel</button>
+            <button id="elx-fix-apply" type="button"
+                    style="padding:8px 16px; background:#4ade80; color:#0a0a0c; border:none;
+                           border-radius:6px; font-size:12px; font-weight:600; cursor:pointer;">Apply selected</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(root);
+      const close = (value) => { root.remove(); resolve(value); };
+      root.querySelector("#elx-fix-cancel").addEventListener("click", () => close([]));
+      root.addEventListener("click", (e) => { if (e.target === root) close([]); });
+      root.querySelector("#elx-fix-apply").addEventListener("click", () => {
+        const acceptEls = root.querySelectorAll(".elx-prop-accept");
+        const accepted = [];
+        acceptEls.forEach((cb, idx) => {
+          if (cb.checked && proposals[idx]) accepted.push(proposals[idx]);
+        });
+        close(accepted);
+      });
+    });
+  }
+  NS.openFixPreviewModal = openFixPreviewModal;
+
+  // Apply a single accepted proposal to a shot by writing the proposed value
+  // at the proposal's dot-path. Handles dot notation (foo.bar) and array
+  // index (foo[0].bar). Returns true on success, false if the path is
+  // unhandled or the proposed value can't be parsed.
+  function _setShotFieldByPath(shot, path, proposedRaw) {
+    // The proposed string for object/array fields will be a JSON string;
+    // for scalar fields it's the literal scalar value.
+    let proposed = proposedRaw;
+    if (typeof proposedRaw === "string") {
+      const trimmed = proposedRaw.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try { proposed = JSON.parse(trimmed); } catch { /* keep as string */ }
+      }
+    }
+    // Resolve the dot path. Build the parent object if any segment is missing.
+    const parts = path.split(/\.(?![^[]*\])/);  // split on '.' but not inside brackets
+    let cur = shot;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const p = parts[i];
+      if (!cur[p] || typeof cur[p] !== "object") cur[p] = {};
+      cur = cur[p];
+    }
+    cur[parts[parts.length - 1]] = proposed;
+    return true;
+  }
+
+  // Apply user-accepted proposals to a shot + persist.
+  async function applyAcceptedProposals(shotId, accepted) {
+    if (!accepted || accepted.length === 0) return 0;
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) return 0;
+    let applied = 0;
+    for (const p of accepted) {
+      if (_setShotFieldByPath(shot, p.field, p.proposed)) applied++;
+    }
+    await Storage.put("shots", shot);
+    // Re-run authoring validators so fixed issues drop off the list
+    try {
+      const characters = await Storage.getAll("characters");
+      const environments = await Storage.getAll("environments");
+      const project = await Storage.Projects.getActive();
+      const newIssues = runAuthoringQualityValidators(shot, { characters, environments, project });
+      shot._validation = shot._validation || {};
+      const v438Kinds = new Set([
+        "focal_unsupported_by_cast", "location_drift",
+        "choreography_overload", "camera_style_conflict",
+      ]);
+      shot._validation.issues = (shot._validation.issues || []).filter(i => !v438Kinds.has(i.kind));
+      shot._validation.issues.push(...newIssues);
+      shot._validation.schema_version = "v4.38";
+      await Storage.put("shots", shot);
+    } catch (err) {
+      console.warn("[v4.39 apply proposals] re-validation failed:", err);
+    }
+    return applied;
+  }
+  NS.applyAcceptedProposals = applyAcceptedProposals;
+
+  async function handleSuggestFix(shotId, issueKind) {
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) return;
+    const issue = (shot._validation?.issues || []).find(i => i.kind === issueKind);
+    if (!issue) {
+      toast(`No "${issueKind}" issue found on this shot.`, { tone: "warn" });
+      return;
+    }
+    const strategy = SUGGEST_FIX_STRATEGIES[issueKind];
+    if (!strategy) {
+      toast(`No fix strategy registered for "${issueKind}".`, { tone: "warn" });
+      return;
+    }
+    setGPS(true, `Generating fix proposal for ${issueKind}…`, "rule + LLM hybrid", 30);
+    try {
+      const characters = await Storage.getAll("characters");
+      const environments = await Storage.getAll("environments");
+      const project = await Storage.Projects.getActive();
+      const ctx = { characters, environments, project };
+      const result = await strategy(shot, issue, ctx);
+      setGPS(false);
+      if (!result?.proposals || result.proposals.length === 0) {
+        toast(`Couldn't generate a fix for "${issueKind}".`, { tone: "warn" });
+        return;
+      }
+      const accepted = await openFixPreviewModal({
+        title: `Suggest fix: ${issueKind}`,
+        subtitle: describeShotIssue(issue),
+        proposals: result.proposals,
+        cost_usd: result.cost_usd,
+      });
+      if (accepted.length === 0) return;  // user cancelled or rejected all
+      const n = await applyAcceptedProposals(shotId, accepted);
+      if (result.cost_usd) await trackCost(result.cost_usd, `AI fix ${issueKind} ${shotId}`);
+      toast(`Applied ${n} fix${n === 1 ? "" : "es"} to ${shot.display_name || shotId}`);
+      if (State.activeShotId === shotId) renderShotEditor(shotId);
+      renderStoryboard();
+    } catch (err) {
+      console.error("[v4.39 suggest-fix]", err);
+      setGPS(false);
+      toast(`Fix proposal failed: ${err.message}`, { tone: "err", duration: 7000 });
+    }
+  }
+  NS.handleSuggestFix = handleSuggestFix;
+
+  // v4.39 Part C: "Author with AI" — call aiAuthorShot in "fill_empties"
+  // mode and show the proposals in a preview modal. User picks which
+  // empty fields to fill. Same preview/Apply pattern as suggest-fix.
+  async function handleAIAuthorShot(shotId) {
+    if (!State.openai) {
+      toast("Add your OpenAI API key in Connection first.", { tone: "warn" });
+      showConnectionPanel();
+      return;
+    }
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) return;
+    setGPS(true, `Asking AI to fill empty fields…`, `${NS.AI_AUTHOR_MODEL || "gpt-4o"} · fill_empties`, 30);
+    try {
+      const characters = await Storage.getAll("characters");
+      const environments = await Storage.getAll("environments");
+      const project = await Storage.Projects.getActive();
+      const ctx = { characters, environments, project };
+      const result = await aiAuthorShot(shot, ctx, "fill_empties");
+      setGPS(false);
+      if (!result?.proposals || result.proposals.length === 0) {
+        toast("AI found no empty/thin fields to fill on this shot.", { duration: 3500 });
+        return;
+      }
+      const accepted = await openFixPreviewModal({
+        title: `✨ Author with AI — ${shot.display_name || shotId}`,
+        subtitle: `GPT proposed ${result.proposals.length} field${result.proposals.length === 1 ? "" : "s"}. Accept the ones you like; reject the rest. Approved values are written to the shot's bible (you can edit further afterwards).`,
+        proposals: result.proposals,
+        cost_usd: result.cost_usd,
+      });
+      if (accepted.length === 0) return;
+      const n = await applyAcceptedProposals(shotId, accepted);
+      if (result.cost_usd) await trackCost(result.cost_usd, `AI author ${shotId}`);
+      toast(`Applied ${n} AI proposal${n === 1 ? "" : "s"} to ${shot.display_name || shotId}`);
+      if (State.activeShotId === shotId) renderShotEditor(shotId);
+      renderStoryboard();
+    } catch (err) {
+      console.error("[v4.39 AI author]", err);
+      setGPS(false);
+      toast(`AI author failed: ${err.message}`, { tone: "err", duration: 7000 });
+    }
+  }
+  NS.handleAIAuthorShot = handleAIAuthorShot;
   function shotHasCriticalIssues(shot) {
     return (shot?._validation?.issues || []).some(i => CRITICAL_VALIDATION_KINDS.has(i.kind));
   }
@@ -19442,11 +20282,28 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const soft     = issues.filter(i => !CRITICAL_VALIDATION_KINDS.has(i.kind));
     const dur = shot.timecode?.duration_seconds || 8;
     const costEstimate = (dur * 0.30) + (resolvedMode === "image_to_video" && !shot.keyframes?.startDataUrl ? 0.05 : 0);
+    // v4.39: each issue gets a "✨ Suggest fix" button when a fix strategy
+    // is registered for its kind. Rule-driven fixes (focal_unsupported_by_cast,
+    // location_drift) are synchronous + no API call. LLM-driven fixes
+    // (choreography_overload, camera_style_conflict) call aiAuthorShot.
+    // Both show a preview modal with Apply / Reject before persisting.
+    const _v439FixableKinds = NS.SUGGEST_FIX_STRATEGIES ? Object.keys(NS.SUGGEST_FIX_STRATEGIES) : [];
+    const renderIssueLi = (i) => {
+      const text = esc(describeShotIssue(i));
+      const fixable = _v439FixableKinds.includes(i.kind);
+      const fixBtn = fixable
+        ? ` <button type="button" data-action="suggest-fix" data-shot-id="${esc(shot.id)}" data-issue-kind="${esc(i.kind)}"
+                    style="background:transparent; color:#c9a25a; border:1px solid #c9a25a; padding:1px 8px; border-radius:10px; font-size:10px; cursor:pointer; margin-left:6px; font-family:Inter, system-ui, sans-serif;">
+                ✨ Suggest fix
+              </button>`
+        : "";
+      return `<li style="margin-bottom:4px;">${text}${fixBtn}</li>`;
+    };
     const issuesBlock = critical.length + soft.length > 0
       ? `<div style="margin:0 0 10px; padding:10px 12px; background:#1a1014; border:1px solid ${critical.length ? "#8a3a30" : "#6a4a25"}; border-radius:6px; font-size:11px; line-height:1.5; color:${critical.length ? "#f8a890" : "#e4a980"};">
            <div style="font-weight:600; margin-bottom:4px;">${critical.length > 0 ? `⛔ ${critical.length} CRITICAL issue${critical.length > 1 ? "s" : ""} — Roll is blocked until fixed:` : `⚠ ${soft.length} soft issue${soft.length > 1 ? "s" : ""} (will roll, but take may drift):`}</div>
            <ul style="margin:0; padding-left:18px;">
-             ${[...critical, ...soft].map(i => `<li>${esc(describeShotIssue(i))}</li>`).join("")}
+             ${[...critical, ...soft].map(renderIssueLi).join("")}
            </ul>
          </div>`
       : "";
