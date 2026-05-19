@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="1d94f18baf7b" data-build-time="2026-05-19T19:16:39.694Z">
+<meta name="elevenx-build" content="52870b7a2554" data-build-time="2026-05-19T19:24:07.581Z">
 <script>
 (function(){
-  var info = { hash: "1d94f18baf7b", time: "2026-05-19T19:16:39.694Z" };
+  var info = { hash: "52870b7a2554", time: "2026-05-19T19:24:07.581Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 1d94f18baf7b @ 2026-05-19T19:16:39.694Z -->
+<!-- elevenx-build: 52870b7a2554 @ 2026-05-19T19:24:07.581Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -18497,7 +18497,236 @@ JSON object only. No commentary. No fences. No trailing text.`;
     "missing_focal",         // composeSeedance produces empty body
     "i2v_orphan",            // i2v with no inheritance + no manual keyframe path
     "references_unresolved", // v4.14: shot.references[] points at non-existent rows
+    // v4.38 authoring-quality rules are all SOFT (warning, not block).
+    // They flag intent mismatches a human reviewer would catch — but a
+    // user might intentionally ignore (e.g., a character is mentioned in
+    // the prose but deliberately off-frame). Surface them in the Shot
+    // Doctor + Spec rail; do NOT block Roll.
   ]);
+
+  // ─── v4.38: authoring-quality validator rules ──────────────────────────
+  //
+  // User audit (2026-05-19) caught four classes of authoring intent
+  // mismatch via a shot-by-shot read of the composed prompts. Each is
+  // detectable programmatically; each gets a soft validator rule. The
+  // rules run during import (alongside rules 1-12 in the import loop)
+  // AND during a boot-time re-validation pass for existing shots (so
+  // the user's already-imported Lionn shots get flagged retroactively).
+
+  // Escape a string for safe use inside a RegExp character class.
+  function _escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+  // Rule 12: focal_unsupported_by_cast.
+  // Detects: focal_point or description names a character from the bible,
+  // but that character is NOT in shot.cast_in_frame. The user audit caught
+  // S02 where focal said "Lionn crouches behind broken stone…" but the
+  // Characters block said "No characters in close focus this shot — only
+  // background figures." Without the cast entry, the composer can't add
+  // an Identity Lock for that character — Seedance leans entirely on the
+  // anchor frame for identity (fragile).
+  function validateFocalSupportedByCast(shot, { characters }) {
+    if (!Array.isArray(characters)) return null;
+    const text = [shot?.the_moment?.focal_point, shot?.the_moment?.description]
+      .filter(Boolean).join(" ").toLowerCase();
+    if (!text || text.length < 5) return null;
+    const namedInFrame = new Set(
+      (shot?.cast_in_frame || [])
+        .map(c => (typeof c === "string" ? c : c?.character_id))
+        .filter(Boolean)
+    );
+    const missing = [];
+    for (const c of characters) {
+      if (!c?.display_name || !c?.id) continue;
+      const re = new RegExp(`\\b${_escapeRegex(c.display_name.toLowerCase())}\\b`, "i");
+      if (re.test(text) && !namedInFrame.has(c.id)) {
+        missing.push({ character_id: c.id, display_name: c.display_name });
+      }
+    }
+    if (missing.length === 0) return null;
+    return { kind: "focal_unsupported_by_cast", detail: missing };
+  }
+  NS.validateFocalSupportedByCast = validateFocalSupportedByCast;
+
+  // Rule 13: location_drift.
+  // Detects: focal/description names a SINGLE environment from the bible
+  // that differs from shot.location.location_id. User audit caught S09
+  // where focal said "shadowed figure stands before the sealed Lion
+  // Throne… huge throne room reverb" but location_id was "Shadow Gate".
+  // We only flag when EXACTLY one env is named in prose — if multiple
+  // are mentioned, it's a transition shot and ambiguous.
+  function validateLocationDrift(shot, { environments }) {
+    if (!Array.isArray(environments)) return null;
+    const text = [shot?.the_moment?.focal_point, shot?.the_moment?.description]
+      .filter(Boolean).join(" ").toLowerCase();
+    if (!text || text.length < 5) return null;
+    const locId = shot?.location?.location_id;
+    const namedInProse = [];
+    for (const e of environments) {
+      if (!e?.display_name || !e?.id) continue;
+      const re = new RegExp(`\\b${_escapeRegex(e.display_name.toLowerCase())}\\b`, "i");
+      if (re.test(text)) namedInProse.push({ id: e.id, display_name: e.display_name });
+    }
+    if (namedInProse.length !== 1) return null;
+    if (namedInProse[0].id === locId) return null;
+    return {
+      kind: "location_drift",
+      detail: { prose_location: namedInProse[0], bound_location_id: locId },
+    };
+  }
+  NS.validateLocationDrift = validateLocationDrift;
+
+  // Rule 14: choreography_overload.
+  // Detects: focal_point describes 4+ distinct action verbs (sprint, leap,
+  // claw, climb…). User audit caught S05 ("sprint a gap, leap, claw onto
+  // a wall, plus violet afterimages") and S07 ("dash, evade, blade-scrape,
+  // counter-slash") violating the project's own world_rule "Do not ask
+  // for complex multi-step choreography in one shot." 4 was chosen as the
+  // threshold so action shots with 2-3 verbs (the typical sprint+leap or
+  // dodge+counter) don't false-positive.
+  const _VERB_STEM_GROUPS = [
+    ["sprint", "sprints", "sprinting"],
+    ["leap", "leaps", "leaping", "leapt"],
+    ["claw", "claws", "clawing", "clawed"],
+    ["climb", "climbs", "climbing", "climbed"],
+    ["run", "runs", "running"],
+    ["jump", "jumps", "jumping", "jumped"],
+    ["dodge", "dodges", "dodging", "dodged"],
+    ["slide", "slides", "sliding", "slid"],
+    ["dash", "dashes", "dashing", "dashed"],
+    ["evade", "evades", "evading", "evaded"],
+    ["slash", "slashes", "slashing", "slashed"],
+    ["strike", "strikes", "striking", "struck"],
+    ["swing", "swings", "swinging", "swung"],
+    ["throw", "throws", "throwing", "threw"],
+    ["catch", "catches", "catching", "caught"],
+    ["dive", "dives", "diving", "dove"],
+    ["roll", "rolls", "rolling", "rolled"],
+    ["twist", "twists", "twisting", "twisted"],
+    ["spin", "spins", "spinning", "spun"],
+    ["lunge", "lunges", "lunging", "lunged"],
+    ["kick", "kicks", "kicking", "kicked"],
+    ["punch", "punches", "punching", "punched"],
+    ["block", "blocks", "blocking", "blocked"],
+    ["parry", "parries", "parrying", "parried"],
+    ["counter", "counters", "countering", "countered"],
+    ["snap", "snaps", "snapping", "snapped"],
+    ["lift", "lifts", "lifting", "lifted"],
+    ["drop", "drops", "dropping", "dropped"],
+    ["scrape", "scrapes", "scraping", "scraped"],
+    ["cling", "clings", "clinging", "clung"],
+    ["grip", "grips", "gripping", "gripped"],
+    ["pull", "pulls", "pulling", "pulled"],
+    ["push", "pushes", "pushing", "pushed"],
+  ];
+  const _VERB_STEM_MAP = {};
+  for (const group of _VERB_STEM_GROUPS) {
+    for (const v of group) _VERB_STEM_MAP[v] = group[0];
+  }
+  function validateChoreographyOverload(shot) {
+    const focal = String(shot?.the_moment?.focal_point || "");
+    if (!focal || focal.length < 5) return null;
+    const stems = new Set();
+    for (const w of (focal.toLowerCase().match(/\b[a-z]+\b/g) || [])) {
+      if (_VERB_STEM_MAP[w]) stems.add(_VERB_STEM_MAP[w]);
+    }
+    if (stems.size < 4) return null;
+    return { kind: "choreography_overload", detail: { verbsFound: [...stems], count: stems.size } };
+  }
+  NS.validateChoreographyOverload = validateChoreographyOverload;
+
+  // Rule 15: camera_style_conflict.
+  // Detects: shot.camera.movement contradicts a negation pattern in
+  // project.style_canon. User audit caught S04 where camera.movement was
+  // "handheld" but style_canon says "no live-action handheld unless
+  // explicitly directed." The model has to reconcile — author intent is
+  // ambiguous from the prompt alone.
+  function validateCameraStyleConflict(shot, { project }) {
+    const movement = String(shot?.camera?.movement || "").trim().toLowerCase();
+    if (!movement || movement === "locked") return null;
+    const canon = String(project?.style_canon || "").toLowerCase();
+    if (!canon) return null;
+    // Tokenize the movement string into individual keywords (e.g., "handheld
+    // tracking" → ["handheld", "tracking"]); skip short connectors.
+    const movementKeywords = movement.split(/[\s,]+/).filter(w => w.length >= 4);
+    const conflicts = [];
+    for (const kw of movementKeywords) {
+      // Negation patterns. Each looks for a negator followed by the keyword
+      // within the SAME sentence (up to the next ".").
+      const patterns = [
+        new RegExp(`\\bno\\b[^.]*\\b${_escapeRegex(kw)}\\b`, "i"),
+        new RegExp(`\\bnever\\b[^.]*\\b${_escapeRegex(kw)}\\b`, "i"),
+        new RegExp(`\\bwithout\\b[^.]*\\b${_escapeRegex(kw)}\\b`, "i"),
+        new RegExp(`\\bdo not\\b[^.]*\\b${_escapeRegex(kw)}\\b`, "i"),
+      ];
+      for (const re of patterns) {
+        const m = canon.match(re);
+        if (m) {
+          conflicts.push({ camera_keyword: kw, canon_excerpt: m[0].slice(0, 120) });
+          break;
+        }
+      }
+    }
+    if (conflicts.length === 0) return null;
+    return { kind: "camera_style_conflict", detail: { movement, conflicts } };
+  }
+  NS.validateCameraStyleConflict = validateCameraStyleConflict;
+
+  // Run all v4.38 authoring-quality rules against a shot. Returns the
+  // array of triggered issues (possibly empty). Pure function — no
+  // side effects, no Storage calls.
+  function runAuthoringQualityValidators(shot, ctx) {
+    const out = [];
+    for (const rule of [
+      () => validateFocalSupportedByCast(shot, ctx),
+      () => validateLocationDrift(shot, ctx),
+      () => validateChoreographyOverload(shot, ctx),
+      () => validateCameraStyleConflict(shot, ctx),
+    ]) {
+      const issue = rule();
+      if (issue) out.push(issue);
+    }
+    return out;
+  }
+  NS.runAuthoringQualityValidators = runAuthoringQualityValidators;
+
+  // Boot-time re-validation pass. Runs the authoring-quality rules
+  // (and re-runs the live preflight) against every existing shot,
+  // appending any new issues to _validation.issues. Idempotent — won't
+  // duplicate issues that already exist with the same {kind, detail}
+  // shape. Tagged with v4.38 so future bumps know the pass ran.
+  async function rerunAuthoringQualityValidatorsAllShots() {
+    try {
+      const characters = await Storage.getAll("characters");
+      const environments = await Storage.getAll("environments");
+      const project = await Storage.Projects.getActive();
+      const ctx = { characters, environments, project };
+      const shots = await Storage.getAll("shots");
+      let added = 0;
+      for (const shot of shots) {
+        // Skip if this shot has already been re-validated by v4.38+
+        if (shot?._validation?.schema_version === "v4.38") continue;
+        const newIssues = runAuthoringQualityValidators(shot, ctx);
+        shot._validation = shot._validation || { issues: [] };
+        shot._validation.issues = shot._validation.issues || [];
+        // Drop any prior v4.38-class issues so we don't duplicate
+        const v438Kinds = new Set([
+          "focal_unsupported_by_cast",
+          "location_drift",
+          "choreography_overload",
+          "camera_style_conflict",
+        ]);
+        shot._validation.issues = shot._validation.issues.filter(i => !v438Kinds.has(i.kind));
+        shot._validation.issues.push(...newIssues);
+        shot._validation.schema_version = "v4.38";
+        added += newIssues.length;
+        await Storage.put("shots", shot);
+      }
+      console.log(`[v4.38] re-validated ${shots.length} shot(s); added ${added} authoring-quality issue(s)`);
+    } catch (err) {
+      console.warn("[v4.38] re-validation pass failed:", err);
+    }
+  }
+  NS.rerunAuthoringQualityValidatorsAllShots = rerunAuthoringQualityValidatorsAllShots;
   function shotHasCriticalIssues(shot) {
     return (shot?._validation?.issues || []).some(i => CRITICAL_VALIDATION_KINDS.has(i.kind));
   }
@@ -18584,6 +18813,25 @@ JSON object only. No commentary. No fences. No trailing text.`;
           return "the_moment.description is thin (<30 chars) AND no verb / emotional_beat — keyframe generator will fall back to focal_point or shot title. Fill description (preferred) or verb+beat.";
         }
         return "the_moment fields all empty (no description, verb, or emotional_beat) — keyframe generator has no scene signal beyond focal_point/display_name. Author at least description.";
+      // v4.38: authoring-quality rules (soft warnings; do not block roll)
+      case "focal_unsupported_by_cast": {
+        const names = (issue.detail || []).map(d => d.display_name).join(", ");
+        return `focal_point/description names character(s) [${names}] that are NOT in cast_in_frame. Composer skips Identity Locks for them; Seedance leans entirely on the anchor frame for identity. Either add to cast_in_frame, or confirm they're intentionally just MENTIONED (not on-screen).`;
+      }
+      case "location_drift": {
+        const prose = issue.detail?.prose_location?.display_name || "?";
+        const bound = issue.detail?.bound_location_id || "(none)";
+        return `prose mentions location "${prose}" but shot.location.location_id is "${bound}". The composer's [Environment] block will use the bound location, but the prompt body will narrate the prose one — Seedance has to reconcile. Repoint location_id or rewrite the prose.`;
+      }
+      case "choreography_overload": {
+        const verbs = (issue.detail?.verbsFound || []).join(", ");
+        return `focal_point describes ${issue.detail?.count || 0} distinct action verbs [${verbs}] in a single shot. Project world_rules typically discourage 4+ discrete moves in 6s (Seedance collapses or drops moves on rolls). Split across two shots, or anchor the result via a state-change end frame.`;
+      }
+      case "camera_style_conflict": {
+        const movement = issue.detail?.movement || "?";
+        const excerpt = issue.detail?.conflicts?.[0]?.canon_excerpt || "";
+        return `camera.movement "${movement}" conflicts with style_canon ("${excerpt}…"). Seedance has to reconcile two opposing directives. Either align the movement to the canon or amend the canon to explicitly allow this shot's movement.`;
+      }
       default:
         return issue.kind;
     }
@@ -21764,6 +22012,19 @@ JSON object only. No commentary. No fences. No trailing text.`;
       }
     } catch (err) {
       console.error("[v4.14 integrity] migration failed:", err);
+    }
+
+    // v4.38: re-run authoring-quality validators against existing shots.
+    // The four new rules (focal_unsupported_by_cast, location_drift,
+    // choreography_overload, camera_style_conflict) need to fire on
+    // shots that were imported BEFORE v4.38 shipped — otherwise the
+    // user's pre-existing Lionn shots (audited 2026-05-19) wouldn't
+    // surface the new findings. The pass is idempotent (skips shots
+    // already tagged _validation.schema_version === "v4.38").
+    try {
+      await rerunAuthoringQualityValidatorsAllShots();
+    } catch (err) {
+      console.warn("[v4.38 re-validation] failed:", err);
     }
 
     // Adapt each screen's DOM (replace static mockup content with live containers)
