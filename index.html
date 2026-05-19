@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="d146ab1c64e8" data-build-time="2026-05-19T20:15:15.068Z">
+<meta name="elevenx-build" content="319eb69f3157" data-build-time="2026-05-19T21:55:43.249Z">
 <script>
 (function(){
-  var info = { hash: "d146ab1c64e8", time: "2026-05-19T20:15:15.068Z" };
+  var info = { hash: "319eb69f3157", time: "2026-05-19T21:55:43.249Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: d146ab1c64e8 @ 2026-05-19T20:15:15.068Z -->
+<!-- elevenx-build: 319eb69f3157 @ 2026-05-19T21:55:43.249Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6270,9 +6270,19 @@ class FalClient {
    * Seedream v4.5 edit. Touch up an existing image without re-rolling
    * identity — critical for cast bible refinement (fix earring, change
    * shirt color) without losing the face.
+   *
+   * v4.40: `image_size` is now plumbed through. Without it Seedream's edit
+   * endpoint defaults to ~1:1 regardless of input aspect, producing square
+   * keyframes that mismatch Seedance's 16:9 video output. Accepts either
+   * a named preset string (`square_hd`, `landscape_16_9`, `portrait_16_9`,
+   * `landscape_4_3`, `portrait_4_3`) or a `{ width, height }` object per
+   * fal docs.
+   *
    * @param {object} body
    * @param {string} body.prompt
    * @param {string[]} body.image_urls   — input images to edit
+   * @param {string|{width:number,height:number}} [body.image_size]
+   * @param {number} [body.num_images]
    * @param {number} [body.seed]
    */
   async seedreamEdit(body, opts = {}) {
@@ -9319,7 +9329,20 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // /v1/sound-generation and looped across the timeline at Exports; per-shot
   // sfx_events are layered on top. Replaces the v4.36 hybrid that asked
   // Seedance for per-shot SFX (which couldn't be made cross-shot consistent).
-  const DB_VER  = 5;
+  //
+  // v6: structural inputs from the 2026-05-19 shot-by-shot audit (v4.40):
+  //   - project.aspect (default "16:9") — drives Seedream image_size on
+  //     every keyframe edit so anchors match Seedance/Kling 16:9 video
+  //     output. Pre-v4.40 omitted aspect → square keyframes, visible
+  //     mid-clip style mismatch across every shot (Finding B).
+  //   - shot.shot_summary + shot.shot_summary_source — human-readable
+  //     one-sentence summary auto-gen'd via chatCompletion (Finding E).
+  //   - character.derived_refs[shot_id] — cross-shot identity chaining:
+  //     after a take is approved, the start-frame is persisted as a
+  //     derived reference; subsequent keyframe gens for the same
+  //     character prefer the derived ref over the cast bible ref so
+  //     facial identity stays stable shot-to-shot (Finding F).
+  const DB_VER  = 6;
 
   // The stores that get the project_id filter treatment.
   const PROJECT_SCOPED = ["characters", "environments", "assets", "shots", "takes", "conversations"];
@@ -9497,6 +9520,65 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             };
           }
         }
+        // v5 → v6: structural inputs from the 2026-05-19 shot-by-shot audit.
+        // Triple-fronted migration — projects get aspect; shots get
+        // shot_summary + audit_source; characters get derived_refs = {}.
+        //
+        // Idempotent: every assignment is guarded by `=== undefined` so a
+        // partial-state DB (e.g. a crash mid-migration on a prior version)
+        // doesn't double-write.
+        if (oldVersion < 6) {
+          // Projects: seed aspect = "16:9" on existing rows (matches the
+          // production assumption — all ElevenX films shipped 16:9 to date).
+          const projOs = txn.objectStore("projects");
+          const pcur = projOs.openCursor();
+          pcur.onsuccess = (ev) => {
+            const c = ev.target.result;
+            if (!c) return;
+            const row = c.value;
+            let dirty = false;
+            if (row.aspect === undefined) { row.aspect = "16:9"; dirty = true; }
+            if (dirty) c.update(row);
+            c.continue();
+          };
+          // Shots: seed shot_summary + shot_summary_source. Auto-gen happens
+          // lazily on the first save AFTER v4.40 deploys; empty string here
+          // just keeps reads non-null.
+          if (db.objectStoreNames.contains("shots")) {
+            const shOs = txn.objectStore("shots");
+            const scur = shOs.openCursor();
+            scur.onsuccess = (ev) => {
+              const c = ev.target.result;
+              if (!c) return;
+              const row = c.value;
+              let dirty = false;
+              if (row.shot_summary === undefined) { row.shot_summary = ""; dirty = true; }
+              if (row.shot_summary_source === undefined) { row.shot_summary_source = "auto"; dirty = true; }
+              if (dirty) c.update(row);
+              c.continue();
+            };
+          }
+          // Characters: seed derived_refs = {}. The cross-shot character
+          // chain (Finding F) writes into this map keyed by shot_id when
+          // a take ships; refUrlFor prefers the most-recent entry over the
+          // cast bible ref so identity stays stable across shots.
+          if (db.objectStoreNames.contains("characters")) {
+            const chOs = txn.objectStore("characters");
+            const ccur = chOs.openCursor();
+            ccur.onsuccess = (ev) => {
+              const c = ev.target.result;
+              if (!c) return;
+              const row = c.value;
+              let dirty = false;
+              if (!row.derived_refs || typeof row.derived_refs !== "object") {
+                row.derived_refs = {};
+                dirty = true;
+              }
+              if (dirty) c.update(row);
+              c.continue();
+            };
+          }
+        }
       };
 
       req.onsuccess = () => resolve(req.result);
@@ -9632,7 +9714,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
        *   - medium: "live_action" (most users start here; switch to animated_3d for Lionn)
        *   - default_shot_duration_seconds: 8 (a teaser-friendly mid-range)
        */
-      async create({ id, display_name, description, medium, logline, style_canon, default_shot_duration_seconds }) {
+      async create({ id, display_name, description, medium, logline, style_canon, default_shot_duration_seconds, aspect }) {
         const slug = id || display_name
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, "_")
@@ -9649,6 +9731,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           logline: logline || "",
           style_canon: style_canon || "",
           default_shot_duration_seconds: Number(default_shot_duration_seconds) || 8,
+          // v4.40 INPUT-1: default to 16:9 (the production assumption);
+          // the project edit modal lets users flip to 9:16, 1:1, 4:3, 3:4.
+          aspect: aspect || "16:9",
           is_seeded: false,
           created_at: new Date().toISOString().slice(0, 10),
         };
@@ -9677,6 +9762,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           // env wide, asset primary). Shape: { dataUrl, filename, byte_size,
           //   source: "user_upload", uploaded_at } or null to clear.
           "style_anchor",
+          // v4.40 INPUT-1: project-level aspect ratio. Drives Seedream
+          // image_size on every keyframe edit; values "16:9" (default) |
+          // "9:16" | "1:1" | "4:3" | "3:4".
+          "aspect",
+          // v4.37: cross-shot audio bed (the ambient bed prompt + cached
+          // audio). Listed here so the Projects.update path can patch them.
+          "ambient_bed", "ambient_bed_audio",
         ];
         const merged = { ...existing };
         for (const k of ALLOWED) {
@@ -9847,6 +9939,87 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // docs/deferred-bugs.md; until then Seedream is the keyframe default.
   const KEYFRAME_IMAGE_MODEL = "seedream";
 
+  // ─── v4.40 INPUT-1: aspect-ratio plumbing ────────────────────────────
+  //
+  // Structural root: the 3 seedreamEdit call sites (cast 3/4+full_body,
+  // env detail, keyframe gen via runIdentityAnchoredEdit) passed NO
+  // image_size to fal → Seedream defaulted to ~1:1. Seedance/Kling
+  // consumed those square anchors at aspect_ratio: "16:9" → systematic
+  // visual mismatch on every keyframe across every shot. Per the
+  // 2026-05-19 shot-by-shot audit (Finding B).
+  //
+  // Fix: explicit aspect string ("16:9" default) maps to a Seedream
+  // preset string for fal AND to a gpt-image-2 size string for OpenAI,
+  // so the same `aspect` value can flow through `runIdentityAnchoredEdit`
+  // regardless of which backend handles the call.
+  //
+  // Defaults to "16:9" because every project ElevenX has shipped to date
+  // (and the dream-state direction) is cinematic 16:9. Future-proofs for
+  // 9:16 (shorts) or 1:1 (insert) without code changes — the user just
+  // flips project.aspect.
+  const ASPECT_PRESETS = {
+    "16:9": { seedream: "landscape_16_9", gpt: "1792x1024" },
+    "9:16": { seedream: "portrait_16_9",  gpt: "1024x1792" },
+    "4:3":  { seedream: "landscape_4_3",  gpt: "1024x1024" }, // gpt has no native 4:3; falls back to square
+    "3:4":  { seedream: "portrait_4_3",   gpt: "1024x1024" },
+    "1:1":  { seedream: "square_hd",      gpt: "1024x1024" },
+  };
+  function aspectToSeedreamImageSize(aspect) {
+    return ASPECT_PRESETS[aspect]?.seedream || ASPECT_PRESETS["16:9"].seedream;
+  }
+  function aspectToGptSize(aspect) {
+    return ASPECT_PRESETS[aspect]?.gpt || ASPECT_PRESETS["16:9"].gpt;
+  }
+  NS.aspectToSeedreamImageSize = aspectToSeedreamImageSize;
+  NS.aspectToGptSize = aspectToGptSize;
+
+  // Resolve project.aspect with safe fallback. The v6 schema migration
+  // seeds existing projects to "16:9", but if a brand-new project is
+  // somehow missing the field we still want a sane default rather than
+  // a Seedream API error.
+  function resolveProjectAspect(project) {
+    const a = project?.aspect;
+    if (a && ASPECT_PRESETS[a]) return a;
+    return "16:9";
+  }
+  NS.resolveProjectAspect = resolveProjectAspect;
+
+  // v4.40 INPUT-2: project-level style anchor resolution (upload + auto-derive).
+  //
+  // Two-tier:
+  //   Tier 1 — user explicit upload: project.style_anchor.dataUrl with
+  //            source: "user_upload" (already an allowed patch field in
+  //            storage.js since v3.8).
+  //   Tier 2 — auto-derive fallback: when no upload exists AND the project
+  //            has at least one approved start-frame, the lowest-numbered
+  //            approved frame becomes the implicit style anchor. Provides
+  //            an "anchor as soon as you have anything" experience without
+  //            blocking shot 1.
+  //
+  // Returns: { dataUrl, source } | null. Always returns null on shot 1 of
+  // a fresh project (no upload, no approved frames yet) — first keyframe
+  // gen has nothing to anchor TO and that's fine; v4.35's character-ref
+  // anchor still drives identity.
+  async function resolveStyleAnchorForGen(project, shots = null) {
+    // Tier 1
+    const upload = project?.style_anchor;
+    if (upload?.dataUrl) {
+      return { dataUrl: upload.dataUrl, source: "user_upload" };
+    }
+    // Tier 2 — walk shots for the lowest-numbered approved start-frame
+    const allShots = shots || (await Storage.getAll("shots"));
+    const approvedStarts = [];
+    for (const s of allShots) {
+      const url = s?.keyframes?.start?.approved_dataUrl;
+      if (url) approvedStarts.push({ shot_number: s.shot_number || 0, dataUrl: url, source_shot_id: s.id });
+    }
+    if (approvedStarts.length === 0) return null;
+    approvedStarts.sort((a, b) => a.shot_number - b.shot_number);
+    const seed = approvedStarts[0];
+    return { dataUrl: seed.dataUrl, source: "auto_derived", derived_from_shot_id: seed.source_shot_id };
+  }
+  NS.resolveStyleAnchorForGen = resolveStyleAnchorForGen;
+
   // ─── Utilities ──────────────────────────────────────────────────────
   const $  = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -9978,7 +10151,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   NS.resolveExtraAssets = resolveExtraAssets;
 
   // Resolve a single ref URL for a character or environment given an
-  // angle/kind. Priority order (since v3 upload path — 2026-05-14):
+  // angle/kind. Priority order (v4.40 update):
+  //   0. derived_refs (characters only): latest approved start-frame from
+  //      a prior shot. Cross-shot identity chain (Finding F) — keeps faces
+  //      consistent across the film. Same image regardless of angleKey.
   //   1. user upload (sacred — survives re-rolls)
   //   2. active model's generated ref
   //   3. other model's generated ref (fallback)
@@ -9986,6 +10162,22 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // art; subsequent generation chains pick this up as the identity anchor
   // for derived angles (3/4 + full_body via the edit endpoint).
   function refUrlFor(asset, angleKey) {
+    if (!asset?.refs && !asset?.derived_refs) return null;
+    // v4.40 INPUT-3: prefer the LATEST derived_ref. The character
+    // chain runs whenever a take ships; the freshest entry has the
+    // highest source_shot_number. Empty / missing → fall through.
+    // Critical: derived_refs only exists on character entities (added
+    // in v6 migration). Envs and assets don't have them → falls
+    // through to bible refs naturally.
+    if (asset?.derived_refs && typeof asset.derived_refs === "object") {
+      const entries = Object.values(asset.derived_refs);
+      if (entries.length > 0) {
+        const latest = entries.reduce((a, b) =>
+          (b.source_shot_number || 0) > (a.source_shot_number || 0) ? b : a
+        );
+        if (latest?.dataUrl) return latest.dataUrl;
+      }
+    }
     if (!asset?.refs) return null;
     const primary = asset.chosenModel || ACTIVE_IMAGE_MODEL;
     const other   = primary === "seedream" ? "gpt" : "seedream";
@@ -11475,7 +11667,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   //
   // The fal/openai client APIs return slightly different shapes; this helper
   // normalizes them to { dataUrl, seed, costUsd }.
-  async function generateImageWithOptionalAnchor({ prompt, anchorDataUrl, size, modelKey, label }) {
+  //
+  // v4.40: `aspect` param ("16:9" | "9:16" | "1:1" | "4:3" | "3:4") plumbs
+  // through to BOTH backends. Without it Seedream defaulted to ~1:1
+  // (structural keyframe bug — square anchor feeding 16:9 video). The
+  // legacy `size` param remains for backwards compat with cast head_on
+  // (intentionally square portrait) and env wide (1536×1024).
+  async function generateImageWithOptionalAnchor({ prompt, anchorDataUrl, size, aspect, modelKey, label }) {
     const styleOnlyClause =
       "IMPORTANT: The input image is a STYLE REFERENCE ONLY. Do NOT copy any subjects, characters, " +
       "or composition from it. Generate a completely new image of the subject described above, " +
@@ -11487,7 +11685,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         const result = await State.openai.imageEdit({
           prompt: editPrompt,
           imageDataUrl: anchorDataUrl,
-          size: size || "1024x1024",
+          size: aspect ? aspectToGptSize(aspect) : (size || "1024x1024"),
           quality: "medium",
           n: 1,
         });
@@ -11495,11 +11693,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         if (!dataUrl) throw new Error(`${label || "edit"}: no image in OpenAI response`);
         return { dataUrl, seed: null, costUsd: result.cost_usd_estimated || 0.042 };
       } else {
-        const result = await State.fal.seedreamEdit({
+        const seedreamBody = {
           prompt: editPrompt,
           image_urls: [anchorDataUrl],
           num_images: 1,
-        });
+        };
+        if (aspect) seedreamBody.image_size = aspectToSeedreamImageSize(aspect);
+        const result = await State.fal.seedreamEdit(seedreamBody);
         const imgUrl = result?.images?.[0]?.url;
         if (!imgUrl) throw new Error(`${label || "edit"}: no image in Seedream response`);
         const blob = await fetch(imgUrl).then(r => r.blob());
@@ -11510,13 +11710,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // No anchor → fall back to text-to-image
     if (modelKey === "gpt") {
       const result = await State.openai.imageGenerate({
-        prompt, size: size || "1024x1024", quality: "medium", n: 1,
+        prompt, size: aspect ? aspectToGptSize(aspect) : (size || "1024x1024"), quality: "medium", n: 1,
       });
       const dataUrl = result?.images?.[0]?.dataUrl;
       if (!dataUrl) throw new Error(`${label || "gen"}: no image in OpenAI response`);
       return { dataUrl, seed: null, costUsd: result.cost_usd_estimated || 0.042 };
     } else {
-      const result = await State.fal.seedreamTextToImage({ prompt });
+      const t2iBody = { prompt };
+      if (aspect) t2iBody.image_size = aspectToSeedreamImageSize(aspect);
+      const result = await State.fal.seedreamTextToImage(t2iBody);
       const imgUrl = result?.images?.[0]?.url;
       if (!imgUrl) throw new Error(`${label || "gen"}: no image in Seedream response`);
       const blob = await fetch(imgUrl).then(r => r.blob());
@@ -11541,10 +11743,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   //
   // Returns one normalized `{ dataUrl, seed, modelLabel, costUsd }` so
   // callers can persist a candidate without knowing which engine fired.
-  async function runIdentityAnchoredEdit({ prompt, refDataUrl, seed, modelKey, label, compositionAnchorDataUrl }) {
+  async function runIdentityAnchoredEdit({ prompt, refDataUrl, seed, modelKey, label, compositionAnchorDataUrl, styleAnchorDataUrl, aspect }) {
     if (!prompt) throw new Error("runIdentityAnchoredEdit: prompt is required");
     if (!refDataUrl) throw new Error("runIdentityAnchoredEdit: refDataUrl is required");
     const key = modelKey || ACTIVE_IMAGE_MODEL;  // defaults to GPT post-A/B
+    // v4.40: aspect is plumbed through so keyframes inherit project.aspect
+    // (default "16:9"). Without this, Seedream defaulted to ~1:1 → keyframe
+    // mismatched the Seedance/Kling 16:9 video output (Finding B in the
+    // 2026-05-19 audit).
+    const aspectKey = (aspect && ASPECT_PRESETS[aspect]) ? aspect : "16:9";
     if (key === "gpt") {
       if (!State.openai) throw new Error(`${label || "edit"}: OpenAI client not configured. Set the OpenAI API key in Connection settings, or switch ACTIVE_IMAGE_MODEL to 'seedream'.`);
       // v4.36: OpenAI's imageEdit takes a single reference image. When a
@@ -11557,7 +11764,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       const result = await State.openai.imageEdit({
         prompt,
         imageDataUrl: gptAnchor,
-        size: "1024x1024",
+        size: aspectToGptSize(aspectKey),
         quality: "medium",
         n: 1,
       });
@@ -11579,13 +11786,25 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     // falClient.js:212) and blends multi-image guidance. The order matters:
     // putting the composition anchor FIRST emphasises camera/environment
     // continuity; refDataUrl (character portrait) reinforces identity.
-    const image_urls = compositionAnchorDataUrl
-      ? [compositionAnchorDataUrl, refDataUrl]
-      : [refDataUrl];
+    //
+    // v4.40 INPUT-2: when a styleAnchorDataUrl is provided (project-level
+    // style anchor — uploaded by user OR auto-derived from the first
+    // approved keyframe), append as a THIRD image_url. Seedream blends
+    // multi-image guidance with diminishing weight; the style anchor's
+    // contribution is palette/lighting/composition density (the "look"),
+    // explicitly NOT identity (the character ref carries that).
+    const image_urls = [];
+    if (compositionAnchorDataUrl) image_urls.push(compositionAnchorDataUrl);
+    image_urls.push(refDataUrl);
+    if (styleAnchorDataUrl) image_urls.push(styleAnchorDataUrl);
     const seedreamBody = {
       prompt,
       image_urls,
       num_images: 1,
+      // v4.40 INPUT-1: force project aspect on every keyframe edit. Was the
+      // structural root of Finding B (all square keyframes mid-2026-05-19
+      // audit).
+      image_size: aspectToSeedreamImageSize(aspectKey),
     };
     if (seed !== undefined && seed !== null) seedreamBody.seed = seed;
     const result = await State.fal.seedreamEdit(seedreamBody);
@@ -11967,6 +12186,92 @@ When the director gives you a story, scene, or beat-list, return ONE
 JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.buildProducerPromptText = buildProducerPromptText;
+
+  // ─── v4.40 COMPOSITION-2: auto-generated shot_summary ───────────────────
+  //
+  // Structural fix (Finding E): the storyboard surfaces only shot_number +
+  // display_name. To understand a shot's intent a director has to read
+  // 8+ fields (focal_point, description, emotional_beat, audio.ambient,
+  // cast_in_frame, location, camera.movement, watch_points). At-a-glance
+  // comprehension is impossible.
+  //
+  // generateShotSummary returns a single sentence ≤140 chars describing
+  // what the shot DOES at a story level. Auto-fired on shot save when
+  // `shot.shot_summary_source === "auto"` AND the existing summary is
+  // missing or stale (focal_point/description changed since the last gen).
+  //
+  // User can override: setting `shot.shot_summary_source = "manual"`
+  // pins the summary; auto-gen never overwrites a manual entry.
+  //
+  // Cost: ~$0.01 per call (gpt-4o, ~300 in / ~50 out tokens). Cheap
+  // enough to auto-chain on save per the v4.36 "cheap auto-chains" rule.
+  async function generateShotSummary(shot, ctx) {
+    if (!State.openai) return null;
+    if (!shot) return null;
+    const moment = shot.the_moment || {};
+    const focal = String(moment.focal_point || "").trim();
+    const description = String(moment.description || "").trim();
+    if (!focal && !description) return null;  // nothing to summarize
+    const { project } = ctx || {};
+    const projCtx = {
+      medium: project?.medium || "live_action",
+      style_canon: (project?.style_canon || "").slice(0, 300),
+    };
+    const shotCtx = {
+      display_name: shot.display_name,
+      shot_number: shot.shot_number,
+      duration_seconds: shot.timecode?.duration_seconds,
+      focal_point: focal,
+      description: description.slice(0, 400),
+      emotional_beat: moment.emotional_beat || "",
+      verb: moment.verb || "",
+      cast_in_frame: (shot.cast_in_frame || []).map(c => typeof c === "string" ? c : c?.character_id),
+    };
+    const system = "You write one-sentence shot summaries for a film director's storyboard. " +
+      "Read the shot's focal_point + description + emotional_beat + cast and emit a SINGLE sentence " +
+      "(≤140 characters, plain text, no markdown, no quotes around the whole sentence) describing " +
+      "WHAT THIS SHOT DOES at a story level. Focus on the dramatic beat — not technical fields like " +
+      "camera or duration. Stay in the project's tone. Return ONLY a JSON object: " +
+      `{"summary":"..."}`;
+    const user = JSON.stringify({ project: projCtx, shot: shotCtx });
+    try {
+      const result = await State.openai.chatCompletion({
+        system,
+        user,
+        response_format: { type: "json_object" },
+        temperature: 0.5,
+        max_tokens: 200,
+      });
+      let summary = String(result.parsed?.summary || "").trim();
+      if (!summary) return null;
+      // Hard cap at 140 chars (with ellipsis if exceeded).
+      if (summary.length > 140) summary = summary.slice(0, 137).replace(/[\s,;:.]+$/, "") + "…";
+      return { summary, cost_usd: result.cost_usd_estimated || 0.01 };
+    } catch (err) {
+      console.warn("[v4.40 shot summary gen]", err.message);
+      return null;
+    }
+  }
+  NS.generateShotSummary = generateShotSummary;
+
+  // Lazy fill helper: if shot.shot_summary is empty AND source==="auto" AND
+  // we have content to summarize, generate + persist. No-op otherwise.
+  // Used by applyAcceptedProposals AND the boot-time pass.
+  async function maybeRefreshShotSummary(shotId, ctx) {
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) return null;
+    if (shot.shot_summary_source === "manual") return null;
+    if (shot.shot_summary && shot.shot_summary.trim().length > 0) return null;
+    const gen = await generateShotSummary(shot, ctx);
+    if (!gen?.summary) return null;
+    shot.shot_summary = gen.summary;
+    shot.shot_summary_source = "auto";
+    shot.shot_summary_generated_at = Date.now();
+    await Storage.put("shots", shot);
+    if (gen.cost_usd) await trackCost(gen.cost_usd, `shot_summary ${shot.id}`);
+    return gen.summary;
+  }
+  NS.maybeRefreshShotSummary = maybeRefreshShotSummary;
 
   // ─── v4.39: AI authoring orchestrator ─────────────────────────────────
   //
@@ -15982,6 +16287,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const card = document.createElement("div");
       card.className = `elx-shot elx-shot--${status}${issues.length > 0 ? " elx-shot--has-issues" : ""}`;
       card.dataset.shotId = s.id;
+      // v4.40 COMPOSITION-2: shot_summary is a single-sentence dramatic-
+      // beat description. Surface BELOW name on the storyboard tile so
+      // directors can scan the film at-a-glance without opening each shot.
+      const summary = String(s.shot_summary || "").trim();
       card.innerHTML = `
         <div class="elx-shot__thumb-only" style="${thumbStyle}">
           <span class="mode-pill ${modeClass} elx-shot__mode-corner">${modeShort}</span>
@@ -15989,6 +16298,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
           <div class="elx-shot__overlay">
             <span class="elx-shot__num">${esc(shotNum)}</span>
             <span class="elx-shot__name">${esc(s.display_name || s.id)}</span>
+            ${summary ? `<span class="elx-shot__summary" style="display:block; font-size:10.5px; color:#c0c0ce; line-height:1.35; margin-top:4px; font-style:italic;">${esc(summary)}</span>` : ""}
           </div>
           ${!thumbUrl ? `<div class="elx-shot__empty-hint">no take yet</div>` : ""}
           <button class="btn elx-shot__hover-cta" data-action="roll-shot" data-shot-id="${esc(s.id)}">
@@ -16061,8 +16371,19 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (ctxBlock) {
       const moment = shot.the_moment || {};
       const verbProse = moment.verb ? String(moment.verb).replace(/_/g, " ") : "";
+      // v4.40 COMPOSITION-2: shot_summary at the top of the context strip
+      // gives the director a 1-sentence "what does this shot DO" before
+      // the field-by-field breakdown. Auto-gen'd on save; user can override
+      // by editing directly (sets shot_summary_source = "manual"). When
+      // present, it's the primary heading — shot_number/timecode/mode pills
+      // become secondary metadata below.
+      const summary = String(shot.shot_summary || "").trim();
+      const summaryBlock = summary
+        ? `<div class="elx-shot-ctx__summary" style="font-size:13px; color:#e4d6b8; line-height:1.45; margin-bottom:8px; font-style:italic; padding-right:220px;">"${esc(summary)}"${shot.shot_summary_source === "manual" ? '<span style="font-size:10px; color:#6a6a78; font-style:normal; margin-left:8px; letter-spacing:0.04em; text-transform:uppercase;">user</span>' : ""}</div>`
+        : "";
       ctxBlock.innerHTML = `
         <div class="elx-shot-ctx" style="position:relative;">
+          ${summaryBlock}
           <span class="elx-shot-ctx__num">S${String(shot.shot_number || "?").padStart(2,"0")}</span>
           <span class="elx-shot-ctx__tc">${esc(shot.timecode?.in || "?")} → ${esc(shot.timecode?.out || "?")} · ${shot.timecode?.duration_seconds || "?"}s</span>
           <span class="elx-shot-ctx__mode">${esc(shot.generation?.mode || "auto")}</span>
@@ -16826,11 +17147,19 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // assumption that ACTIVE_IMAGE_MODEL should drive keyframes too —
     // keyframes feed Seedance, not human eyes, so they need Seedream's
     // aesthetic to land inside Seedance's training distribution.
+    // v4.40 INPUT-1: aspect plumbed from project.aspect (default "16:9")
+    // so Seedream produces matched-aspect keyframes instead of defaulting
+    // to ~1:1.
+    // v4.40 INPUT-2: style anchor (uploaded OR auto-derived from first
+    // approved start-frame) provides project-level aesthetic consistency.
+    const styleAnchorDataUrl = (await resolveStyleAnchorForGen(project))?.dataUrl || null;
     const edit = await runIdentityAnchoredEdit({
       prompt: promptText,
       refDataUrl: charRef,
       modelKey: KEYFRAME_IMAGE_MODEL,
       label: `keyframe-gen ${shot.id}`,
+      aspect: resolveProjectAspect(project),
+      styleAnchorDataUrl,
     });
     const dataUrl = edit.dataUrl;
     // Persist on the shot
@@ -17149,6 +17478,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
         ].join("\n\n")
       : promptText;
 
+    // v4.40 INPUT-2: resolve the project's style anchor BEFORE the N-candidate
+    // loop. Same anchor for every candidate (palette/lighting/composition
+    // density consistency within the gen pass — and across all subsequent
+    // gens until the user changes it). May be null on shot 1 of a fresh
+    // project; auto-derive kicks in after the first start-frame approval.
+    const allShotsForStyle = await Storage.getAll("shots");
+    const styleAnchor = await resolveStyleAnchorForGen(project, allShotsForStyle);
+    const styleAnchorDataUrl = styleAnchor?.dataUrl || null;
+    // v4.40 [Style Lock] prompt addendum — only when a style anchor flows
+    // into image_urls. Tells Seedream which role the third image plays.
+    const styleLockedPrompt = styleAnchorDataUrl
+      ? `${finalPromptText}\n\n[Style Lock] The final input image is the PROJECT STYLE ANCHOR. Match its lighting quality, palette, composition density, and overall aesthetic precisely — but do NOT copy its subjects or characters. Identity is governed by the character reference image; the style anchor governs the LOOK only.`
+      : finalPromptText;
+
     // Generate N candidates with distinct seeds.
     const newCandidates = [];
     const placeholderDataUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
@@ -17161,11 +17504,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
           dataUrl: placeholderDataUrl,
           model: "dry-run-placeholder",
           seed,
-          prompt: finalPromptText,
+          prompt: styleLockedPrompt,
           composition_anchored: !!compositionAnchor,
+          style_anchored: !!styleAnchorDataUrl,
+          aspect: resolveProjectAspect(project),
           generated_at: Date.now(),
         });
-        console.log(`[dry-run · keyframe-candidate] shot=${shot.id} slot=${slot} seed=${seed} composition_anchored=${!!compositionAnchor}`);
+        console.log(`[dry-run · keyframe-candidate] shot=${shot.id} slot=${slot} seed=${seed} composition_anchored=${!!compositionAnchor} style_anchored=${!!styleAnchorDataUrl} aspect=${resolveProjectAspect(project)}`);
         continue;
       }
       try {
@@ -17176,21 +17521,29 @@ JSON object only. No commentary. No fences. No trailing text.`;
         // v4.36: passes compositionAnchorDataUrl for end-frame gen so
         // Seedream receives [startFrame, characterRef] and locks the
         // end frame's composition to the start frame.
+        // v4.40: aspect + styleAnchor plumbed for INPUT-1 (16:9 keyframes)
+        // and INPUT-2 (project-level style consistency). When the style
+        // anchor is present, the prompt has a [Style Lock] addendum so
+        // Seedream knows the third image is for aesthetic not identity.
         const edit = await runIdentityAnchoredEdit({
-          prompt: finalPromptText,
+          prompt: styleLockedPrompt,
           refDataUrl: charRef,
           compositionAnchorDataUrl: compositionAnchor,
+          styleAnchorDataUrl,
+          aspect: resolveProjectAspect(project),
           seed,
           modelKey: KEYFRAME_IMAGE_MODEL,
-          label: `keyframe-candidate ${shot.id}/${slot} ${i+1}/${n}${compositionAnchor ? " [composition-anchored]" : ""}`,
+          label: `keyframe-candidate ${shot.id}/${slot} ${i+1}/${n}${compositionAnchor ? " [composition-anchored]" : ""}${styleAnchorDataUrl ? " [style-locked]" : ""}`,
         });
         newCandidates.push({
           id: candidateId,
           dataUrl: edit.dataUrl,
           model: edit.modelLabel,
           seed: edit.seed,
-          prompt: finalPromptText,
+          prompt: styleLockedPrompt,
           composition_anchored: !!compositionAnchor,  // v4.36 audit trail
+          style_anchored: !!styleAnchorDataUrl,       // v4.40 audit trail
+          aspect: resolveProjectAspect(project),       // v4.40 audit trail
           generated_at: Date.now(),
         });
         await trackCost(edit.costUsd, `${edit.modelLabel} keyframe candidate ${shot.id}/${slot}${compositionAnchor ? " [comp-anchored]" : ""}`);
@@ -18404,6 +18757,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // CONTINUITY CHAIN — extract last frame, seed next shot's start image
       // if its continuity strategy is "inherit_end_of_previous".
       chainToNextShot(shot, take).catch(err => console.warn("[chain]", err));
+      // v4.40 INPUT-3 — chain CHARACTER IDENTITY across shots. Persist the
+      // approved start-frame on every cast character as a derived_ref;
+      // subsequent gens for those characters prefer this ref over the cast
+      // bible portrait → facial identity stays stable shot-to-shot
+      // (Finding F in the 2026-05-19 shot-by-shot audit).
+      persistCharacterDerivedRefs(shot).catch(err => console.warn("[v4.40 derived-refs]", err));
       renderStoryboard();
       if (State.activeShotId === shotId) renderShotEditor(shotId);
       // v4.36: auto-fire ElevenLabs voice overlay for dialogue shots.
@@ -18492,6 +18851,46 @@ JSON object only. No commentary. No fences. No trailing text.`;
       v.addEventListener("error", reject);
     });
   }
+
+  // v4.40 INPUT-3: persist the approved start-frame as a derived_ref on
+  // every character that appears in this shot's cast_in_frame. Subsequent
+  // keyframe gens for the same character (any shot, any angle request)
+  // will resolve refUrlFor → derived_ref over the cast bible ref →
+  // faces stay consistent across the film (Finding F in 2026-05-19 audit).
+  //
+  // Why the START FRAME (not the video's middle): the start frame is
+  // already a Seedream-generated 16:9 anchor (v4.40 INPUT-1), the model
+  // accepted it as input for the successful roll, and extracting a video
+  // frame adds canvas+seek+JPEG-transcode latency for no quality win.
+  //
+  // Idempotent: re-runs on the same shot overwrite the entry (which is
+  // fine — the data is the same approved frame).
+  async function persistCharacterDerivedRefs(approvedShot) {
+    const startUrl = approvedShot?.keyframes?.start?.approved_dataUrl;
+    if (!startUrl) return { skipped: "no_approved_start_frame", count: 0 };
+    const castInFrame = (approvedShot.cast_in_frame || [])
+      .map(c => typeof c === "string" ? c : c?.character_id)
+      .filter(Boolean);
+    if (castInFrame.length === 0) return { skipped: "no_cast_in_frame", count: 0 };
+    const characters = await Storage.getAll("characters");
+    const approvedTakeId = approvedShot.takes?.find(t => t.status === "approved")?.id || null;
+    let count = 0;
+    for (const charId of castInFrame) {
+      const c = characters.find(x => x.id === charId);
+      if (!c) continue;
+      c.derived_refs = c.derived_refs || {};
+      c.derived_refs[approvedShot.id] = {
+        dataUrl: startUrl,
+        extracted_at: Date.now(),
+        source_take_id: approvedTakeId,
+        source_shot_number: approvedShot.shot_number || 0,
+      };
+      await Storage.put("characters", c);
+      count++;
+    }
+    return { count };
+  }
+  NS.persistCharacterDerivedRefs = persistCharacterDerivedRefs;
 
   // After a take is approved, extract its last frame and seed the NEXT shot's
   // start image — if that shot has continuity.start_frame_strategy === "inherit_end_of_previous"
@@ -19245,6 +19644,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // appending any new issues to _validation.issues. Idempotent — won't
   // duplicate issues that already exist with the same {kind, detail}
   // shape. Tagged with v4.38 so future bumps know the pass ran.
+  //
+  // v4.40 update: also silently auto-applies `focal_unsupported_by_cast`
+  // fixes per COMPOSITION-1 (Finding C). Existing shots that pre-date
+  // v4.40 with prose naming a cast-bible-resolvable character get the
+  // character added to cast_in_frame on next boot. schema_version bumps
+  // to "v4.40" so the pass doesn't re-run on subsequent loads.
   async function rerunAuthoringQualityValidatorsAllShots() {
     try {
       const characters = await Storage.getAll("characters");
@@ -19253,9 +19658,19 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const ctx = { characters, environments, project };
       const shots = await Storage.getAll("shots");
       let added = 0;
+      let autoFixed = 0;
+      const autoFixedNames = new Set();
       for (const shot of shots) {
-        // Skip if this shot has already been re-validated by v4.38+
-        if (shot?._validation?.schema_version === "v4.38") continue;
+        // v4.40: bump schema gate to "v4.40" so shots that already passed
+        // v4.38 still get the silent focal-cast auto-fix on next boot.
+        if (shot?._validation?.schema_version === "v4.40") continue;
+        // v4.40 COMPOSITION-1: silent auto-fix BEFORE re-running validators
+        // so the fixed issue doesn't get re-added to the issues list.
+        const fix = autoFixFocalCastSilent(shot, ctx);
+        if (fix.applied > 0) {
+          autoFixed += fix.applied;
+          for (const n of fix.added) autoFixedNames.add(n);
+        }
         const newIssues = runAuthoringQualityValidators(shot, ctx);
         shot._validation = shot._validation || { issues: [] };
         shot._validation.issues = shot._validation.issues || [];
@@ -19268,13 +19683,29 @@ JSON object only. No commentary. No fences. No trailing text.`;
         ]);
         shot._validation.issues = shot._validation.issues.filter(i => !v438Kinds.has(i.kind));
         shot._validation.issues.push(...newIssues);
-        shot._validation.schema_version = "v4.38";
+        shot._validation.schema_version = "v4.40";
         added += newIssues.length;
         await Storage.put("shots", shot);
       }
-      console.log(`[v4.38] re-validated ${shots.length} shot(s); added ${added} authoring-quality issue(s)`);
+      // v4.40 COMPOSITION-2: lazy-fill shot summaries on boot. Iterates
+      // again so the validator pass above lands first (a fixed-cast shot
+      // gets an updated summary too). Only fires when chatCompletion is
+      // available — silently skips on projects without OpenAI configured.
+      let summariesFilled = 0;
+      if (State.openai) {
+        for (const shot of shots) {
+          if (shot.shot_summary && shot.shot_summary.trim()) continue;
+          if (shot.shot_summary_source === "manual") continue;
+          const summary = await maybeRefreshShotSummary(shot.id, ctx).catch(() => null);
+          if (summary) summariesFilled++;
+        }
+      }
+      console.log(`[v4.40] re-validated ${shots.length} shot(s); added ${added} issue(s); auto-fixed ${autoFixed} focal-cast omission(s)${autoFixed > 0 ? " for: " + Array.from(autoFixedNames).join(", ") : ""}; filled ${summariesFilled} shot summaries.`);
+      if (autoFixed > 0) {
+        toast(`Auto-added focal-named characters to ${autoFixed} cast slot(s) (boot-time fix).`, { duration: 5000 });
+      }
     } catch (err) {
-      console.warn("[v4.38] re-validation pass failed:", err);
+      console.warn("[v4.40] re-validation pass failed:", err);
     }
   }
   NS.rerunAuthoringQualityValidatorsAllShots = rerunAuthoringQualityValidatorsAllShots;
@@ -19448,6 +19879,52 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return true;
   }
 
+  // v4.40 COMPOSITION-1: silent auto-fix for focal_unsupported_by_cast.
+  //
+  // Structural fix (Finding C): every time the validator detects a focal
+  // or description naming a character whose `display_name` resolves in
+  // the cast bible, that character is silently added to cast_in_frame
+  // with `role_in_shot: "in-frame"` (focal_point implies they're seen).
+  //
+  // Why silent: this is the highest-confidence rule-driven fix in the
+  // codebase. The character_id is already resolved (by the validator's
+  // regex match against cast bible display_names). There's no ambiguity
+  // a human user could resolve better than the rule.
+  //
+  // The v4.39 SUGGEST_FIX_STRATEGIES entry remains in place so users
+  // can still inspect and apply per-issue from the Shot Doctor UI — but
+  // most cases will be silently resolved before they're ever shown.
+  //
+  // Mutates `shot.cast_in_frame` in place. Returns {applied, added[]}.
+  // Idempotent — skips any character already in cast_in_frame.
+  function autoFixFocalCastSilent(shot, ctx) {
+    if (!shot || !ctx?.characters) return { applied: 0, added: [] };
+    const issue = validateFocalSupportedByCast(shot, ctx);
+    if (!issue) return { applied: 0, added: [] };
+    const missing = issue.detail || [];
+    if (missing.length === 0) return { applied: 0, added: [] };
+    shot.cast_in_frame = shot.cast_in_frame || [];
+    const added = [];
+    for (const m of missing) {
+      const already = shot.cast_in_frame.some(c =>
+        (typeof c === "string" ? c : c?.character_id) === m.character_id
+      );
+      if (already) continue;
+      shot.cast_in_frame.push({
+        character_id: m.character_id,
+        // v4.40: "in-frame" is the right default — focal_point naming
+        // a character implies they're visible. The v4.39 suggest-fix
+        // strategy used "observing" as a conservative default; for
+        // SILENT auto-apply we trust the focal/description signal more.
+        role_in_shot: "in-frame",
+        action: "",
+      });
+      added.push(m.display_name);
+    }
+    return { applied: added.length, added };
+  }
+  NS.autoFixFocalCastSilent = autoFixFocalCastSilent;
+
   // Apply user-accepted proposals to a shot + persist.
   async function applyAcceptedProposals(shotId, accepted) {
     if (!accepted || accepted.length === 0) return 0;
@@ -19456,6 +19933,18 @@ JSON object only. No commentary. No fences. No trailing text.`;
     let applied = 0;
     for (const p of accepted) {
       if (_setShotFieldByPath(shot, p.field, p.proposed)) applied++;
+    }
+    // v4.40 COMPOSITION-1: silent auto-add focal-named characters. Runs
+    // BEFORE the validator re-run below so the fix-detect doesn't fire
+    // when the rule-driven fix has already handled it. Idempotent.
+    try {
+      const characters = await Storage.getAll("characters");
+      const autoFix = autoFixFocalCastSilent(shot, { characters });
+      if (autoFix.applied > 0) {
+        toast(`Auto-added ${autoFix.added.join(" + ")} to cast_in_frame (named in focal/description).`, { duration: 4500 });
+      }
+    } catch (err) {
+      console.warn("[v4.40 auto-fix focal-cast] failed:", err);
     }
     await Storage.put("shots", shot);
     // Re-run authoring validators so fixed issues drop off the list
@@ -19471,10 +19960,25 @@ JSON object only. No commentary. No fences. No trailing text.`;
       ]);
       shot._validation.issues = (shot._validation.issues || []).filter(i => !v438Kinds.has(i.kind));
       shot._validation.issues.push(...newIssues);
-      shot._validation.schema_version = "v4.38";
+      shot._validation.schema_version = "v4.40";
       await Storage.put("shots", shot);
+      // v4.40 COMPOSITION-2: if any of the accepted proposals touched
+      // focal_point or description, the existing summary is stale. Clear
+      // auto-summaries so the lazy refresh below regenerates them. Manual
+      // summaries are untouched.
+      const summaryAffectingFields = new Set(["the_moment.focal_point", "the_moment.description"]);
+      const touchedSummary = accepted.some(p => summaryAffectingFields.has(p.field));
+      if (touchedSummary && shot.shot_summary_source !== "manual") {
+        shot.shot_summary = "";
+        await Storage.put("shots", shot);
+      }
+      // v4.40 COMPOSITION-2: lazy-fill summary (no-op if already populated
+      // or source==="manual" or no chatCompletion-capable backend).
+      await maybeRefreshShotSummary(shotId, { project, characters, environments }).catch(err => {
+        console.warn("[v4.40 apply proposals summary refresh]", err);
+      });
     } catch (err) {
-      console.warn("[v4.39 apply proposals] re-validation failed:", err);
+      console.warn("[v4.40 apply proposals] re-validation failed:", err);
     }
     return applied;
   }
@@ -22008,7 +22512,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             <input id="elx-proj-logline" type="text" placeholder="A young prince afraid of his own shadow power must enter a ruined lion kingdom..."
                    style="${FIELD_INPUT_STYLE} margin-bottom:12px;">
 
-            <div style="display:grid; grid-template-columns:1fr 130px; gap:12px; margin-bottom:12px;">
+            <div style="display:grid; grid-template-columns:1fr 130px 110px; gap:12px; margin-bottom:12px;">
               <div>
                 <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Medium</label>
                 <select id="elx-proj-medium" style="${FIELD_INPUT_STYLE}">
@@ -22016,18 +22520,34 @@ JSON object only. No commentary. No fences. No trailing text.`;
                 </select>
               </div>
               <div>
-                <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Default shot duration</label>
+                <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Default duration</label>
                 <input id="elx-proj-default-duration" type="number" min="4" max="15" value="8"
                        style="${FIELD_INPUT_STYLE}">
               </div>
+              <div>
+                <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Aspect</label>
+                <select id="elx-proj-aspect" style="${FIELD_INPUT_STYLE}">
+                  <option value="16:9">16:9 (cinematic)</option>
+                  <option value="9:16">9:16 (shorts)</option>
+                  <option value="1:1">1:1 (square)</option>
+                  <option value="4:3">4:3</option>
+                  <option value="3:4">3:4</option>
+                </select>
+              </div>
             </div>
             <div style="font-size:10.5px; color:#6a6a78; margin-top:-6px; margin-bottom:14px; line-height:1.4;">
-              Medium drives composer language (animation strips live-action lighting cues). Default duration is the per-shot Seedance render length unless a shot overrides it (4–15s range).
+              Medium drives composer language. Duration is the per-shot Seedance length (4–15s, shot-overridable). Aspect forces Seedream keyframes to match the Seedance/Kling video output (v4.40 — square keyframes were the structural root of mid-clip style mismatch).
             </div>
 
             <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Style canon (prepended to every shot prompt)</label>
             <textarea id="elx-proj-style-canon" rows="5" placeholder="${esc(STYLE_CANON_PLACEHOLDER)}"
                    style="${FIELD_INPUT_STYLE} resize:vertical; margin-bottom:12px;"></textarea>
+
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Style anchor image (look reference)</label>
+            <div id="elx-proj-style-anchor-block" style="margin-bottom:14px;"></div>
+            <div style="font-size:10.5px; color:#6a6a78; margin-top:-8px; margin-bottom:14px; line-height:1.4;">
+              ONE image captures the project's intended look (lighting, palette, composition density). Used as a style reference for cast/env refs AND keyframe gens. If no upload exists, the first approved start-frame becomes the implicit anchor automatically (v4.40 INPUT-2).
+            </div>
 
             <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Description (internal note, optional)</label>
             <textarea id="elx-proj-desc" rows="2" placeholder="Genre / audience / tone — anything that helps you remember the project"
@@ -22061,12 +22581,99 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const editIdInput  = $("#elx-proj-edit-id", panel);
     const saveBtn      = $("#elx-proj-form-save", panel);
 
+    // v4.40: render the style anchor block (preview + upload/clear + auto-derive
+    // status). Mutates Storage on user action; re-renders inline.
+    const renderStyleAnchorBlock = async (editRow) => {
+      const wrap = $("#elx-proj-style-anchor-block", panel);
+      if (!wrap) return;
+      // For a NEW project (no editRow), the row doesn't exist yet — the upload
+      // is deferred until after Save. Show an explanatory chip instead.
+      if (!editRow) {
+        wrap.innerHTML = `
+          <div style="background:#0a0a0c; border:1px dashed #2a2a35; border-radius:6px;
+                      padding:10px 14px; font-size:11.5px; color:#9a9aab;">
+            Save the project first; the style anchor upload becomes available after.
+          </div>
+        `;
+        return;
+      }
+      // Read the freshest project row (the editRow we have may be stale).
+      const fresh = await Storage.get("projects", editRow.id);
+      const anchor = fresh?.style_anchor || null;
+      const allShots = await Storage.getAll("shots");
+      const derived = !anchor?.dataUrl
+        ? await resolveStyleAnchorForGen(fresh, allShots)
+        : null;
+      const showPreviewUrl = anchor?.dataUrl || derived?.dataUrl || null;
+      const sourceLabel = anchor?.dataUrl
+        ? `User upload · ${anchor.filename ? esc(anchor.filename) + " · " : ""}saved ${new Date(anchor.uploaded_at).toLocaleString()}`
+        : (derived?.dataUrl
+            ? `Auto-derived from ${esc(derived.derived_from_shot_id || "first approved keyframe")} (no upload set — upload to override)`
+            : `No upload yet · no approved keyframes yet (anchor will activate after shot 1 approves)`);
+      wrap.innerHTML = `
+        <div style="display:flex; gap:14px; align-items:flex-start; background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:10px 14px;">
+          ${showPreviewUrl
+            ? `<div style="width:60px; height:60px; flex-shrink:0; border:1px solid #2a2a35; border-radius:4px; background-image:url('${showPreviewUrl}'); background-size:cover; background-position:center;"></div>`
+            : `<div style="width:60px; height:60px; flex-shrink:0; border:1.5px dashed #2a2a35; border-radius:4px; display:flex; align-items:center; justify-content:center; color:#3a3a45; font-size:18px;">∅</div>`
+          }
+          <div style="flex:1; min-width:0;">
+            <div style="font-size:11.5px; color:${anchor?.dataUrl ? "#4ade80" : "#9a9aab"}; line-height:1.5; margin-bottom:8px;">
+              ${sourceLabel}
+            </div>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <label style="cursor:pointer; background:#c9a25a; color:#14141a; padding:5px 10px; border-radius:4px; font-size:11px; font-weight:600;">
+                ${anchor?.dataUrl ? "Replace" : "Upload"}
+                <input id="elx-proj-style-anchor-file" type="file" accept="image/png,image/jpeg,image/webp" style="display:none;">
+              </label>
+              ${anchor?.dataUrl ? `
+                <button id="elx-proj-style-anchor-clear" type="button"
+                        style="background:none; color:#9a9aab; border:1px solid #2a2a35; padding:5px 10px; border-radius:4px; font-size:11px; cursor:pointer;">Remove</button>
+              ` : ""}
+            </div>
+          </div>
+        </div>
+      `;
+      const fileInput = $("#elx-proj-style-anchor-file", panel);
+      if (fileInput) {
+        fileInput.addEventListener("change", async (e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          try {
+            const dataUrl = await readFileAsDataUrl(file);
+            await Storage.Projects.update(fresh.id, {
+              style_anchor: {
+                dataUrl,
+                filename: file.name,
+                byte_size: file.size,
+                source: "user_upload",
+                uploaded_at: Date.now(),
+              },
+            });
+            toast(`Style anchor saved · all subsequent gens inherit its look.`, { tone: "ok" });
+            await renderStyleAnchorBlock(fresh);
+          } catch (err) {
+            toast(`Couldn't save anchor: ${err.message}`, { tone: "err", duration: 7000 });
+          }
+        });
+      }
+      const clearBtn = $("#elx-proj-style-anchor-clear", panel);
+      if (clearBtn) {
+        clearBtn.addEventListener("click", async () => {
+          if (!confirm("Remove the project style anchor? Auto-derive (from first approved keyframe) will kick in until you upload a replacement.")) return;
+          await Storage.Projects.update(fresh.id, { style_anchor: null });
+          toast("Style anchor cleared — auto-derive will resolve from approved keyframes.", { tone: "warn" });
+          await renderStyleAnchorBlock(fresh);
+        });
+      }
+    };
+
     const openForm = (editRow = null) => {
       // Reset fields then populate if editing
       $("#elx-proj-name", panel).value             = editRow?.display_name || "";
       $("#elx-proj-logline", panel).value          = editRow?.logline || "";
       $("#elx-proj-medium", panel).value           = editRow?.medium || "live_action";
       $("#elx-proj-default-duration", panel).value = editRow?.default_shot_duration_seconds ?? 8;
+      $("#elx-proj-aspect", panel).value           = resolveProjectAspect(editRow);
       $("#elx-proj-style-canon", panel).value      = editRow?.style_canon || "";
       $("#elx-proj-desc", panel).value             = editRow?.description || "";
       editIdInput.value = editRow?.id || "";
@@ -22074,6 +22681,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // Name field is immutable in edit (id is derived from it) — disable.
       $("#elx-proj-name", panel).disabled = !!editRow;
       $("#elx-proj-name", panel).style.opacity = editRow ? "0.6" : "1";
+
+      // v4.40: render style anchor preview/upload block — different state
+      // for create-mode vs edit-mode.
+      renderStyleAnchorBlock(editRow);
 
       form.style.display = "block";
       createToggle.style.display = "none";
@@ -22106,6 +22717,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const logline        = $("#elx-proj-logline", panel).value.trim();
       const medium         = $("#elx-proj-medium", panel).value;
       const defaultDur     = Number($("#elx-proj-default-duration", panel).value) || 8;
+      const aspect         = $("#elx-proj-aspect", panel).value || "16:9";
       const styleCanon     = $("#elx-proj-style-canon", panel).value.trim();
       const desc           = $("#elx-proj-desc", panel).value.trim();
       if (!editingId && !name) {
@@ -22118,6 +22730,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             logline,
             medium,
             default_shot_duration_seconds: defaultDur,
+            aspect,
             style_canon: styleCanon,
             description: desc,
           });
@@ -22130,6 +22743,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             logline,
             style_canon: styleCanon,
             default_shot_duration_seconds: defaultDur,
+            aspect,
           });
           await Storage.Projects.setActive(row.id);
           toast(`Created "${row.display_name}" — reloading…`, { tone: "ok" });
