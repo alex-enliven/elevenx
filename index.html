@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="8279ca35ae1e" data-build-time="2026-05-19T13:43:39.333Z">
+<meta name="elevenx-build" content="c12ff38c2d1d" data-build-time="2026-05-19T14:00:06.291Z">
 <script>
 (function(){
-  var info = { hash: "8279ca35ae1e", time: "2026-05-19T13:43:39.333Z" };
+  var info = { hash: "c12ff38c2d1d", time: "2026-05-19T14:00:06.291Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 8279ca35ae1e @ 2026-05-19T13:43:39.333Z -->
+<!-- elevenx-build: c12ff38c2d1d @ 2026-05-19T14:00:06.291Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9511,6 +9511,24 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // panel in the future) to swap providers. All renders + handlers default
   // to this. Existing data in other models' buckets stays in IDB untouched.
   const ACTIVE_IMAGE_MODEL = "gpt";
+
+  // v4.35: SEPARATE constant for keyframe gen. Audit (2026-05-19) caught
+  // that v4.34 silently extended ACTIVE_IMAGE_MODEL to keyframes — but
+  // keyframes have a DIFFERENT downstream consumer (Seedance/Kling video
+  // models) than cast/env refs (the human looking at the portrait).
+  //
+  // Seedream and Seedance share Bytedance/fal lineage → overlapping
+  // aesthetic priors → Seedance interpolates motion FROM a Seedream
+  // keyframe naturally (the anchor sits inside its training distribution).
+  // gpt-image-2 sits OUTSIDE Seedance's distribution → mid-clip style
+  // drift, "doesn't match the reference" symptom.
+  //
+  // The May 2026 A/B test that picked gpt-image-2 optimized for "what
+  // looks best to the human" (correct for cast/env). It never tested
+  // "what feeds the video pipeline cleanly" (the keyframe metric).
+  // Re-running the A/B with the right downstream metric is logged in
+  // docs/deferred-bugs.md; until then Seedream is the keyframe default.
+  const KEYFRAME_IMAGE_MODEL = "seedream";
 
   // ─── Utilities ──────────────────────────────────────────────────────
   const $  = (sel, root = document) => root.querySelector(sel);
@@ -16302,11 +16320,15 @@ JSON object only. No commentary. No fences. No trailing text.`;
       return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
     }
 
-    // v4.34: route through the model-aware helper so the keyframe uses
-    // gpt-image-2 (post-A/B-test winner) instead of hard-coded Seedream.
+    // v4.35: route through the model-aware helper with EXPLICIT modelKey
+    // = KEYFRAME_IMAGE_MODEL (Seedream by default). Audit corrected v4.34's
+    // assumption that ACTIVE_IMAGE_MODEL should drive keyframes too —
+    // keyframes feed Seedance, not human eyes, so they need Seedream's
+    // aesthetic to land inside Seedance's training distribution.
     const edit = await runIdentityAnchoredEdit({
       prompt: promptText,
       refDataUrl: charRef,
+      modelKey: KEYFRAME_IMAGE_MODEL,
       label: `keyframe-gen ${shot.id}`,
     });
     const dataUrl = edit.dataUrl;
@@ -16616,14 +16638,15 @@ JSON object only. No commentary. No fences. No trailing text.`;
         continue;
       }
       try {
-        // v4.34: route through the model-aware helper. For GPT, `seed` is
-        // logged but doesn't drive variation (gpt-image-2 doesn't expose
-        // a seed knob); diversity comes from making N separate calls. For
-        // Seedream, the seed is honoured and produces deterministic variation.
+        // v4.35: explicit modelKey = KEYFRAME_IMAGE_MODEL (Seedream by
+        // default) so candidates land inside Seedance's training
+        // distribution. The seed is honoured by Seedream and produces
+        // deterministic variation across the N candidates.
         const edit = await runIdentityAnchoredEdit({
           prompt: promptText,
           refDataUrl: charRef,
           seed,
+          modelKey: KEYFRAME_IMAGE_MODEL,
           label: `keyframe-candidate ${shot.id}/${slot} ${i+1}/${n}`,
         });
         newCandidates.push({
@@ -16658,7 +16681,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
   async function handleGenerateKeyframeCandidates(shotId, slot) {
     if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
     if (!shotId || !slot) return;
-    setGPS(true, `Generating 3 keyframe candidates for ${slot}`, `${IMAGE_MODELS[ACTIVE_IMAGE_MODEL].label} · 3 variations`, 20);
+    setGPS(true, `Generating 3 keyframe candidates for ${slot}`, `${IMAGE_MODELS[KEYFRAME_IMAGE_MODEL].label} · 3 variations`, 20);
     try {
       const candidates = await generateKeyframeCandidates(shotId, slot, 3);
       setGPS(false);
@@ -16738,6 +16761,85 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (State.activeShotId === shotId) renderShotEditor(shotId);
     } catch (err) {
       toast(`Toggle failed: ${err.message}`, { tone: "warn" });
+    }
+  }
+
+  // v4.35: open a keyframe candidate at full size via the existing lightbox
+  // helper. UX-review-gap fix — the gate panel's 120×68 thumbnails were too
+  // small to tell a good candidate from a bad one. Approved candidates can
+  // be opened too (useful for inspection after the auto-approve).
+  async function handleOpenCandidate(shotId, slot, candidateId) {
+    if (!shotId || !slot || !candidateId) return;
+    try {
+      const shot = await Storage.get("shots", shotId);
+      const slotData = shot?.keyframes?.[slot];
+      const candidate = (slotData?.candidates || []).find(c => c.id === candidateId);
+      if (!candidate?.dataUrl) {
+        toast(`Candidate not found or has no image data`, { tone: "warn" });
+        return;
+      }
+      const isApproved = candidate.id === slotData.approved_id;
+      const title = `${shot.display_name || shotId} · ${slot} frame · ${candidate.model || "?"} · seed ${candidate.seed ?? "—"}${isApproved ? " · ✓ approved" : ""}`;
+      openLightbox(candidate.dataUrl, title);
+    } catch (err) {
+      toast(`Open failed: ${err.message}`, { tone: "warn" });
+    }
+  }
+
+  // v4.35: delete a single keyframe candidate from a slot. Blocks deletion
+  // of the approved candidate (the approved one is the audit trail — to
+  // change which candidate is approved, click a different one to re-approve;
+  // the v4.32 cache invalidation handles the fal_storage_url busting). Lifecycle
+  // management was missing from the gate UI — S02 was accumulating candidates
+  // from repeated debugging gen-rolls with no way to clean up.
+  async function handleDeleteCandidate(shotId, slot, candidateId) {
+    if (!shotId || !slot || !candidateId) return;
+    try {
+      const shot = await Storage.get("shots", shotId);
+      const slotData = shot?.keyframes?.[slot];
+      if (!slotData) {
+        toast(`Slot ${slot} has no candidates`, { tone: "warn" });
+        return;
+      }
+      if (candidateId === slotData.approved_id) {
+        toast(`Can't delete the approved candidate. Approve a different one first, then delete this.`, { tone: "warn", duration: 5000 });
+        return;
+      }
+      const before = (slotData.candidates || []).length;
+      slotData.candidates = (slotData.candidates || []).filter(c => c.id !== candidateId);
+      const after = slotData.candidates.length;
+      if (before === after) {
+        toast(`Candidate not found`, { tone: "warn" });
+        return;
+      }
+      await Storage.put("shots", shot);
+      if (State.activeShotId === shotId) renderShotEditor(shotId);
+      toast(`Deleted candidate (${after} remaining in ${slot} slot)`, { duration: 2500 });
+    } catch (err) {
+      toast(`Delete failed: ${err.message}`, { tone: "warn" });
+    }
+  }
+
+  // v4.35: clear all unapproved candidates in a slot. Used when a shot has
+  // accumulated many failed gen attempts — keeps the approved one and
+  // wipes the rest. Triggered by the "Clear unapproved (N)" button that
+  // only appears when there are ≥4 candidates in the slot.
+  async function handleClearUnapprovedCandidates(shotId, slot) {
+    if (!shotId || !slot) return;
+    try {
+      const shot = await Storage.get("shots", shotId);
+      const slotData = shot?.keyframes?.[slot];
+      if (!slotData) return;
+      const approvedId = slotData.approved_id;
+      const before = (slotData.candidates || []).length;
+      slotData.candidates = (slotData.candidates || []).filter(c => c.id === approvedId);
+      const after = slotData.candidates.length;
+      const removed = before - after;
+      await Storage.put("shots", shot);
+      if (State.activeShotId === shotId) renderShotEditor(shotId);
+      toast(`Cleared ${removed} unapproved candidate${removed === 1 ? "" : "s"} from ${slot} slot.`, { duration: 3000 });
+    } catch (err) {
+      toast(`Clear failed: ${err.message}`, { tone: "warn" });
     }
   }
 
@@ -17146,7 +17248,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // failing that, fire the Seedream auto-keyframe-gen ladder.
       let startImage = shot.keyframes?.startDataUrl;
       if (!startImage) {
-        setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, `${IMAGE_MODELS[ACTIVE_IMAGE_MODEL].label} · identity-anchored`, 30);
+        setGPS(true, `Generating keyframe for <span class="mono">${esc(shotId)}</span>`, `${IMAGE_MODELS[KEYFRAME_IMAGE_MODEL].label} · identity-anchored`, 30);
         try {
           // v4.15: pass allCastForKeyframe (cast_in_frame ∪ references[].chars)
           // so generateKeyframeForShot finds Veyr-style anchors that live in
@@ -17819,6 +17921,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
     else if (action === "shot-doctor")        showShotDoctorModal();
     else if (action === "gen-keyframe-candidates") handleGenerateKeyframeCandidates(target.dataset.shotId, target.dataset.slot);
     else if (action === "approve-candidate")  handleApproveCandidate(target.dataset.shotId, target.dataset.slot, target.dataset.candidateId);
+    else if (action === "open-candidate")      handleOpenCandidate(target.dataset.shotId, target.dataset.slot, target.dataset.candidateId);
+    else if (action === "delete-candidate")    handleDeleteCandidate(target.dataset.shotId, target.dataset.slot, target.dataset.candidateId);
+    else if (action === "clear-unapproved-candidates") handleClearUnapprovedCandidates(target.dataset.shotId, target.dataset.slot);
     else if (action === "toggle-state-change") handleToggleStateChange(target.dataset.shotId, target.checked);
     else if (action === "finish-play-all")    playSequenceFromIdx(0);
     else if (action === "finish-pause")       $("#elx-finish-video")?.pause();
@@ -18219,12 +18324,19 @@ JSON object only. No commentary. No fences. No trailing text.`;
       }
       return `<div style="display:flex; gap:6px; flex-wrap:wrap;">${candidates.map(c => {
         const isApproved = c.id === slotData.approved_id;
+        // v4.35: parent div still carries "approve-candidate" so clicking the
+        // thumbnail body approves (preserving v4.33's auto-approve flow). The
+        // event delegator uses e.target.closest("[data-action]"), so child
+        // buttons with their own data-action resolve correctly without
+        // bubbling — the magnifier opens the lightbox, the × deletes,
+        // without re-triggering approve.
         return `<div
+          class="elx-candidate"
           data-action="approve-candidate"
           data-shot-id="${esc(shot.id)}"
           data-slot="${slot}"
           data-candidate-id="${esc(c.id)}"
-          title="${isApproved ? "Approved" : "Click to approve as the " + slot + " frame"}"
+          title="${isApproved ? "Approved (click 🔍 to inspect at full size)" : "Click to approve as the " + slot + " frame · 🔍 to enlarge · × to delete"}"
           style="
             width: 120px; aspect-ratio: 16/9;
             background-image: url('${c.dataUrl}');
@@ -18233,8 +18345,31 @@ JSON object only. No commentary. No fences. No trailing text.`;
             border-radius: 4px; cursor: pointer; position: relative;
             transition: border-color .1s;
           ">
-          ${isApproved ? `<span style="position:absolute; top:2px; right:4px; background:#4ade80; color:#0a0a0c; font-size:10px; font-weight:700; padding:1px 4px; border-radius:2px;">✓ approved</span>` : ""}
-          <span style="position:absolute; bottom:2px; left:4px; font-size:9px; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.8); font-family:'JetBrains Mono', monospace;">${c.model || "?"} · seed ${c.seed ?? "—"}</span>
+          ${isApproved ? `<span style="position:absolute; top:2px; right:4px; background:#4ade80; color:#0a0a0c; font-size:10px; font-weight:700; padding:1px 4px; border-radius:2px; pointer-events:none;">✓ approved</span>` : ""}
+          <span style="position:absolute; bottom:2px; left:4px; font-size:9px; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.8); font-family:'JetBrains Mono', monospace; pointer-events:none;">${c.model || "?"} · seed ${c.seed ?? "—"}</span>
+          <!-- v4.35: hover-revealed icon controls. Magnifier opens lightbox
+               (inspect at full size). × deletes the candidate from the slot.
+               Approved candidate can be opened but not deleted (the source
+               array entry is the audit trail; approved_dataUrl is the
+               denormalised primary). -->
+          <div class="elx-candidate-actions" style="position:absolute; top:2px; left:2px; display:flex; gap:3px;">
+            ${!isApproved ? `<button type="button"
+              data-action="delete-candidate"
+              data-shot-id="${esc(shot.id)}"
+              data-slot="${slot}"
+              data-candidate-id="${esc(c.id)}"
+              title="Delete this candidate"
+              style="background:rgba(0,0,0,0.65); color:#f8a890; border:1px solid rgba(248,113,113,0.4); width:18px; height:18px; padding:0; border-radius:50%; font-size:11px; line-height:1; cursor:pointer; font-family:Inter,sans-serif;"
+            >×</button>` : ""}
+          </div>
+          <button type="button"
+            data-action="open-candidate"
+            data-shot-id="${esc(shot.id)}"
+            data-slot="${slot}"
+            data-candidate-id="${esc(c.id)}"
+            title="Open at full size"
+            style="position:absolute; bottom:2px; right:2px; background:rgba(0,0,0,0.65); color:#e8e8ee; border:1px solid rgba(255,255,255,0.15); width:18px; height:18px; padding:0; border-radius:50%; font-size:10px; line-height:1; cursor:pointer; font-family:Inter,sans-serif;"
+          >🔍</button>
         </div>`;
       }).join("")}</div>`;
     };
@@ -18276,11 +18411,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
             <span style="font-size:11.5px; color:${startOK ? "#4ade80" : "#e8e8ee"}; font-weight:600;">
               Start frame ${startOK ? "✓" : "(required)"}
             </span>
-            <button type="button"
-                    data-action="gen-keyframe-candidates" data-shot-id="${esc(shot.id)}" data-slot="start"
-                    style="background:#14141a; color:#c9a25a; border:1px solid #c9a25a; padding:5px 11px; border-radius:4px; font-size:11px; cursor:pointer;">
-              ${(startSlot.candidates || []).length > 0 ? "+ Generate 3 more" : "Generate 3 candidates"} <span style="color:#6a6a78;">· ~$0.15</span>
-            </button>
+            <div style="display:flex; gap:6px; align-items:center;">
+              ${(startSlot.candidates || []).length >= 4 ? `
+              <button type="button"
+                      data-action="clear-unapproved-candidates" data-shot-id="${esc(shot.id)}" data-slot="start"
+                      title="Delete all unapproved start-frame candidates (keeps the approved one)"
+                      style="background:transparent; color:#9a9aab; border:1px solid #2a2a35; padding:5px 9px; border-radius:4px; font-size:11px; cursor:pointer;">
+                Clear unapproved (${(startSlot.candidates || []).filter(c => c.id !== startSlot.approved_id).length})
+              </button>` : ""}
+              <button type="button"
+                      data-action="gen-keyframe-candidates" data-shot-id="${esc(shot.id)}" data-slot="start"
+                      style="background:#14141a; color:#c9a25a; border:1px solid #c9a25a; padding:5px 11px; border-radius:4px; font-size:11px; cursor:pointer;">
+                ${(startSlot.candidates || []).length > 0 ? "+ Generate 3 more" : "Generate 3 candidates"} <span style="color:#6a6a78;">· ~$0.15</span>
+              </button>
+            </div>
           </div>
           ${renderCandidateStrip("start", startSlot)}
         </div>
@@ -18291,11 +18435,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
             <span style="font-size:11.5px; color:${endOK ? "#4ade80" : "#e8e8ee"}; font-weight:600;">
               End frame ${endOK ? "✓" : "(required for state-change shots)"}
             </span>
-            <button type="button"
-                    data-action="gen-keyframe-candidates" data-shot-id="${esc(shot.id)}" data-slot="end"
-                    style="background:#14141a; color:#c9a25a; border:1px solid #c9a25a; padding:5px 11px; border-radius:4px; font-size:11px; cursor:pointer;">
-              ${(endSlot.candidates || []).length > 0 ? "+ Generate 3 more" : "Generate 3 candidates"} <span style="color:#6a6a78;">· ~$0.15</span>
-            </button>
+            <div style="display:flex; gap:6px; align-items:center;">
+              ${(endSlot.candidates || []).length >= 4 ? `
+              <button type="button"
+                      data-action="clear-unapproved-candidates" data-shot-id="${esc(shot.id)}" data-slot="end"
+                      title="Delete all unapproved end-frame candidates (keeps the approved one)"
+                      style="background:transparent; color:#9a9aab; border:1px solid #2a2a35; padding:5px 9px; border-radius:4px; font-size:11px; cursor:pointer;">
+                Clear unapproved (${(endSlot.candidates || []).filter(c => c.id !== endSlot.approved_id).length})
+              </button>` : ""}
+              <button type="button"
+                      data-action="gen-keyframe-candidates" data-shot-id="${esc(shot.id)}" data-slot="end"
+                      style="background:#14141a; color:#c9a25a; border:1px solid #c9a25a; padding:5px 11px; border-radius:4px; font-size:11px; cursor:pointer;">
+                ${(endSlot.candidates || []).length > 0 ? "+ Generate 3 more" : "Generate 3 candidates"} <span style="color:#6a6a78;">· ~$0.15</span>
+              </button>
+            </div>
           </div>
           ${renderCandidateStrip("end", endSlot)}
         </div>` : ""}
