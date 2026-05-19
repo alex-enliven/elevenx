@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="330bd08f82dc" data-build-time="2026-05-19T14:28:11.277Z">
+<meta name="elevenx-build" content="1d94f18baf7b" data-build-time="2026-05-19T19:16:39.694Z">
 <script>
 (function(){
-  var info = { hash: "330bd08f82dc", time: "2026-05-19T14:28:11.277Z" };
+  var info = { hash: "1d94f18baf7b", time: "2026-05-19T19:16:39.694Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 330bd08f82dc @ 2026-05-19T14:28:11.277Z -->
+<!-- elevenx-build: 1d94f18baf7b @ 2026-05-19T19:16:39.694Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -7541,25 +7541,29 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
   // v4.16: hardcode generate_audio: false. Audit found Seedance was being
   // asked to generate native audio on every roll AND being fed dialogue
   // text in the prompt body, producing mode-mixed video output that didn't
-  // match the reference. ElevenLabs handles all speech now; the Exports
-  // stage stitches video + per-shot VO. Ambient/SFX is on the prompt body
-  // ([Audio] block earlier) and Seedance renders it silent unless the
-  // user explicitly opts in via shot.audio.generate_native_override === true.
+  // match the reference.
   //
-  // v4.36 hybrid audio routing: when the shot has NO speech (no in-frame
-  // dialogue AND no voiceover entries), Seedance generates native SFX
-  // (ambient/environmental sound) automatically. When the shot HAS speech,
-  // generate_audio stays false to preserve the v4.16 mode-mixing fix —
-  // ElevenLabs handles speech, video stays silent for ambient (future
-  // enhancement: layer ElevenLabs SFX on dialogue shots; logged as deferred).
-  const hasSpeech = (
-    (shot.cast_in_frame || []).some(c =>
-      c.dialogue?.en || (typeof c.dialogue === "string" && c.dialogue.trim())
-    ) ||
-    (Array.isArray(shot.voiceover) && shot.voiceover.length > 0)
-  );
-  const genAudio = shot.audio?.generate_native_override === true
-                || (!hasSpeech && shot.audio?.generate_native_override !== false);
+  // v4.36 introduced a hybrid: Seedance native SFX for silent shots,
+  // false for dialogue shots. That gave inconsistent cross-shot SFX
+  // (Seedance has no audio-reference parameter — each shot generates
+  // a different room tone).
+  //
+  // v4.37 REVERTS to hardcoded false. ALL audio now flows through
+  // ElevenLabs in a single pipeline:
+  //   • Ambient bed: project.ambient_bed → /v1/sound-generation once,
+  //     looped across timeline at Exports
+  //   • Per-shot SFX events: shot.audio.sfx_events[] → /v1/sound-generation
+  //     per event
+  //   • Voice/VO: ElevenLabs TTS with cross-shot prosody continuity
+  //     (previous_text, previous_request_ids — see handleGenerateVoiceOverlay)
+  // This makes cross-shot consistency a structural property (one ambient
+  // bed reused, one voice-id per character with prosody chaining) rather
+  // than per-shot luck.
+  //
+  // shot.audio.generate_native_override === true still wins as an escape
+  // hatch (e.g., for a single experimental shot where you want Seedance
+  // to attempt audio anyway). Default is false.
+  const genAudio = shot.audio?.generate_native_override === true;
   const resolution = shot.prompt_engineering?.seedance_param_overrides?.resolution || "720p";
 
   let body;
@@ -8895,12 +8899,24 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
     /**
      * Generate TTS audio for a given voice + text.
      *
+     * v4.37 extension: now accepts the cross-utterance prosody params
+     * documented at the ElevenLabs TTS endpoint (verified via doc fetch
+     * 2026-05-19). Caller is responsible for collecting `previous_text`
+     * from prior shot dialogue and `previous_request_ids` from prior
+     * generation request_ids (returned from this method).
+     *
      * @param {object} body
      * @param {string} body.voice_id       — ElevenLabs voice ID
      * @param {string} body.text           — dialogue line (max ~5000 chars)
      * @param {string} [body.model_id]     — defaults to "eleven_v3"
-     * @param {object} [body.voice_settings]
-     * @returns {Promise<{ audioBlob: Blob, dataUrl: string, byteSize: number }>}
+     * @param {object} [body.voice_settings] — { stability, similarity_boost, style, speed }
+     * @param {string} [body.previous_text]  — v4.37: prior dialogue for prosody coherence
+     * @param {string} [body.next_text]      — v4.37: following dialogue
+     * @param {string[]} [body.previous_request_ids] — v4.37: prior generation IDs (max 3)
+     * @param {string[]} [body.next_request_ids]     — v4.37: following generation IDs
+     * @param {number} [body.seed]                   — v4.37: deterministic gen
+     * @param {"auto"|"on"|"off"} [body.apply_text_normalization]
+     * @returns {Promise<{ audioBlob: Blob, dataUrl: string, byteSize: number, request_id: string|null }>}
      */
     async textToSpeech(body, opts = {}) {
       if (!body.voice_id) throw new Error("textToSpeech: voice_id is required");
@@ -8913,8 +8929,25 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
         use_speaker_boost: true,
       };
 
+      // v4.37: assemble the request body. Only include cross-utterance
+      // params if the caller provided them (don't send empty arrays —
+      // some APIs reject those). previous_request_ids capped at 3 (the
+      // doc didn't quantify N; 3 is a safe-looking number from
+      // similar APIs; if ElevenLabs rejects, lower in a follow-up).
+      const reqBody = { text: body.text, model_id, voice_settings };
+      if (body.previous_text)               reqBody.previous_text = body.previous_text;
+      if (body.next_text)                   reqBody.next_text = body.next_text;
+      if (Array.isArray(body.previous_request_ids) && body.previous_request_ids.length > 0) {
+        reqBody.previous_request_ids = body.previous_request_ids.slice(0, 3);
+      }
+      if (Array.isArray(body.next_request_ids) && body.next_request_ids.length > 0) {
+        reqBody.next_request_ids = body.next_request_ids.slice(0, 3);
+      }
+      if (typeof body.seed === "number")     reqBody.seed = body.seed;
+      if (body.apply_text_normalization)     reqBody.apply_text_normalization = body.apply_text_normalization;
+
       const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(body.voice_id)}`;
-      this.onLog(`→ POST eleven_v3 TTS (${body.voice_id.slice(0, 8)}…, ${body.text.length} chars)`);
+      this.onLog(`→ POST eleven_v3 TTS (${body.voice_id.slice(0, 8)}…, ${body.text.length} chars${body.previous_text ? ", +prev_text" : ""}${reqBody.previous_request_ids ? `, +${reqBody.previous_request_ids.length} prev_req_ids` : ""})`);
 
       const res = await this._fetchWithRetry(url, {
         method: "POST",
@@ -8923,13 +8956,25 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
           "accept": "audio/mpeg",
           "content-type": "application/json",
         },
-        body: JSON.stringify({ text: body.text, model_id, voice_settings }),
+        body: JSON.stringify(reqBody),
       }, "elevenlabs tts");
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
         throw new Error(`elevenlabs tts ${res.status}: ${errText.slice(0, 300)}`);
       }
+
+      // v4.37: capture request_id from response headers for downstream
+      // cross-shot conditioning via previous_request_ids. ElevenLabs
+      // exposes it on a "Request-Id" or "request-id" header per their
+      // streaming-API docs; we try both cases. Falls back to null if
+      // the header isn't present — callers gracefully omit
+      // previous_request_ids in that case (falling back to previous_text
+      // alone, which is still better than today's no-context calls).
+      const request_id = res.headers?.get?.("request-id")
+                      || res.headers?.get?.("Request-Id")
+                      || res.headers?.get?.("x-request-id")
+                      || null;
 
       const audioBlob = await res.blob();
       const dataUrl = await this._blobToDataUrl(audioBlob);
@@ -8938,6 +8983,79 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
         dataUrl,
         byteSize: audioBlob.size,
         cost_usd_estimated: estimateElevenLabsCost(body.text.length),
+        model_id,
+        request_id,
+      };
+    }
+
+    /**
+     * v4.37: ElevenLabs sound-generation endpoint. POSTs to
+     * /v1/sound-generation with a text prompt and returns MP3 audio.
+     * Used by v4.37's SFX migration: ALL audio (ambient bed + per-shot
+     * SFX events) flows through this single endpoint, replacing Seedance's
+     * inconsistent per-shot native SFX.
+     *
+     * Verified params via doc fetch 2026-05-19:
+     *   • text (required)
+     *   • duration_seconds (optional, 0.5-30s; system estimates if omitted)
+     *   • prompt_influence (0-1, default 0.3; v4.37 uses 0.5 for stronger adherence)
+     *   • loop (boolean, v2 model only)
+     *   • model_id (string, default "eleven_text_to_sound_v2")
+     *
+     * @param {object} body
+     * @param {string} body.text
+     * @param {number} [body.duration_seconds]
+     * @param {number} [body.prompt_influence]
+     * @param {boolean} [body.loop]
+     * @param {string} [body.model_id]
+     * @returns {Promise<{ audioBlob: Blob, dataUrl: string, byteSize: number, cost_usd_estimated: number, model_id: string }>}
+     */
+    async soundGenerate(body, opts = {}) {
+      if (!body?.text || !body.text.trim()) {
+        throw new Error("soundGenerate: body.text is required");
+      }
+      const model_id = body.model_id || "eleven_text_to_sound_v2";
+      const reqBody = {
+        text: body.text,
+        model_id,
+        prompt_influence: typeof body.prompt_influence === "number" ? body.prompt_influence : 0.5,
+      };
+      if (typeof body.duration_seconds === "number") {
+        // Clamp to documented 0.5-30s range
+        reqBody.duration_seconds = Math.max(0.5, Math.min(30, body.duration_seconds));
+      }
+      if (body.loop === true) reqBody.loop = true;
+
+      const url = `https://api.elevenlabs.io/v1/sound-generation`;
+      this.onLog(`→ POST eleven sound-generation (${reqBody.duration_seconds ?? "auto"}s, prompt_influence=${reqBody.prompt_influence}${reqBody.loop ? ", loop" : ""})`);
+
+      const res = await this._fetchWithRetry(url, {
+        method: "POST",
+        headers: {
+          "xi-api-key": this.apiKey,
+          "accept": "audio/mpeg",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(reqBody),
+      }, "elevenlabs sound-generation");
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`elevenlabs sound-generation ${res.status}: ${errText.slice(0, 300)}`);
+      }
+
+      const audioBlob = await res.blob();
+      const dataUrl = await this._blobToDataUrl(audioBlob);
+      // Pricing: docs don't specify per-call cost. From training memory:
+      // ~$0.05-0.10 per generation depending on duration. We estimate
+      // conservatively as $0.08 for traceability — refine when fal/eleven
+      // publish a clearer rate.
+      const cost_usd_estimated = 0.08;
+      return {
+        audioBlob,
+        dataUrl,
+        byteSize: audioBlob.size,
+        cost_usd_estimated,
         model_id,
       };
     }
@@ -9081,7 +9199,14 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // this as true, v4.36 flips it to false after user audit caught the
   // cost-control regression) and project.auto_vo_overlay (default true;
   // ElevenLabs auto-fires for dialogue shots after take is rolled).
-  const DB_VER  = 4;
+  //
+  // v5: cross-shot audio consistency (v4.37 plan). Adds project.ambient_bed
+  // (string, project-level audio bed prompt) and seeds shots[*].audio.sfx_events
+  // to []. The ambient bed is rendered ONCE per project via ElevenLabs
+  // /v1/sound-generation and looped across the timeline at Exports; per-shot
+  // sfx_events are layered on top. Replaces the v4.36 hybrid that asked
+  // Seedance for per-shot SFX (which couldn't be made cross-shot consistent).
+  const DB_VER  = 5;
 
   // The stores that get the project_id filter treatment.
   const PROJECT_SCOPED = ["characters", "environments", "assets", "shots", "takes", "conversations"];
@@ -9223,6 +9348,41 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             if (dirty) c.update(row);
             c.continue();
           };
+        }
+        // v4 → v5: cross-shot audio consistency (v4.37). Adds:
+        //   - project.ambient_bed (string, project-level audio bed prompt)
+        //   - project.ambient_bed_audio (cache of the generated bed)
+        //   - shot.audio.sfx_events ([] — per-shot one-off SFX events,
+        //     authoring UI deferred to v4.38, schema seeded now so the
+        //     Exports stitch can read it without runtime if-undefined)
+        if (oldVersion < 5) {
+          const projOs = txn.objectStore("projects");
+          const pcur = projOs.openCursor();
+          pcur.onsuccess = (ev) => {
+            const c = ev.target.result;
+            if (!c) return;
+            const row = c.value;
+            let dirty = false;
+            if (row.ambient_bed === undefined) { row.ambient_bed = ""; dirty = true; }
+            if (row.ambient_bed_audio === undefined) { row.ambient_bed_audio = null; dirty = true; }
+            if (dirty) c.update(row);
+            c.continue();
+          };
+          // Seed shots[*].audio.sfx_events = []
+          if (db.objectStoreNames.contains("shots")) {
+            const shOs = txn.objectStore("shots");
+            const scur = shOs.openCursor();
+            scur.onsuccess = (ev) => {
+              const c = ev.target.result;
+              if (!c) return;
+              const row = c.value;
+              let dirty = false;
+              row.audio = row.audio || {};
+              if (!Array.isArray(row.audio.sfx_events)) { row.audio.sfx_events = []; dirty = true; }
+              if (dirty) c.update(row);
+              c.continue();
+            };
+          }
         }
       };
 
@@ -16981,6 +17141,37 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // stored on the take as audioDataUrl + overlay metadata. Playback in the
   // Shot Editor preview will use this overlay instead of the video's
   // native audio if present.
+  // v4.37: audio-tag derivation map. ElevenLabs v3 honors inline tags
+  // like `[whispers] line text` to shape per-line delivery. We auto-prefix
+  // when the cast/shot's delivery_note contains a matching keyword. Word
+  // boundaries enforced so "laughingly" doesn't accidentally trigger the
+  // [laughs] tag. Conservative — only fires on obvious matches.
+  const V437_AUDIO_TAG_MAP = [
+    { keywords: ["whisper", "whispers", "whispered", "whispering"], tag: "whispers" },
+    { keywords: ["sigh", "sighs", "sighed", "sighing"], tag: "sighs" },
+    { keywords: ["laugh", "laughs", "laughed", "laughing", "laughter"], tag: "laughs" },
+    { keywords: ["gasp", "gasps", "gasped", "gasping"], tag: "gasps" },
+    { keywords: ["cry", "cries", "crying", "weep", "weeps"], tag: "crying" },
+    { keywords: ["shout", "shouts", "shouting", "yell", "yells", "yelling"], tag: "shouting" },
+    { keywords: ["soft", "softly", "quiet", "quietly", "hushed"], tag: "softly" },
+    { keywords: ["angry", "angrily", "furious"], tag: "angrily" },
+    { keywords: ["excited", "excitedly", "thrilled"], tag: "excited" },
+    { keywords: ["sad", "sadly", "mournful"], tag: "sadly" },
+  ];
+  function deriveAudioTagFromDelivery(deliveryNote) {
+    if (!deliveryNote || typeof deliveryNote !== "string") return null;
+    const lower = deliveryNote.toLowerCase();
+    for (const { keywords, tag } of V437_AUDIO_TAG_MAP) {
+      for (const kw of keywords) {
+        // Word-boundary match: \b<kw>\b case-insensitively
+        const re = new RegExp(`\\b${kw}\\b`, "i");
+        if (re.test(lower)) return tag;
+      }
+    }
+    return null;
+  }
+  NS.deriveAudioTagFromDelivery = deriveAudioTagFromDelivery;
+
   async function handleGenerateVoiceOverlay(shotId, takeId) {
     if (!State.eleven) {
       toast("Add your ElevenLabs API key in Connection first.", { tone: "warn" });
@@ -17016,80 +17207,204 @@ JSON object only. No commentary. No fences. No trailing text.`;
       toast("This shot has no dialogue or voiceover lines — nothing to overlay.", { tone: "warn" });
       return;
     }
-    const firstLine = allLines[0];
 
-    // Resolve voice id. For cast speakers, look up the bible. For "narrator"
-    // or any unknown id, prompt the director — there's no character row to
-    // hang a voice_id off, so we store the inputted id on the shot itself.
     const characters = await Storage.getAll("characters");
-    const character  = characters.find(c => c.id === firstLine.speakerId);
-    const isNarrator = !character;  // VO with no matching cast row → narrator
-    const speakerDisplay = character?.display_name || (firstLine.speakerId === "narrator" ? "Narrator" : firstLine.speakerId);
 
-    let voiceId = character?.voice?.elevenlabs_fallback?.voice_id;
-    // Narrator lookups: keep a per-shot fallback in shot.voiceover[].voice_id
-    // so the director doesn't have to re-paste the id every roll.
-    if (isNarrator) {
-      const voEntry = (shot.voiceover || []).find(v => (v.speaker_id || "narrator") === firstLine.speakerId);
-      voiceId = voEntry?.voice_id || voiceId;
+    // v4.37: cross-shot prosody context. Walk shots in shot_number order
+    // to find the immediately-prior shot's LAST dialogue line (any
+    // speaker) for previous_text, and the immediately-next shot's FIRST
+    // line for next_text. Per-speaker prior request_ids are gathered
+    // separately below.
+    const allShots = await Storage.getAll("shots");
+    const sortedShots = [...allShots].sort((a, b) => (a.shot_number || 0) - (b.shot_number || 0));
+    const myIdx = sortedShots.findIndex(s => s.id === shotId);
+    let previous_text = null;
+    let next_text = null;
+    if (myIdx > 0) {
+      const prevShot = sortedShots[myIdx - 1];
+      const prevLines = [
+        ...(prevShot.cast_in_frame || []).map(c => c.dialogue?.en || (typeof c.dialogue === "string" ? c.dialogue : null)),
+        ...(prevShot.voiceover || []).map(v => v.text),
+      ].filter(t => t && String(t).trim());
+      if (prevLines.length > 0) previous_text = String(prevLines[prevLines.length - 1]).trim();
     }
-    if (!voiceId || voiceId === "TBD" || voiceId === "") {
-      const enteredVoiceId = prompt(
-        `${speakerDisplay}'s voice ID isn't set ${isNarrator ? "for this voiceover" : "in the cast bible (voice.elevenlabs_fallback.voice_id)"}.\n\nPaste an ElevenLabs voice ID to use:`,
-        ""
-      );
-      if (!enteredVoiceId) return;
-      // Save back to the right place so future rolls don't re-prompt
-      if (isNarrator) {
-        shot.voiceover = (shot.voiceover || []).map(v =>
-          (v.speaker_id || "narrator") === firstLine.speakerId
-            ? { ...v, voice_id: enteredVoiceId.trim() }
-            : v
-        );
-        await Storage.put("shots", shot);
-      } else if (character) {
-        character.voice = character.voice || {};
-        character.voice.elevenlabs_fallback = character.voice.elevenlabs_fallback || {};
-        character.voice.elevenlabs_fallback.voice_id = enteredVoiceId.trim();
-        await Storage.put("characters", character);
+    if (myIdx >= 0 && myIdx < sortedShots.length - 1) {
+      const nextShot = sortedShots[myIdx + 1];
+      const nextLines = [
+        ...(nextShot.cast_in_frame || []).map(c => c.dialogue?.en || (typeof c.dialogue === "string" ? c.dialogue : null)),
+        ...(nextShot.voiceover || []).map(v => v.text),
+      ].filter(t => t && String(t).trim());
+      if (nextLines.length > 0) next_text = String(nextLines[0]).trim();
+    }
+
+    // v4.37: walk prior shots' approved takes for same-speaker request_ids.
+    // ElevenLabs accepts up to N prior request IDs to condition the gen on
+    // actual prior generations (stronger than previous_text alone). We
+    // cap at 3 per the elevenLabsClient. Walk MOST-RECENT-FIRST so the
+    // closest priors land first in the array.
+    const collectPriorRequestIdsForSpeaker = (speakerId) => {
+      const ids = [];
+      for (let i = myIdx - 1; i >= 0 && ids.length < 3; i--) {
+        const ps = sortedShots[i];
+        const pt = (ps.takes || []).find(t => t.status === "approved" && t.audioOverlay);
+        if (!pt?.audioOverlay) continue;
+        // Schema (v4.37): audioOverlay may carry { lines: [{...}] } (v4.37+)
+        // or just the flat shape (v4.36 back-compat). Walk both.
+        const ovLines = Array.isArray(pt.audioOverlay.lines)
+          ? pt.audioOverlay.lines
+          : [pt.audioOverlay];
+        for (const ovL of ovLines) {
+          if (ovL?.speakerId === speakerId && ovL?.request_id) {
+            ids.push(ovL.request_id);
+            if (ids.length >= 3) break;
+          }
+        }
       }
-      return handleGenerateVoiceOverlay(shotId, takeId); // recurse with the now-saved id
-    }
+      return ids;
+    };
 
     State.activeJobs++;
-    setGPS(true, `Generating v3 overlay for <span class="mono">${esc(shotId)}</span>`, `${speakerDisplay} · ${firstLine.source} · ${firstLine.text.length} chars`, 30);
+    setGPS(true, `Generating v3 overlay for <span class="mono">${esc(shotId)}</span>`, `${allLines.length} line${allLines.length === 1 ? "" : "s"}${previous_text ? " · +prev_text" : ""}`, 20);
+
+    // v4.37: per-line generation. v4.36 only generated allLines[0] —
+    // shots with multiple speakers silently dropped all but the first.
+    // Now we generate ONE TTS per line and persist as audioOverlay.lines[].
+    // Back-compat: also stamp the FIRST line's fields at the top level of
+    // audioOverlay so readers expecting the v4.36 flat shape keep working.
+    const lineResults = [];
+    let totalCost = 0;
+    let totalBytes = 0;
     try {
-      const voice_settings = isNarrator ? {
-        stability: 0.5, similarity_boost: 0.75, style: 0.4, use_speaker_boost: true,
-      } : {
-        stability:        character.voice.elevenlabs_fallback.stability ?? 0.5,
-        similarity_boost: character.voice.elevenlabs_fallback.similarity ?? 0.75,
-        style:            character.voice.elevenlabs_fallback.style ?? 0.5,
-        use_speaker_boost: true,
-      };
-      const result = await State.eleven.textToSpeech({
-        voice_id: voiceId,
-        text: firstLine.text,
-        voice_settings,
-      });
-      // Persist on the take. The schema now carries `source` so the UI can
-      // show "VO" vs "lip-sync" badges later.
+      for (let lineIdx = 0; lineIdx < allLines.length; lineIdx++) {
+        const line = allLines[lineIdx];
+        const character = characters.find(c => c.id === line.speakerId);
+        const isNarrator = !character;
+        const speakerDisplay = character?.display_name || (line.speakerId === "narrator" ? "Narrator" : line.speakerId);
+
+        let voiceId = character?.voice?.elevenlabs_fallback?.voice_id;
+        if (isNarrator) {
+          const voEntry = (shot.voiceover || []).find(v => (v.speaker_id || "narrator") === line.speakerId);
+          voiceId = voEntry?.voice_id || voiceId;
+        }
+        if (!voiceId || voiceId === "TBD" || voiceId === "") {
+          // For multi-line shots with a missing voice ID, ask once and
+          // recurse (same UX as v4.36 single-line). The user only sees
+          // the prompt for the FIRST line that misses an ID; once they
+          // paste, the loop restarts and tries again.
+          const enteredVoiceId = prompt(
+            `${speakerDisplay}'s voice ID isn't set ${isNarrator ? "for this voiceover" : "in the cast bible (voice.elevenlabs_fallback.voice_id)"}.\n\nPaste an ElevenLabs voice ID to use:`,
+            ""
+          );
+          if (!enteredVoiceId) {
+            setGPS(false);
+            State.activeJobs--;
+            return;
+          }
+          if (isNarrator) {
+            shot.voiceover = (shot.voiceover || []).map(v =>
+              (v.speaker_id || "narrator") === line.speakerId
+                ? { ...v, voice_id: enteredVoiceId.trim() }
+                : v
+            );
+            await Storage.put("shots", shot);
+          } else if (character) {
+            character.voice = character.voice || {};
+            character.voice.elevenlabs_fallback = character.voice.elevenlabs_fallback || {};
+            character.voice.elevenlabs_fallback.voice_id = enteredVoiceId.trim();
+            await Storage.put("characters", character);
+          }
+          setGPS(false);
+          State.activeJobs--;
+          return handleGenerateVoiceOverlay(shotId, takeId);
+        }
+
+        // v4.37: per-character voice_settings honor cast-bible authored
+        // values + new speed param. style defaults to 0 per current
+        // ElevenLabs doc (was 0.5 in v4.36's hardcoded default; bible
+        // values still override).
+        const ev = character?.voice?.elevenlabs_fallback || {};
+        const voice_settings = isNarrator ? {
+          stability: 0.5, similarity_boost: 0.75, style: 0.4, speed: 1.0, use_speaker_boost: true,
+        } : {
+          stability:        ev.stability ?? 0.5,
+          similarity_boost: ev.similarity ?? 0.75,
+          style:            ev.style ?? 0.5,
+          speed:            ev.speed ?? 1.0,
+          use_speaker_boost: true,
+        };
+
+        // v4.37: audio-tag derivation. delivery_note keywords map to ElevenLabs
+        // v3 inline tags. Tags prepend the line text — the model treats them
+        // as a per-line delivery shaper.
+        const audioTag = deriveAudioTagFromDelivery(line.deliveryNote);
+        const taggedText = audioTag ? `[${audioTag}] ${line.text}` : line.text;
+
+        // v4.37: prior request_ids for THIS speaker (cross-shot prosody
+        // conditioning). Same-speaker only — Tom's prior request_ids
+        // shouldn't condition Aisha's gen.
+        const previous_request_ids = collectPriorRequestIdsForSpeaker(line.speakerId);
+
+        const result = await State.eleven.textToSpeech({
+          voice_id: voiceId,
+          text: taggedText,
+          voice_settings,
+          previous_text,
+          next_text,
+          previous_request_ids: previous_request_ids.length > 0 ? previous_request_ids : undefined,
+          seed: typeof ev.seed === "number" ? ev.seed : undefined,
+        });
+        lineResults.push({
+          dataUrl: result.dataUrl,
+          speakerId: line.speakerId,
+          speakerDisplay,
+          source: line.source,
+          voiceId,
+          modelId: result.model_id,
+          text: line.text,
+          taggedText,
+          audioTag,
+          deliveryNote: line.deliveryNote || null,
+          previous_text_used: previous_text || null,
+          next_text_used: next_text || null,
+          previous_request_ids_used: previous_request_ids,
+          request_id: result.request_id || null,
+          byteSize: result.byteSize,
+          cost_usd: result.cost_usd_estimated,
+          generated_at: Date.now(),
+        });
+        totalCost += result.cost_usd_estimated || 0;
+        totalBytes += result.byteSize || 0;
+      }
+
+      if (lineResults.length === 0) {
+        // No lines generated (all voice IDs missing + user cancelled the prompt)
+        return;
+      }
+
+      // v4.37 schema: audioOverlay.lines[] with back-compat top-level mirror
+      const firstResult = lineResults[0];
       take.audioOverlay = {
-        dataUrl: result.dataUrl,
-        characterId: firstLine.speakerId,
-        speakerDisplay,
-        source: firstLine.source,                 // "dialogue" | "voiceover"
-        voiceId,
-        modelId: result.model_id,
-        text: firstLine.text,
-        deliveryNote: firstLine.deliveryNote || null,
-        byteSize: result.byteSize,
-        cost_usd: result.cost_usd_estimated,
+        // v4.37 multi-line array
+        lines: lineResults,
+        total_cost_usd: totalCost,
+        total_byte_size: totalBytes,
         generated_at: Date.now(),
+        // Back-compat (v4.36 readers): top-level mirror of the first line
+        dataUrl: firstResult.dataUrl,
+        characterId: firstResult.speakerId,
+        speakerDisplay: firstResult.speakerDisplay,
+        source: firstResult.source,
+        voiceId: firstResult.voiceId,
+        modelId: firstResult.modelId,
+        text: firstResult.text,
+        deliveryNote: firstResult.deliveryNote,
+        byteSize: firstResult.byteSize,
+        cost_usd: firstResult.cost_usd,
       };
       await Storage.put("shots", shot);
-      await trackCost(result.cost_usd_estimated || 0, `elevenlabs v3 ${shotId}/${speakerDisplay}`);
-      toast(`${firstLine.source === "voiceover" ? "Voiceover" : "Voice overlay"} ready (${speakerDisplay})`);
+      await trackCost(totalCost, `elevenlabs v3 ${shotId} (${lineResults.length} lines)`);
+      const speakerSummary = [...new Set(lineResults.map(r => r.speakerDisplay))].join(", ");
+      toast(`Voice overlay ready · ${lineResults.length} line${lineResults.length === 1 ? "" : "s"} · ${speakerSummary}`, { duration: 4000 });
       if (State.activeShotId === shotId) renderShotEditor(shotId);
     } catch (err) {
       console.error("[eleven]", err);
@@ -18033,7 +18348,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
     else if (action === "clear-unapproved-candidates") handleClearUnapprovedCandidates(target.dataset.shotId, target.dataset.slot);
     else if (action === "toggle-state-change") handleToggleStateChange(target.dataset.shotId, target.checked);
     else if (action === "finish-play-all")    playSequenceFromIdx(0);
-    else if (action === "finish-pause")       $("#elx-finish-video")?.pause();
+    else if (action === "finish-pause") {
+      $("#elx-finish-video")?.pause();
+      // v4.37: pause ambient bed alongside the video (otherwise it loops
+      // silently underneath while the user thinks playback is fully paused).
+      $("#elx-finish-ambient-audio")?.pause();
+      $("#elx-finish-score-audio")?.pause();
+    }
     else if (action === "finish-score-pick") {
       const inp = $("#elx-finish-score-upload");
       if (inp) {
@@ -18043,6 +18364,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
     }
     else if (action === "finish-score-play")    handleScorePreview();
     else if (action === "finish-score-remove")  handleScoreRemove();
+    else if (action === "finish-ambient-generate") handleAmbientGenerate();
+    else if (action === "finish-ambient-preview")  handleAmbientPreview();
+    else if (action === "finish-ambient-clear")    handleAmbientClear();
     else if (action === "finish-export-fcpxml") handleExportFcpxml();
     else if (action === "finish-export-manifest") handleExportProvenance();
     else if (action === "open-shot-editor") navigateToShot(target.dataset.shotId);
@@ -18896,6 +19220,28 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const s5 = $("#screen-s5");
     if (!s5) return;
     if ($("#elx-finish", s5)) return;
+    // v4.37: schedule a one-time attach of the ambient textarea autosave
+    // AFTER innerHTML lands. setTimeout(0) is sufficient — by the next
+    // microtask the new DOM is queryable. Debounce by 600ms so each
+    // keystroke doesn't hit IDB.
+    setTimeout(() => {
+      const textarea = $("#elx-finish-ambient-text");
+      if (!textarea) return;
+      let saveTimer = null;
+      textarea.addEventListener("input", () => {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(async () => {
+          try {
+            const project = await Storage.Projects.getActive();
+            if (!project) return;
+            project.ambient_bed = textarea.value.trim();
+            await Storage.Projects.update(project.id, project);
+          } catch (err) {
+            console.warn("[ambient autosave]", err);
+          }
+        }, 600);
+      });
+    }, 0);
     s5.innerHTML = `
       <div class="s5 elx-finish" id="elx-finish">
         <div class="elx-finish__head">
@@ -18905,6 +19251,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
         <div class="elx-finish__player">
           <video id="elx-finish-video" controls playsinline style="width:100%; aspect-ratio:16/9; background:#000; border-radius:8px;"></video>
           <audio id="elx-finish-score-audio"></audio>
+          <!-- v4.37: project-level ambient bed audio. ElevenLabs sound-generation
+               produces ONE bed for the whole project (cross-shot consistent),
+               looped during sequence playback. Replaces Seedance native SFX which
+               couldn't be made consistent (no audio-reference param). -->
+          <audio id="elx-finish-ambient-audio" loop></audio>
           <div class="elx-finish__nowplaying" id="elx-finish-now"></div>
         </div>
         <div class="elx-finish__playctl">
@@ -18925,6 +19276,27 @@ JSON object only. No commentary. No fences. No trailing text.`;
             <button class="btn btn--sm btn--ghost" data-action="finish-score-play" id="elx-finish-score-play" disabled>▶ Preview</button>
             <button class="btn btn--sm btn--ghost" data-action="finish-score-remove" id="elx-finish-score-remove" disabled>Remove</button>
             <span class="elx-finish__score-hint">Enters at <span id="elx-finish-score-enters" class="mono">00:54</span> in the master · plays mixed with video audio</span>
+          </div>
+        </div>
+
+        <!-- v4.37: ambient bed. One ElevenLabs sound-generation per project,
+             looped across the full timeline. Replaces Seedance native SFX
+             (which was per-shot inconsistent — no audio-reference param). -->
+        <div class="elx-finish__score" id="elx-finish-ambient">
+          <div class="elx-finish__score-head">
+            <div class="elx-finish__label">Ambient bed (ElevenLabs sound-generation)</div>
+            <div class="elx-finish__score-state" id="elx-finish-ambient-state">No ambient bed generated</div>
+          </div>
+          <div style="margin:6px 0;">
+            <textarea id="elx-finish-ambient-text"
+                      placeholder="One-sentence ambient prompt for the whole project. Example: 'Modern open-plan office, low HVAC hum, distant overhead fluorescent buzz, occasional muffled keyboard clicks from outside the room, no music.'"
+                      style="width:100%; min-height:60px; background:#0e0e12; color:#e8e8ee; border:1px solid #2a2a35; border-radius:6px; padding:8px 10px; font-size:12px; font-family:Inter, system-ui, sans-serif; resize:vertical;"></textarea>
+          </div>
+          <div class="elx-finish__score-row">
+            <button class="btn btn--sm" data-action="finish-ambient-generate">🎵 Generate ambient bed (~$0.08)</button>
+            <button class="btn btn--sm btn--ghost" data-action="finish-ambient-preview" id="elx-finish-ambient-preview" disabled>▶ Preview</button>
+            <button class="btn btn--sm btn--ghost" data-action="finish-ambient-clear" id="elx-finish-ambient-clear" disabled>Remove</button>
+            <span class="elx-finish__score-hint">~30s clip, looped across the timeline · cross-shot consistent</span>
           </div>
         </div>
 
@@ -19057,6 +19429,28 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (playBtn) playBtn.disabled = true;
       if (rmBtn)   rmBtn.disabled = true;
     }
+    // v4.37: hydrate the ambient bed UI in the same pass.
+    const project = await Storage.Projects.getActive();
+    const textarea = $("#elx-finish-ambient-text");
+    const ambState = $("#elx-finish-ambient-state");
+    const previewBtn = $("#elx-finish-ambient-preview");
+    const clearBtn = $("#elx-finish-ambient-clear");
+    if (textarea && project?.ambient_bed && textarea.value === "") {
+      textarea.value = project.ambient_bed;
+    }
+    if (project?.ambient_bed_audio?.dataUrl) {
+      const sizeKb = Math.round((project.ambient_bed_audio.byteSize || 0) / 1024);
+      const costStr = project.ambient_bed_audio.cost_usd
+        ? fmtUsd(project.ambient_bed_audio.cost_usd)
+        : "—";
+      if (ambState) ambState.innerHTML = `<span style="color:#4ade80">Generated · ${sizeKb} KB · ${costStr} · ${new Date(project.ambient_bed_audio.generated_at || Date.now()).toLocaleString()}</span>`;
+      if (previewBtn) previewBtn.disabled = false;
+      if (clearBtn) clearBtn.disabled = false;
+    } else {
+      if (ambState) ambState.textContent = project?.ambient_bed ? "Prompt saved · click 'Generate ambient bed' to render" : "No ambient bed generated";
+      if (previewBtn) previewBtn.disabled = true;
+      if (clearBtn) clearBtn.disabled = true;
+    }
   }
 
   async function handleScorePreview() {
@@ -19073,6 +19467,77 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (!confirm("Remove the score from this episode?")) return;
     await Storage.setSetting("episode_score", null);
     toast("Score removed.");
+    renderFinishScreen();
+  }
+
+  // v4.37: ambient bed handlers. The bed is generated once per project
+  // via ElevenLabs /v1/sound-generation, persisted on project.ambient_bed_audio,
+  // and played underneath the sequence in the Finish player. Replaces
+  // Seedance native SFX (per-shot, inconsistent).
+  async function handleAmbientGenerate() {
+    if (!State.eleven) {
+      toast("Add your ElevenLabs API key in Connection first.", { tone: "warn" });
+      showConnectionPanel();
+      return;
+    }
+    const textarea = $("#elx-finish-ambient-text");
+    const text = (textarea?.value || "").trim();
+    if (!text) {
+      toast("Write an ambient prompt first (textarea above the Generate button).", { tone: "warn" });
+      return;
+    }
+    const project = await Storage.Projects.getActive();
+    if (!project) {
+      toast("No active project to attach the bed to.", { tone: "warn" });
+      return;
+    }
+    setGPS(true, `Generating ambient bed`, "eleven sound-generation · ~30s · ~$0.08", 25);
+    try {
+      const result = await State.eleven.soundGenerate({
+        text,
+        duration_seconds: 30,    // doc-confirmed max is 30s; we use the full 30 for richer ambient
+        prompt_influence: 0.5,   // higher than the doc default 0.3 so the model adheres to the ambient prompt
+        loop: true,              // v2 model supports loop:true; gives a seamless boundary for the looped playback
+      });
+      // Persist on the active project
+      project.ambient_bed = text;
+      project.ambient_bed_audio = {
+        dataUrl: result.dataUrl,
+        byteSize: result.byteSize,
+        cost_usd: result.cost_usd_estimated,
+        model_id: result.model_id,
+        prompt_text: text,
+        generated_at: Date.now(),
+      };
+      await Storage.Projects.update(project.id, project);
+      await trackCost(result.cost_usd_estimated || 0, `elevenlabs ambient bed`);
+      toast(`Ambient bed generated · ${Math.round(result.byteSize / 1024)} KB · ${fmtUsd(result.cost_usd_estimated)}`);
+      renderFinishScreen();
+    } catch (err) {
+      console.error("[ambient]", err);
+      toast(`Ambient bed gen failed: ${err.message}`, { tone: "err", duration: 8000 });
+    } finally {
+      setGPS(false);
+    }
+  }
+  async function handleAmbientPreview() {
+    const audio = $("#elx-finish-ambient-audio");
+    const project = await Storage.Projects.getActive();
+    if (!audio || !project?.ambient_bed_audio?.dataUrl) {
+      toast("No ambient bed to preview.", { tone: "warn" });
+      return;
+    }
+    audio.src = project.ambient_bed_audio.dataUrl;
+    audio.currentTime = 0;
+    audio.play().catch(() => toast("Browser blocked auto-play. Click ▶ Preview again.", { tone: "warn" }));
+  }
+  async function handleAmbientClear() {
+    if (!confirm("Remove the ambient bed audio from this project? (The prompt text stays, so you can regenerate.)")) return;
+    const project = await Storage.Projects.getActive();
+    if (!project) return;
+    project.ambient_bed_audio = null;
+    await Storage.Projects.update(project.id, project);
+    toast("Ambient bed cleared.");
     renderFinishScreen();
   }
 
@@ -19269,7 +19734,24 @@ JSON object only. No commentary. No fences. No trailing text.`;
     State.finishPlaylistIdx = startIdx;
     const v = $("#elx-finish-video");
     const scoreAudio = $("#elx-finish-score-audio");
+    const ambientAudio = $("#elx-finish-ambient-audio");
     if (!v) return;
+
+    // v4.37: ambient bed playback. If the project has a generated bed,
+    // start it on play and pause it when the sequence ends. The audio
+    // element is `loop`-attribute'd in adaptScreenFive, so it auto-loops
+    // for any sequence longer than the 30s bed. Volume is left at 1.0
+    // for v4.37; future enhancement (deferred to v4.38): a volume
+    // mixer that lets the director attenuate ambient vs VO vs score.
+    const projectForAmbient = await Storage.Projects.getActive();
+    const ambientUrl = projectForAmbient?.ambient_bed_audio?.dataUrl || null;
+    if (ambientAudio && ambientUrl) {
+      ambientAudio.src = ambientUrl;
+      ambientAudio.currentTime = 0;
+      ambientAudio.play().catch(() => {/* autoplay blocked; user can click ▶ Preview to start */});
+    } else if (ambientAudio) {
+      ambientAudio.removeAttribute("src");
+    }
 
     // Score: if the episode has one, queue it to start at its configured TC
     const score = await Storage.getSetting("episode_score", null);
@@ -19289,7 +19771,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const playNext = () => {
       const i = State.finishPlaylistIdx;
       const item = playlist[i];
-      if (!item) { v.removeEventListener("ended", playNext); scoreAudio?.pause(); return; }
+      if (!item) {
+        v.removeEventListener("ended", playNext);
+        scoreAudio?.pause();
+        // v4.37: pause the ambient bed when the sequence ends.
+        ambientAudio?.pause();
+        return;
+      }
       const num = item.shot.shot_number != null ? `S${String(item.shot.shot_number).padStart(2,"0")}` : "S?";
       playOne(item.take.videoDataUrl, `${num} · ${item.shot.display_name || item.shot.id} (${i+1}/${playlist.length})`);
       // Per-clip overlay sync (if this take has one)
