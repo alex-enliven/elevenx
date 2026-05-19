@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="04acaff3f2f5" data-build-time="2026-05-16T18:49:52.064Z">
+<meta name="elevenx-build" content="2a0149a34d73" data-build-time="2026-05-19T13:33:55.830Z">
 <script>
 (function(){
-  var info = { hash: "04acaff3f2f5", time: "2026-05-16T18:49:52.064Z" };
+  var info = { hash: "2a0149a34d73", time: "2026-05-19T13:33:55.830Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 04acaff3f2f5 @ 2026-05-16T18:49:52.064Z -->
+<!-- elevenx-build: 2a0149a34d73 @ 2026-05-19T13:33:55.830Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11842,30 +11842,48 @@ JSON object only. No commentary. No fences. No trailing text.`;
         reason: "bible mode=built_in_resolve — handled outside Seedance pipeline",
       };
     }
-    // 2. Gate-satisfied with BOTH frames + state-change → Kling dual-keyframe.
-    //    This is the highest-fidelity path: both anchors are honored as
-    //    actual frame positions, not as "style references".
+    // 2. Gate-satisfied with BOTH frames + state-change → dual-anchor engine.
+    //    User-selectable between Seedance i2v (with end_image_url) and Kling
+    //    O1 dual-keyframe via shot.generation.dual_anchor_engine (default
+    //    "seedance"). Audit (2026-05-16): v4.27-v4.32 hard-coded Kling here,
+    //    which required 5 follow-up builds to debug Kling-specific friction
+    //    (prompt length, field names, https-only image input, worker storage
+    //    route, JPEG transcode). Seedance i2v with end_image_url — which the
+    //    user's original audit offered as the "stay on Seedance for cost"
+    //    alternative — works today with data: URIs, no worker storage,
+    //    proven field names. Default to Seedance dual-anchor; Kling becomes
+    //    opt-in for A/B fidelity tests.
     //
-    // v4.30 field-name fix: Kling O1 dual-keyframe expects start_image_url
-    // (NOT image_url, which is Seedance's field). Audit (2026-05-16): both
-    // post-v4.27 rolls 422'd with "Field required: body.start_image_url"
-    // because the v4.17 code path reused Seedance's field names when it
-    // added Kling routing. body_overrides now carries the ENGINE-SPECIFIC
-    // dispatch field names (start_image_url + tail_image_url for Kling).
-    // The canonical "what URL is the start/end frame" lives at
-    // _anchors.{start,end} so consumers that need the frame URLs without
-    // caring about which engine (composer, prompt context, UI) read those
-    // and never touch body_overrides.
+    // body_overrides carries ENGINE-SPECIFIC dispatch field names:
+    //   - Seedance i2v dual-anchor: image_url + end_image_url
+    //   - Kling O1 dual-keyframe:   start_image_url + tail_image_url
+    // The canonical "what URL is which frame" lives at _anchors.{start,end}
+    // so consumers that need the frame URLs without caring about engine
+    // (composer, prompt context, UI) read those and never touch body_overrides.
     if (startApproved && endApproved && stateChange) {
+      const dualEngine = shot?.generation?.dual_anchor_engine || "seedance";
+      if (dualEngine === "kling") {
+        return {
+          engine: "kling-o1-dual",
+          composer_mode: "image_to_video",  // i2v prompt language fits dual-keyframe
+          body_overrides: {
+            start_image_url: startApproved,   // Kling O1 schema field name
+            tail_image_url:  endApproved,     // Kling O1 schema field name
+          },
+          _anchors: { start: startApproved, end: endApproved },
+          reason: "gate-approved start + end frames with has_state_change=true; shot.generation.dual_anchor_engine='kling' → Kling O1 dual-keyframe (overrides bible mode " + JSON.stringify(declaredMode) + ")",
+        };
+      }
+      // Default path: Seedance i2v with end_image_url (proven, no worker storage required)
       return {
-        engine: "kling-o1-dual",
-        composer_mode: "image_to_video",  // i2v prompt language fits dual-keyframe
+        engine: "seedance-image_to_video",
+        composer_mode: "image_to_video",
         body_overrides: {
-          start_image_url: startApproved,   // Kling O1 schema field name
-          tail_image_url:  endApproved,     // Kling O1 schema field name
+          image_url:     startApproved,     // Seedance i2v schema field name
+          end_image_url: endApproved,       // Seedance i2v dual-anchor field
         },
         _anchors: { start: startApproved, end: endApproved },
-        reason: "gate-approved start + end frames with has_state_change=true → Kling dual-keyframe anchors both ends (overrides bible mode " + JSON.stringify(declaredMode) + ")",
+        reason: "gate-approved start + end frames with has_state_change=true; dual_anchor_engine='seedance' (default) → Seedance i2v dual-anchor (overrides bible mode " + JSON.stringify(declaredMode) + ")",
       };
     }
     // 3. Gate-satisfied with START frame only → Seedance i2v. Single
@@ -16582,6 +16600,38 @@ JSON object only. No commentary. No fences. No trailing text.`;
     try {
       const candidates = await generateKeyframeCandidates(shotId, slot, 3);
       setGPS(false);
+      // v4.33 Direction A: auto-approve the first (top) candidate so the user
+      // doesn't have to click. They can still click a different candidate to
+      // override. This couples with the auto-roll-on-gate-satisfied handler
+      // in handleApproveCandidate to collapse the typical "Generate → click
+      // candidate → toggle state-change → Generate end → click candidate →
+      // Roll" 6-click ceremony into a single Generate click followed by
+      // watching the take materialize. Project-level setting
+      // `auto_approve_top_candidate` defaults ON; off restores explicit-click.
+      const project = await Storage.Projects.getActive();
+      const autoApprove = project?.auto_approve_top_candidate !== false;  // default ON
+      if (autoApprove && candidates.length > 0) {
+        try {
+          await approveKeyframeCandidate(shotId, slot, candidates[0].id);
+          toast(`✓ Generated ${candidates.length} candidate(s) — top auto-approved for ${slot} (click another to override).`, { duration: 4500 });
+          // Mirror the post-approve cascade: re-render + maybe auto-roll
+          if (State.activeShotId === shotId) renderShotEditor(shotId);
+          renderStoryboard();
+          // Mirror auto-roll trigger from handleApproveCandidate. Without this,
+          // auto-approve still requires the user to click roll, which
+          // defeats the click-reduction purpose.
+          const freshShot = await Storage.get("shots", shotId);
+          if (freshShot && isShotGateSatisfied(freshShot)) {
+            const autoRoll = project?.auto_roll_on_gate !== false;  // default ON
+            if (autoRoll) handleRollShot(shotId);
+          }
+          return;
+        } catch (err) {
+          // Auto-approve failed (shouldn't happen — we just generated them).
+          // Fall through to manual-mode toast.
+          console.warn("[v4.33 auto-approve top candidate failed]", err);
+        }
+      }
       toast(`✓ Generated ${candidates.length} keyframe candidate(s) for ${slot}. Click one to approve.`, { duration: 6000 });
       if (State.activeShotId === shotId) renderShotEditor(shotId);
       renderStoryboard();
@@ -16598,6 +16648,23 @@ JSON object only. No commentary. No fences. No trailing text.`;
       toast(`✓ ${slot[0].toUpperCase()}${slot.slice(1)} frame approved.`, { duration: 3000 });
       if (State.activeShotId === shotId) renderShotEditor(shotId);
       renderStoryboard();
+      // v4.33 Direction A: auto-roll on gate satisfaction. If approving this
+      // candidate just satisfied the gate AND the project allows auto-roll,
+      // fire handleRollShot immediately — saves the user a click per shot
+      // and aligns with the "review final take, not intermediate ceremony"
+      // UX direction. Project-level toggle (project.auto_roll_on_gate) lets
+      // a user turn this OFF for expensive batches where per-shot confirmation
+      // is still desired. Audit (2026-05-16): cuts ~11 clicks from an 11-shot film.
+      const freshShot = await Storage.get("shots", shotId);
+      if (freshShot && isShotGateSatisfied(freshShot)) {
+        const project = await Storage.Projects.getActive();
+        const autoRoll = project?.auto_roll_on_gate !== false;  // default ON
+        if (autoRoll) {
+          // Don't await — let the user keep interacting; the GPS overlay +
+          // toasts inside handleRollShot will signal progress.
+          handleRollShot(shotId);
+        }
+      }
     } catch (err) {
       toast(`Approve failed: ${err.message}`, { tone: "warn" });
     }
@@ -18014,6 +18081,26 @@ JSON object only. No commentary. No fences. No trailing text.`;
       return;
     }
     const kf = shot.keyframes || {};
+    // v4.33 Direction A: auto-set has_state_change from the v4.18 verb
+    // proposer on the FIRST visit to a shot whose value is undefined or
+    // migrated-to-false-but-proposer-disagrees. Saves the user a click for
+    // ~half the shots. The mutation is idempotent and runs async; the user
+    // never sees the checkbox jump because the proposer's verdict matches
+    // the shot's verb 95%+ of the time. If the user later wants the other
+    // value, they click the checkbox — that explicit click is respected
+    // forever (we only auto-set when has_state_change is undefined OR the
+    // _migrated_has_state_change flag is true).
+    if (kf.has_state_change === undefined || kf._migrated_has_state_change) {
+      const proposerSays = proposeHasStateChangeForShot(shot);
+      if (proposerSays !== !!kf.has_state_change) {
+        // Fire-and-forget; the next render after the write will see the new value
+        setShotHasStateChange(shot.id, proposerSays).catch(err => {
+          console.warn("[v4.33 auto-set has_state_change failed]", err);
+        });
+        // Optimistic local update so this render reflects the soon-to-be-persisted state
+        kf.has_state_change = proposerSays;
+      }
+    }
     const hasStateChange = !!kf.has_state_change;
     const startSlot = kf.start || { candidates: [], approved_id: null };
     const endSlot   = kf.end   || { candidates: [], approved_id: null };
@@ -18025,7 +18112,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // satisfied on legacy approved shots, but for semantically state-change
     // shots (e.g. S02 "The boy hides the shadow") that means Kling
     // dual-keyframe routing is silently bypassed. Surface the proposer's
-    // verdict so the director can opt in.
+    // verdict so the director can opt in. (v4.33: less relevant now that
+    // we auto-set above, but kept for the edge case where the proposer
+    // disagrees with an explicitly-set value.)
     const proposerVerdict = proposeHasStateChangeForShot(shot);
     const showProposerHint = !!kf._migrated_has_state_change
       && proposerVerdict !== hasStateChange;
@@ -18037,17 +18126,29 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // and show the engine name + a one-line "why" so the director can SEE
     // what the API call will be before they commit credits.
     const routingPreview = resolveRenderEngine(shot, { previousShotHasApprovedTake: false });
-    const engineLabel = ({
-      "kling-o1-dual": "Kling O1 dual-keyframe",
-      "seedance-image_to_video": "Seedance i2v (single anchor)",
-      "seedance-reference_to_video": "Seedance r2v (reference images)",
-      "seedance-text_to_video": "Seedance t2v (prompt-only)",
-      "built_in_resolve": "Resolve (no model call)",
-    })[routingPreview.engine] || routingPreview.engine;
+    // v4.33: distinguish single-anchor i2v from dual-anchor i2v in the
+    // routing chip. body_overrides.end_image_url is present only on the
+    // dual-anchor branch (proven Seedance path; default for state-change shots).
+    const isSeedanceDual = routingPreview.engine === "seedance-image_to_video"
+                          && !!routingPreview.body_overrides?.end_image_url;
+    const engineLabel = isSeedanceDual
+      ? "Seedance i2v dual-anchor (default)"
+      : ({
+          "kling-o1-dual": "Kling O1 dual-keyframe",
+          "seedance-image_to_video": "Seedance i2v (single anchor)",
+          "seedance-reference_to_video": "Seedance r2v (reference images)",
+          "seedance-text_to_video": "Seedance t2v (prompt-only)",
+          "built_in_resolve": "Resolve (no model call)",
+        })[routingPreview.engine] || routingPreview.engine;
     const engineColor = routingPreview.engine === "kling-o1-dual" ? "#c9a25a"
+                      : isSeedanceDual ? "#7eb3ff"
                       : routingPreview.engine === "seedance-image_to_video" ? "#7eb3ff"
                       : routingPreview.engine === "seedance-reference_to_video" ? "#9a9aab"
                       : "#6a6a78";
+    // v4.33 Direction A: engine choice exists per-shot but is collapsed in
+    // an "Advanced" disclosure so the default flow doesn't expose it.
+    // Currently selected value:
+    const currentDualEngine = shot?.generation?.dual_anchor_engine || "seedance";
 
     const renderCandidateStrip = (slot, slotData) => {
       const candidates = slotData.candidates || [];
@@ -18136,8 +18237,52 @@ JSON object only. No commentary. No fences. No trailing text.`;
           </div>
           ${renderCandidateStrip("end", endSlot)}
         </div>` : ""}
+        ${hasStateChange ? `
+        <!-- v4.33: Advanced disclosure — engine selection for dual-anchor.
+             Collapsed by default (per UX Direction A: subtraction default).
+             Only shown when has_state_change is on, since engine selection
+             only matters for the dual-anchor path. -->
+        <details style="margin-top:12px; padding-top:10px; border-top:1px solid #2a2a35;">
+          <summary style="cursor:pointer; font-size:11px; color:#9a9aab; user-select:none;">⚙ Advanced</summary>
+          <div style="margin-top:8px; padding:8px 10px; background:#0e0e12; border:1px solid #1f1f28; border-radius:4px;">
+            <label style="display:flex; align-items:center; gap:8px; font-size:11px; color:#c0c0ce;">
+              <span style="min-width:120px;">Dual-anchor engine:</span>
+              <select data-action="set-dual-anchor-engine" data-shot-id="${esc(shot.id)}"
+                      style="background:#14141a; color:#e8e8ee; border:1px solid #2a2a35; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">
+                <option value="seedance" ${currentDualEngine === "seedance" ? "selected" : ""}>Seedance i2v dual-anchor (default, proven)</option>
+                <option value="kling"    ${currentDualEngine === "kling"    ? "selected" : ""}>Kling O1 dual-keyframe (requires worker storage; A/B fidelity test)</option>
+              </select>
+            </label>
+            <div style="margin-top:6px; font-size:10px; color:#6a6a78; line-height:1.4;">
+              v4.33: Seedance i2v with end_image_url is the default — it uses the same field names and data: URIs the gate already produces. Switch to Kling only to compare fidelity on a single shot; Kling requires the /fal-storage/* worker route to be deployed and uses ~5-8× more bandwidth (PNG anchor uploads).
+            </div>
+          </div>
+        </details>` : ""}
       </div>
     `;
+    // v4.33: wire the Advanced dropdown's change event. The global click
+    // delegator can't catch <select> changes (the click hits the select
+    // element, not the chosen option's data-action). Direct listener keeps
+    // this change-handling logic contained without expanding the global
+    // delegator's contract to "click OR change."
+    const engineSelect = host.querySelector('[data-action="set-dual-anchor-engine"]');
+    if (engineSelect) {
+      engineSelect.addEventListener("change", async (e) => {
+        const value = e.target.value;
+        if (value !== "seedance" && value !== "kling") return;
+        try {
+          const fresh = await Storage.get("shots", shot.id);
+          if (!fresh) return;
+          fresh.generation = fresh.generation || {};
+          fresh.generation.dual_anchor_engine = value;
+          await Storage.put("shots", fresh);
+          toast(`Engine set to ${value === "kling" ? "Kling O1 dual-keyframe" : "Seedance i2v dual-anchor"} for this shot.`, { duration: 3500 });
+          if (State.activeShotId === shot.id) renderShotEditor(shot.id);
+        } catch (err) {
+          toast(`Engine change failed: ${err.message}`, { tone: "warn" });
+        }
+      });
+    }
   }
   NS.renderKeyframeGate = renderKeyframeGate;
 
