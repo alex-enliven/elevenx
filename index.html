@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="e459c06b51bc" data-build-time="2026-05-19T22:01:01.313Z">
+<meta name="elevenx-build" content="5b28b45b0668" data-build-time="2026-05-20T14:03:16.496Z">
 <script>
 (function(){
-  var info = { hash: "e459c06b51bc", time: "2026-05-19T22:01:01.313Z" };
+  var info = { hash: "5b28b45b0668", time: "2026-05-20T14:03:16.496Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: e459c06b51bc @ 2026-05-19T22:01:01.313Z -->
+<!-- elevenx-build: 5b28b45b0668 @ 2026-05-20T14:03:16.496Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -12401,6 +12401,343 @@ JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.aiAuthorShot = aiAuthorShot;
 
+  // ─── v4.42 M-AI-1: project-level AI authoring orchestrator ───────────────
+  //
+  // Companion to aiAuthorShot. Same return envelope, but the proposals are
+  // at the PROJECT level — full entities (project meta, characters, envs,
+  // shots), not shot fields.
+  //
+  // Modes:
+  //   - "bootstrap_bible" — given a logline + medium + style hints, propose
+  //     a complete starting bible: 1 project, 2-4 characters, 1-3 envs,
+  //     6-12 shots. For a brand-new user with no cast/env/shots.
+  //   - "generate_storyboard" — given an EXISTING project + cast + envs,
+  //     propose only shots that reference the existing entities.
+  //
+  // Input shape:
+  //   { logline: string, medium?: string, style_hints?: string,
+  //     shot_count_target?: number, duration_target_seconds?: number }
+  //
+  // Output (same envelope as aiAuthorShot):
+  //   { proposals: [{ field, current, proposed, rationale }], cost_usd, model }
+  //
+  // Field paths use prefixed routing so applyBootstrapProposals can dispatch:
+  //   "project"             → Storage.Projects.create
+  //   "character.<id>"      → Storage.put("characters", parsedValue)
+  //   "environment.<id>"    → Storage.put("environments", parsedValue)
+  //   "shot.<id>"           → Storage.put("shots", parsedValue)
+  //
+  // Cost guard: estimates token usage before submit; throws if projected
+  // cost > $1.50 (a 10-shot bootstrap should land ~$0.30-$0.80).
+  const AI_AUTHOR_PROJECT_COST_CEILING = 1.50;
+  async function aiAuthorProject(input, ctx, mode) {
+    // v4.42: input validation runs FIRST (cheap, surfaces the clearest
+    // error message). The State.openai guard runs after — otherwise a
+    // missing API key masks a malformed-logline bug behind a generic
+    // "not configured" message.
+    if (!input?.logline || typeof input.logline !== "string" || input.logline.trim().length < 8) {
+      throw new Error("aiAuthorProject: input.logline is required (min 8 chars)");
+    }
+    if (mode !== "bootstrap_bible" && mode !== "generate_storyboard") {
+      throw new Error(`aiAuthorProject: unknown mode "${mode}" (expected "bootstrap_bible" or "generate_storyboard")`);
+    }
+    if (!State.openai) {
+      throw new Error("aiAuthorProject: OpenAI client not configured. Set the OpenAI API key in Connection settings.");
+    }
+    const { project, characters, environments } = ctx || {};
+    const logline = input.logline.trim();
+    const medium = (input.medium || project?.medium || "live_action").trim();
+    const styleHints = (input.style_hints || "").trim();
+    const shotCount = Math.max(2, Math.min(20, Number(input.shot_count_target) || 10));
+    const durationTotal = Math.max(8, Math.min(300, Number(input.duration_target_seconds) || (shotCount * 8)));
+    const perShotDuration = Math.max(4, Math.min(15, Math.round(durationTotal / shotCount)));
+
+    // Build the existing-bible context for generate_storyboard mode. For
+    // bootstrap mode, the cast/env arrays are empty — the model proposes
+    // everything fresh.
+    const castInBible = (characters || []).map(c => ({
+      id: c.id,
+      display_name: c.display_name,
+      archetype: c.identity?.archetype,
+      distinctive_features: c.physical?.distinctive_features?.slice(0, 4),
+    }));
+    const envsInBible = (environments || []).map(e => ({
+      id: e.id,
+      display_name: e.display_name,
+      architecture_type: e.architecture?.type,
+      lighting_primary: e.lighting?.primary_source,
+    }));
+
+    let system, user;
+    if (mode === "bootstrap_bible") {
+      // The system prompt asks for a complete starting bible. Output is a
+      // JSON object with proposals[] where each proposal's `proposed` field
+      // is a JSON-stringified entity body. Field paths use the
+      // entity-routing prefix scheme so applyBootstrapProposals can persist
+      // each proposal to the right store.
+      system = [
+        "You are a film director's AI authoring assistant.",
+        "Given a logline + medium + style hints, propose a COMPLETE starting bible for a short film:",
+        "1 project meta, 2-4 characters, 1-3 environments, " + shotCount + " shots.",
+        "",
+        "Output ONLY a JSON object with this exact shape:",
+        '{"proposals":[',
+        '  {"field":"project","current":"(none)","proposed":"<JSON string of project body>","rationale":"why these project choices"},',
+        '  {"field":"character.<slug>","current":"(none)","proposed":"<JSON string of character body>","rationale":"role in story"},',
+        '  {"field":"environment.<slug>","current":"(none)","proposed":"<JSON string of env body>","rationale":"why this location"},',
+        '  {"field":"shot.<slug>","current":"(none)","proposed":"<JSON string of shot body>","rationale":"dramatic function"}',
+        ']}',
+        "",
+        "PROJECT body MUST include: display_name, description, medium, logline, style_canon (1-3 sentences),",
+        "default_shot_duration_seconds (" + perShotDuration + "), aspect (16:9 unless logline implies otherwise).",
+        "",
+        "CHARACTER body MUST include: id (snake_case slug), display_name, identity {age, role_in_story, archetype},",
+        "physical {distinctive_features: [2-4 items]}, wardrobe {episode_default: {top, bottom, footwear}, color_palette: [2-3 colors]},",
+        "stability_note (1 sentence visual identity lock), high_risk (boolean — true for protagonist + on-screen named cast).",
+        "",
+        "ENVIRONMENT body MUST include: id (snake_case slug), display_name, description,",
+        "architecture {type}, lighting {primary_source, quality, time_of_day}, palette [3-5 colors], props [3-5 items].",
+        "",
+        "SHOT body MUST include: id (snake_case slug like s01_cold_open), shot_number (1..N),",
+        "display_name, timecode {duration_seconds: " + perShotDuration + "},",
+        "the_moment {verb, focal_point, emotional_beat, description},",
+        "camera {framing (wide|medium|close-up|two-shot|over-shoulder), movement (locked|pan|dolly|handheld), aspect_ratio: '16:9'},",
+        "cast_in_frame [{character_id: '<matches a character.id from this same proposal>', role_in_shot: 'in-frame'|'speaks'|'observing', action}],",
+        "location {location_id: '<matches an environment.id from this same proposal>'},",
+        "audio {ambient (1-sentence description), generate_native: true},",
+        "generation {mode: 'image_to_video'}.",
+        "",
+        "CRITICAL: character_id references in shots MUST point at character.id values you propose in THIS pass.",
+        "Same for location_id. The composer will refuse shots referencing non-existent entities.",
+        "",
+        "Keep prose cinematic but accessible. The user is NOT a professional director — focal_point and emotional_beat",
+        "should be plain-English descriptions of what's literally on screen and how the moment feels.",
+      ].join("\n");
+      user = JSON.stringify({
+        logline,
+        medium,
+        style_hints: styleHints,
+        shot_count: shotCount,
+        duration_total_seconds: durationTotal,
+        per_shot_duration_seconds: perShotDuration,
+        instruction: "Propose the complete starting bible. Return JSON only. Use snake_case slugs throughout.",
+      });
+    } else {
+      // generate_storyboard — uses existing cast/env, proposes only shots.
+      system = [
+        "You are a film director's AI authoring assistant.",
+        "Given an EXISTING project + cast + environments, propose " + shotCount + " shots that USE the existing entities.",
+        "",
+        "Output ONLY a JSON object: " +
+          '{"proposals":[{"field":"shot.<slug>","current":"(none)","proposed":"<JSON string of shot body>","rationale":"dramatic function"}]}',
+        "",
+        "SHOT body MUST include: id, shot_number, display_name, timecode {duration_seconds},",
+        "the_moment {verb, focal_point, emotional_beat, description}, camera, cast_in_frame, location, audio, generation.",
+        "",
+        "CRITICAL: cast_in_frame[].character_id MUST be from the existing bible (see ctx.cast_bible).",
+        "location.location_id MUST be from existing environments (see ctx.env_bible).",
+      ].join("\n");
+      user = JSON.stringify({
+        project: {
+          display_name: project?.display_name,
+          medium: project?.medium,
+          style_canon: project?.style_canon,
+          logline: project?.logline,
+        },
+        cast_bible: castInBible,
+        env_bible: envsInBible,
+        logline,
+        shot_count: shotCount,
+        per_shot_duration_seconds: perShotDuration,
+        style_hints: styleHints,
+        instruction: "Propose " + shotCount + " shots only. Return JSON only.",
+      });
+    }
+
+    // Pre-flight cost estimate. gpt-4o pricing (from CHAT_PRICING_PER_1K):
+    // $0.0025 input / $0.01 output per 1K. Bootstrap proposals run ~2.5K
+    // out for a 10-shot generation; ceiling at $1.50 protects against
+    // runaway max_tokens edge cases.
+    const estimatedCostUsd = ((system.length + user.length) / 4 / 1000) * 0.0025 + (2500 / 1000) * 0.01;
+    if (estimatedCostUsd > AI_AUTHOR_PROJECT_COST_CEILING) {
+      throw new Error(`aiAuthorProject: estimated cost $${estimatedCostUsd.toFixed(2)} exceeds ceiling $${AI_AUTHOR_PROJECT_COST_CEILING.toFixed(2)} — reduce shot_count_target or shorten logline`);
+    }
+
+    const result = await State.openai.chatCompletion({
+      system,
+      user,
+      response_format: { type: "json_object" },
+      temperature: 0.7,  // higher than aiAuthorShot's 0.4 — bootstrap needs more creative variation
+      max_tokens: 4000,
+    });
+    const proposals = Array.isArray(result.parsed?.proposals) ? result.parsed.proposals : [];
+    // Guard: drop proposals that don't have both a field and a proposed body.
+    const filtered = proposals.filter(p => p && p.field && p.proposed);
+    return {
+      proposals: filtered,
+      cost_usd: result.cost_usd_estimated || 0,
+      model: result.model,
+    };
+  }
+  NS.aiAuthorProject = aiAuthorProject;
+  NS.AI_AUTHOR_PROJECT_COST_CEILING = AI_AUTHOR_PROJECT_COST_CEILING;
+
+  // v4.42 M-AI-1b: persist a set of accepted bootstrap proposals into IDB.
+  //
+  // Inspects each proposal's field-path prefix and routes to the right store:
+  //   "project"             → Storage.Projects.create + setActive
+  //   "character.<id>"      → Storage.put("characters", body)
+  //   "environment.<id>"    → Storage.put("environments", body)
+  //   "shot.<id>"           → Storage.put("shots", body)
+  //
+  // The proposed payload comes from the LLM as a JSON STRING (gpt-4o tends
+  // to nest structured bodies as strings inside JSON-mode responses); this
+  // helper parses lazily and surfaces partial-failure detail in the toast.
+  //
+  // Project proposals run FIRST (creates the project + activates it so
+  // Storage.put gets the right project_id injection). Then characters +
+  // environments (so shots can resolve their character_id/location_id
+  // references when written). Then shots last.
+  //
+  // Returns: { applied: { project, characters, environments, shots },
+  //            project_id, errors: [{ field, error }] }
+  async function applyBootstrapProposals(accepted) {
+    if (!Array.isArray(accepted) || accepted.length === 0) {
+      return { applied: { project: 0, characters: 0, environments: 0, shots: 0 }, errors: [] };
+    }
+    const applied = { project: 0, characters: 0, environments: 0, shots: 0 };
+    const errors = [];
+    let createdProjectId = null;
+
+    // Helper — parses the `proposed` field which may be a JSON string OR
+    // an already-parsed object.
+    const parseProposed = (raw) => {
+      if (raw == null) return null;
+      if (typeof raw === "object") return raw;
+      if (typeof raw === "string") {
+        try { return JSON.parse(raw); } catch { /* fall through */ }
+      }
+      return null;
+    };
+
+    // Phase 1: project. Must come first so subsequent put()s get the right
+    // project_id injection from Storage.put().
+    const projectProposal = accepted.find(p => p.field === "project");
+    if (projectProposal) {
+      try {
+        const body = parseProposed(projectProposal.proposed);
+        if (!body || !body.display_name) {
+          throw new Error("project proposal has no display_name");
+        }
+        const row = await Storage.Projects.create({
+          display_name: body.display_name,
+          description: body.description || "",
+          medium: body.medium || "live_action",
+          logline: body.logline || "",
+          style_canon: body.style_canon || "",
+          default_shot_duration_seconds: body.default_shot_duration_seconds || 8,
+          aspect: body.aspect || "16:9",
+        });
+        await Storage.Projects.setActive(row.id);
+        createdProjectId = row.id;
+        applied.project = 1;
+      } catch (err) {
+        errors.push({ field: "project", error: err.message });
+        // If project creation fails the rest is moot — abort.
+        return { applied, errors, project_id: null };
+      }
+    }
+
+    // Phase 2: characters.
+    const charProposals = accepted.filter(p => p.field?.startsWith("character."));
+    for (const p of charProposals) {
+      try {
+        const body = parseProposed(p.proposed);
+        if (!body || !body.id) {
+          throw new Error("character proposal has no id");
+        }
+        // Initialize empty refs buckets — generators expect refs.user / refs.<modelKey>
+        body.refs = body.refs || { user: {}, seedream: {}, gpt: {} };
+        body.refs.user = body.refs.user || {};
+        body.refs.seedream = body.refs.seedream || {};
+        body.refs.gpt = body.refs.gpt || {};
+        body.derived_refs = body.derived_refs || {};
+        await Storage.put("characters", body);
+        applied.characters++;
+      } catch (err) {
+        errors.push({ field: p.field, error: err.message });
+      }
+    }
+
+    // Phase 3: environments.
+    const envProposals = accepted.filter(p => p.field?.startsWith("environment."));
+    for (const p of envProposals) {
+      try {
+        const body = parseProposed(p.proposed);
+        if (!body || !body.id) {
+          throw new Error("environment proposal has no id");
+        }
+        body.refs = body.refs || { user: {}, seedream: {}, gpt: {} };
+        await Storage.put("environments", body);
+        applied.environments++;
+      } catch (err) {
+        errors.push({ field: p.field, error: err.message });
+      }
+    }
+
+    // Phase 4: shots. Recompute timecode based on shot_number ordering so
+    // back-to-back shots have continuous in/out times.
+    const shotProposals = accepted.filter(p => p.field?.startsWith("shot."));
+    const shotBodies = [];
+    for (const p of shotProposals) {
+      try {
+        const body = parseProposed(p.proposed);
+        if (!body || !body.id) throw new Error("shot proposal has no id");
+        shotBodies.push({ body, field: p.field });
+      } catch (err) {
+        errors.push({ field: p.field, error: err.message });
+      }
+    }
+    // Sort by shot_number, then assign in/out timecodes from cumulative durations.
+    shotBodies.sort((a, b) => (a.body.shot_number || 0) - (b.body.shot_number || 0));
+    let cursorSeconds = 0;
+    for (const { body, field } of shotBodies) {
+      try {
+        const duration = Math.max(4, Math.min(15, Number(body.timecode?.duration_seconds) || 8));
+        body.timecode = body.timecode || {};
+        body.timecode.duration_seconds = duration;
+        body.timecode.in = formatTimecode(cursorSeconds);
+        body.timecode.out = formatTimecode(cursorSeconds + duration);
+        cursorSeconds += duration;
+        // Seed required arrays so downstream code doesn't trip.
+        body.takes = body.takes || [];
+        body.audio = body.audio || {};
+        if (!Array.isArray(body.audio.sfx_events)) body.audio.sfx_events = [];
+        body.keyframes = body.keyframes || {};
+        body._validation = body._validation || { issues: [], schema_version: "v4.41" };
+        body.shot_summary = body.shot_summary || "";
+        body.shot_summary_source = "auto";
+        await Storage.put("shots", body);
+        applied.shots++;
+      } catch (err) {
+        errors.push({ field, error: err.message });
+      }
+    }
+
+    return { applied, errors, project_id: createdProjectId };
+  }
+  NS.applyBootstrapProposals = applyBootstrapProposals;
+
+  // Small helper used by applyBootstrapProposals to compute timecodes.
+  // Format: "00:00:00:00" (HH:MM:SS:FF at 24fps); FF stays 00 for now since
+  // the seed data uses second-precision in/out.
+  function formatTimecode(totalSeconds) {
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = Math.floor(totalSeconds % 60);
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}:00`;
+  }
+
   // v4.39: AI-pick a voice from the user's ElevenLabs library by matching
   // against the character's voice.seedance_native_direction description.
   // Used by the in-app voice-ID modal as a "Auto-pick" affordance.
@@ -19475,6 +19812,268 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // ─── Inject missing DOM hooks into mockup ───────────────────────────
   // The mockup hardcoded its cast cards. We replace them with a grid container
   // that our render functions populate.
+
+  // v4.42 M-AI-1c: Screen 1 ("AI Producer") was a static mockup conversation
+  // until now. This replaces the demo content with a real interactive chat
+  // UI that calls aiAuthorProject (bootstrap_bible / generate_storyboard)
+  // and runs the resulting proposals through openFixPreviewModal →
+  // applyBootstrapProposals.
+  //
+  // Two entry-button modes:
+  //   • "✨ Create new film from logline" → bootstrap_bible mode → creates a
+  //     brand-new project + cast + envs + shots from the typed logline.
+  //   • "+ Add shots to current project" → generate_storyboard mode → adds
+  //     shots to the currently-active project using its existing cast/envs.
+  //
+  // Cost preview is shown before submit (estimated, hard cap $1.50).
+  function adaptScreenOne() {
+    const s1Section = $("#screen-s1");
+    if (!s1Section) return;
+    if ($("#elx-ai-producer-chat", s1Section)) return;  // idempotent
+
+    // Replace the inner `<div class="s1">` content. The outer .s1 grid
+    // stays so the breadcrumb / right-rail layout still works.
+    const s1Inner = $(".s1", s1Section);
+    if (!s1Inner) return;
+
+    s1Inner.innerHTML = `
+      <div id="elx-ai-producer-chat" style="
+        max-width:720px; margin:0 auto; padding:48px 24px 24px;
+        display:flex; flex-direction:column; gap:20px;
+        font-family: Inter, system-ui, sans-serif; color:#e8e8ee;
+      ">
+        <div style="text-align:center; padding:16px 8px;">
+          <div style="width:56px; height:56px; margin:0 auto 16px;
+                      border-radius:50%;
+                      background:radial-gradient(circle at 30% 28%, rgba(255,255,255,0.22), transparent 50%),
+                                  conic-gradient(from 200deg at 50% 50%, var(--gold), #5a4220, var(--gold-hi), var(--gold), #3d2c14, var(--gold));"></div>
+          <h1 style="margin:0; font-size:22px; font-weight:600; line-height:1.3;">
+            Tell me about the film you want to make.
+          </h1>
+          <p style="margin:8px 0 0; font-size:13.5px; color:#9a9aab; line-height:1.6; max-width:520px; margin-left:auto; margin-right:auto;">
+            One sentence is enough. I'll propose the cast, locations, and a complete storyboard. You'll review every choice before anything is saved.
+          </p>
+        </div>
+
+        <div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:12px; padding:18px 20px;">
+          <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:6px; letter-spacing:0.04em; text-transform:uppercase;">Logline</label>
+          <textarea id="elx-producer-logline" rows="3"
+            placeholder="A 60-second short about a boy who turns invisible to escape a lion guard prowling a ruined throne hall…"
+            style="${FIELD_INPUT_STYLE} resize:vertical; min-height:64px; margin-bottom:14px; font-size:14px; line-height:1.5;"></textarea>
+
+          <div style="display:grid; grid-template-columns:1fr 110px 110px; gap:12px; margin-bottom:14px;">
+            <div>
+              <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Medium</label>
+              <select id="elx-producer-medium" style="${FIELD_INPUT_STYLE}">
+                <option value="animated_3d">3D animated</option>
+                <option value="animated_2d">2D animated</option>
+                <option value="live_action">Live action</option>
+                <option value="motion_graphics">Motion graphics</option>
+                <option value="documentary">Documentary</option>
+              </select>
+            </div>
+            <div>
+              <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Shots</label>
+              <input id="elx-producer-shot-count" type="number" min="2" max="20" value="10" style="${FIELD_INPUT_STYLE}">
+            </div>
+            <div>
+              <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Total length (sec)</label>
+              <input id="elx-producer-duration" type="number" min="8" max="300" value="80" style="${FIELD_INPUT_STYLE}">
+            </div>
+          </div>
+
+          <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Style hints (optional)</label>
+          <textarea id="elx-producer-style-hints" rows="2"
+            placeholder="Stylized 3D animation, dark fantasy palette, low-key lighting, observational camera. Tone reverent and grounded."
+            style="${FIELD_INPUT_STYLE} resize:vertical; min-height:50px; font-size:13px; line-height:1.5;"></textarea>
+        </div>
+
+        <div id="elx-producer-mode-info" style="font-size:11.5px; color:#6a6a78; line-height:1.55; padding:0 4px;"></div>
+
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button id="elx-producer-bootstrap" type="button"
+            style="flex:1; min-width:240px; background:#c9a25a; color:#14141a; border:none;
+                   padding:12px 16px; border-radius:8px; font-size:13px; font-weight:600;
+                   cursor:pointer; line-height:1.3;">
+            ✨ Create new film from logline
+          </button>
+          <button id="elx-producer-storyboard" type="button"
+            style="flex:1; min-width:240px; background:transparent; color:#c9a25a; border:1px solid #c9a25a;
+                   padding:12px 16px; border-radius:8px; font-size:13px; font-weight:600;
+                   cursor:pointer; line-height:1.3;">
+            + Add shots to current project
+          </button>
+        </div>
+
+        <div id="elx-producer-status" style="display:none; padding:12px 16px; border-radius:8px;
+              font-size:12.5px; line-height:1.5; background:rgba(201,162,90,0.08); border:1px solid rgba(201,162,90,0.3); color:#c8c8d4;"></div>
+
+        <details style="margin-top:8px; font-size:11.5px; color:#6a6a78;">
+          <summary style="cursor:pointer; padding:4px 0;">How this works</summary>
+          <div style="padding:10px 14px; background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; margin-top:6px; line-height:1.6;">
+            <p style="margin:0 0 8px;"><strong>Create new film</strong> calls GPT-4o to draft a complete starting bible from your logline: 2-4 characters with identity descriptions, 1-3 locations with visual notes, and ${"<shot count>"} shots with cinematic direction. You'll preview every entity before anything is saved.</p>
+            <p style="margin:0 0 8px;"><strong>Add shots</strong> reuses the cast + locations from your active project; only proposes new shots.</p>
+            <p style="margin:0;"><strong>Cost</strong>: ~$0.30–$0.80 per generation, hard-capped at $1.50. After accepting, cast / location reference images cost $0.05 each via Seedream.</p>
+          </div>
+        </details>
+      </div>
+    `;
+
+    // Update the inline mode-info hint based on active project state.
+    const refreshModeInfo = async () => {
+      const infoEl = $("#elx-producer-mode-info");
+      if (!infoEl) return;
+      const project = await Storage.Projects.getActive();
+      const chars = await Storage.getAll("characters");
+      const envs = await Storage.getAll("environments");
+      const hasBibles = chars.length > 0 && envs.length > 0;
+      if (project && hasBibles) {
+        infoEl.innerHTML = `Active project: <strong style="color:#e8e8ee;">${esc(project.display_name)}</strong> · ${chars.length} cast · ${envs.length} location${envs.length === 1 ? "" : "s"}. "Add shots" extends this project; "Create new film" starts fresh.`;
+      } else if (project) {
+        infoEl.innerHTML = `Active project: <strong style="color:#e8e8ee;">${esc(project.display_name)}</strong> · no bibles yet. Both buttons will bootstrap a fresh bible.`;
+      } else {
+        infoEl.textContent = "No active project yet. Use \"Create new film\" to start.";
+      }
+    };
+    refreshModeInfo();
+
+    // Bootstrap mode handler
+    const onBootstrap = () => handleAIProducerSubmit("bootstrap_bible");
+    const onStoryboard = () => handleAIProducerSubmit("generate_storyboard");
+    $("#elx-producer-bootstrap").addEventListener("click", onBootstrap);
+    $("#elx-producer-storyboard").addEventListener("click", onStoryboard);
+  }
+
+  // v4.42 M-AI-1c: AI Producer chat submit handler. Reads the form, fires
+  // aiAuthorProject(mode), shows proposals via openFixPreviewModal, applies
+  // accepted via applyBootstrapProposals on success. Reloads to land the
+  // user on the freshly-created project's storyboard.
+  async function handleAIProducerSubmit(mode) {
+    if (!State.openai) {
+      toast("Add your OpenAI API key in Connection first.", { tone: "warn" });
+      showConnectionPanel();
+      return;
+    }
+    const logline = $("#elx-producer-logline")?.value?.trim();
+    if (!logline || logline.length < 8) {
+      toast("Logline needs at least 8 characters — tell me what the film is about.", { tone: "warn" });
+      return;
+    }
+    const medium = $("#elx-producer-medium")?.value || "live_action";
+    const shotCount = Number($("#elx-producer-shot-count")?.value) || 10;
+    const duration = Number($("#elx-producer-duration")?.value) || 80;
+    const styleHints = $("#elx-producer-style-hints")?.value?.trim() || "";
+
+    const statusEl = $("#elx-producer-status");
+    const setStatus = (html, tone = "info") => {
+      if (!statusEl) return;
+      statusEl.style.display = "block";
+      const bg = tone === "err" ? "rgba(248,113,113,0.08)" : tone === "ok" ? "rgba(74,222,128,0.08)" : "rgba(201,162,90,0.08)";
+      const border = tone === "err" ? "rgba(248,113,113,0.3)" : tone === "ok" ? "rgba(74,222,128,0.3)" : "rgba(201,162,90,0.3)";
+      const color = tone === "err" ? "#fca5a5" : tone === "ok" ? "#86efac" : "#c8c8d4";
+      statusEl.style.background = bg;
+      statusEl.style.borderColor = border;
+      statusEl.style.color = color;
+      statusEl.innerHTML = html;
+    };
+
+    setStatus(`🎬 ${mode === "bootstrap_bible" ? "Drafting a fresh starting bible" : "Generating storyboard for active project"}… (${shotCount} shots, ${duration}s total)`);
+    setGPS(true, `AI Producer ${mode === "bootstrap_bible" ? "bootstrap" : "storyboard"}`, "gpt-4o · proposing bible", 30);
+
+    try {
+      const project = await Storage.Projects.getActive();
+      const characters = await Storage.getAll("characters");
+      const environments = await Storage.getAll("environments");
+      const ctx = { project, characters, environments };
+
+      const result = await aiAuthorProject(
+        {
+          logline,
+          medium,
+          style_hints: styleHints,
+          shot_count_target: shotCount,
+          duration_target_seconds: duration,
+        },
+        ctx,
+        mode
+      );
+      setGPS(false);
+
+      if (!result?.proposals || result.proposals.length === 0) {
+        setStatus("AI returned no proposals — try a longer logline or different style hints.", "err");
+        return;
+      }
+
+      // Group proposals for the preview by entity type for readability.
+      const subtitle = (() => {
+        const pCount = result.proposals.filter(p => p.field === "project").length;
+        const cCount = result.proposals.filter(p => p.field?.startsWith("character.")).length;
+        const eCount = result.proposals.filter(p => p.field?.startsWith("environment.")).length;
+        const sCount = result.proposals.filter(p => p.field?.startsWith("shot.")).length;
+        const parts = [];
+        if (pCount) parts.push(`${pCount} project`);
+        if (cCount) parts.push(`${cCount} character${cCount === 1 ? "" : "s"}`);
+        if (eCount) parts.push(`${eCount} location${eCount === 1 ? "" : "s"}`);
+        if (sCount) parts.push(`${sCount} shot${sCount === 1 ? "" : "s"}`);
+        return `GPT proposed ${parts.join(" + ")}. Accept the ones you want; reject the rest. Each accepted entity will be persisted to your project.`;
+      })();
+
+      const accepted = await openFixPreviewModal({
+        title: mode === "bootstrap_bible" ? "✨ New film from logline" : "+ New shots for active project",
+        subtitle,
+        proposals: result.proposals,
+        cost_usd: result.cost_usd,
+      });
+      if (accepted.length === 0) {
+        setStatus("No proposals accepted. The project is unchanged.", "info");
+        return;
+      }
+
+      setStatus(`Persisting ${accepted.length} entit${accepted.length === 1 ? "y" : "ies"}…`);
+      const applyResult = await applyBootstrapProposals(accepted);
+      if (result.cost_usd) await trackCost(result.cost_usd, `AI Producer ${mode}`);
+
+      const summary = [
+        applyResult.applied.project ? `1 project` : "",
+        applyResult.applied.characters ? `${applyResult.applied.characters} character${applyResult.applied.characters === 1 ? "" : "s"}` : "",
+        applyResult.applied.environments ? `${applyResult.applied.environments} location${applyResult.applied.environments === 1 ? "" : "s"}` : "",
+        applyResult.applied.shots ? `${applyResult.applied.shots} shot${applyResult.applied.shots === 1 ? "" : "s"}` : "",
+      ].filter(Boolean).join(" + ");
+      const errorTail = applyResult.errors.length > 0
+        ? ` <span style="color:#fca5a5;">(${applyResult.errors.length} error${applyResult.errors.length === 1 ? "" : "s"} — see console)</span>`
+        : "";
+      if (applyResult.errors.length > 0) {
+        console.warn("[v4.42 applyBootstrapProposals errors]", applyResult.errors);
+      }
+
+      const reloadHint = mode === "bootstrap_bible"
+        ? `Reloading in 2s so the new project becomes active…`
+        : `Switching to Storyboard…`;
+      setStatus(`✓ Persisted ${summary}.${errorTail}<br><span style="color:#9a9aab;">${reloadHint}</span>`, "ok");
+      toast(`AI Producer applied ${summary}.`, { tone: "ok", duration: 4000 });
+
+      if (mode === "bootstrap_bible") {
+        // Project active was set inside applyBootstrapProposals; full reload
+        // re-runs init() with the new active project as the seed.
+        setTimeout(() => window.location.reload(), 1800);
+      } else {
+        // For storyboard mode: navigate to s3 + re-render storyboard.
+        setTimeout(() => {
+          document.querySelectorAll(".proto-tab").forEach(t => t.classList.toggle("is-active", t.dataset.screen === "s3"));
+          document.querySelectorAll(".screen").forEach(s => s.classList.toggle("is-active", s.id === "screen-s3"));
+          renderStoryboard();
+        }, 1200);
+      }
+    } catch (err) {
+      console.error("[v4.42 AI Producer]", err);
+      setGPS(false);
+      setStatus(`✗ ${esc(err.message)}`, "err");
+      toast(`AI Producer failed: ${err.message}`, { tone: "err", duration: 8000 });
+    }
+  }
+  NS.handleAIProducerSubmit = handleAIProducerSubmit;
+  NS.adaptScreenOne = adaptScreenOne;
+
   function adaptScreenTwo() {
     const s2 = $("#screen-s2");
     if (!s2) return;
@@ -23707,6 +24306,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
     }
 
     // Adapt each screen's DOM (replace static mockup content with live containers)
+    // v4.42: Screen 1 ("AI Producer") becomes the real story-first chat
+    // entry point instead of the static demo conversation.
+    adaptScreenOne();
     adaptScreenTwo();
     adaptScreenThree();
     adaptScreenFour();
