@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="5b28b45b0668" data-build-time="2026-05-20T14:03:16.496Z">
+<meta name="elevenx-build" content="a6df40db0580" data-build-time="2026-05-20T14:43:40.405Z">
 <script>
 (function(){
-  var info = { hash: "5b28b45b0668", time: "2026-05-20T14:03:16.496Z" };
+  var info = { hash: "a6df40db0580", time: "2026-05-20T14:43:40.405Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 5b28b45b0668 @ 2026-05-20T14:03:16.496Z -->
+<!-- elevenx-build: a6df40db0580 @ 2026-05-20T14:43:40.405Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -8077,7 +8077,33 @@ function mediumPromptSpec(medium) {
       envNegative: "neon, sci-fi, fake plants, lens flare, dramatic lighting, soundstage feel",
     };
   }
-  // live_action (default)
+  // v4.42.1 F4: photoreal — CG-rendered photoreal humans (think Unreal
+  // MetaHumans). Distinct from live_action: this is generated, not captured.
+  // The bias is naturalistic camera language + "indistinguishable from
+  // live action" quality cue + aggressive anti-stylization negative.
+  if (medium === "photoreal") {
+    return {
+      opening: "Photoreal CG character — indistinguishable from a real human in a film. Anamorphic cinematic framing.",
+      qualityCues: "Naturalistic skin with realistic pores, sub-surface scattering, accurate eye reflection, individual hair strands. Cinematic 35mm lens look, soft natural light from a single direction. Identity-locked photoreal — feels like a real actor.",
+      negativeCues: "stylization, animated, illustration, cartoon, plastic skin, smooth-out, exaggerated features, anime, AI sheen, painterly, hand-drawn, motion graphics",
+      envOpening: "Photoreal CG establishing shot — looks like real-world cinematography, naturalistic lighting.",
+      envQuality: "Photoreal materials, accurate light/shadow, realistic scale. Looks captured, not rendered.",
+      envNegative: "stylization, painterly, illustration, cartoon, plastic, AI sheen, hand-drawn",
+    };
+  }
+  // v4.42.1 F4: motion_graphics — type-driven, abstract visual language.
+  // No humans by default; if humans appear they're abstracted silhouettes.
+  if (medium === "motion_graphics") {
+    return {
+      opening: "Motion graphics composition — abstract typography, geometric shapes, vibrant color blocks.",
+      qualityCues: "Bold flat-color design, kinetic typography, smooth easing, modern brand-system aesthetic. No photoreal rendering.",
+      negativeCues: "photoreal, photograph, 3D character animation, skin pores, lens flare, naturalistic, stock photo",
+      envOpening: "Motion graphics environment — abstract geometric setting, no photoreal architecture.",
+      envQuality: "Flat color planes, geometric props, brand-system palette.",
+      envNegative: "photoreal, photograph, 3D rendering, naturalistic lighting, fake plants, lens flare",
+    };
+  }
+  // live_action (default — actual camera, actual humans)
   return {
     opening: "Photographic portrait, documentary corporate style.",
     qualityCues: "Neutral grey studio background. Soft north-facing daylight from camera right. 35mm lens, shallow depth of field, natural skin texture visible, high resolution.",
@@ -8125,6 +8151,25 @@ function mediumPromptSpecForKeyframe(medium) {
       opening: "Observational documentary cinematic still — a frame mid-scene, available light.",
       qualityCues: "Naturalistic, subtle camera presence. Scene composition: subject in their actual environment, mid-action. No studio lighting setup. Natural skin texture, real environment.",
       negativeCues: "stock photo, plastic skin, over-smoothed, AI sheen, theatrical lighting, glossy, posed portrait, neutral background, reference sheet",
+    };
+  }
+  // v4.42.1 F4: photoreal keyframes — indistinguishable from live action.
+  // Bias: anamorphic framing + "this is a still from a Roger Deakins-shot
+  // film" qualifier + naturalistic light. Same negatives as photoreal cast
+  // refs but tuned for scene composition not portraits.
+  if (medium === "photoreal") {
+    return {
+      opening: "Photoreal cinematic still — a single frame from a film, anamorphic 35mm, naturalistic.",
+      qualityCues: "Scene composition: subject in their environment with action visible. Realistic pores, accurate light/shadow, subtle film grain. Looks captured by a camera, not rendered. Style of Roger Deakins / Emmanuel Lubezki — naturalism + cinematic restraint.",
+      negativeCues: "stylization, animated, illustration, cartoon, plastic skin, hand-drawn, painterly, motion graphics, AI sheen, posed portrait, reference sheet, neutral background",
+    };
+  }
+  // v4.42.1 F4: motion_graphics keyframes — abstract design composition.
+  if (medium === "motion_graphics") {
+    return {
+      opening: "Motion graphics composition — a single frame of an abstract, type-driven sequence.",
+      qualityCues: "Bold flat color planes, kinetic geometry, brand-system aesthetic. No photoreal rendering. Composition includes type and abstract shapes as scene elements.",
+      negativeCues: "photoreal, photograph, 3D character animation, skin pores, lens flare, naturalistic, posed portrait, reference sheet",
     };
   }
   // live_action (default)
@@ -8935,24 +8980,31 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
   // Reads at runtime so a user with access to gpt-5/4.1 can flip the
   // AI_AUTHOR_MODEL constant + add a pricing entry without touching the
   // call sites.
+  //
+  // v4.42.1: gpt-5.5 is the new default. The v4.42 validation surfaced
+  // multi-character drop bugs in gpt-4o output that gpt-5.5 handles
+  // correctly per Anthropic-team benchmarks. Pricing roughly 2.5-3×
+  // gpt-4o on input + output, but still <$0.20 per bootstrap call.
   const CHAT_PRICING_PER_1K = {
     "gpt-4o":      { in: 0.0025, out: 0.01 },
     "gpt-4o-mini": { in: 0.00015, out: 0.0006 },
-    "gpt-4.1":     { in: 0.002,  out: 0.008 },     // approximate; verify
+    "gpt-4.1":     { in: 0.002,  out: 0.008 },
     "gpt-4-turbo": { in: 0.01,   out: 0.03 },
-    "gpt-5":       { in: 0.005,  out: 0.02 },      // placeholder; verify when available
-    "gpt-5.5":     { in: 0.007,  out: 0.025 },     // placeholder; user-mentioned model
+    "gpt-5":       { in: 0.005,  out: 0.02 },
+    "gpt-5-mini":  { in: 0.0005, out: 0.002 },     // budget tier
+    "gpt-5.5":     { in: 0.007,  out: 0.025 },     // v4.42.1 default
   };
   function estimateOpenAIChatCost(model, inputTokens, outputTokens) {
-    const rate = CHAT_PRICING_PER_1K[model] || CHAT_PRICING_PER_1K["gpt-4o"];
+    const rate = CHAT_PRICING_PER_1K[model] || CHAT_PRICING_PER_1K["gpt-5.5"];
     return (inputTokens / 1000) * rate.in + (outputTokens / 1000) * rate.out;
   }
 
-  // v4.39: Default model for the AI authoring layer. Change this constant
-  // to flip the entire AI authoring layer to a newer model when one
-  // becomes available in the user's account. Empirically validated for
-  // structured-JSON outputs as of 2026-05-19.
-  const AI_AUTHOR_MODEL = "gpt-4o";
+  // v4.42.1: Default model for the AI authoring layer. Bumped from
+  // gpt-4o → gpt-5.5 after the 2026-05-20 validation surfaced a class
+  // of multi-character scene-blocking bugs that gpt-4o silently
+  // dropped. gpt-5.5 is roughly 3× the cost but ~10× more reliable on
+  // structured-multi-entity outputs. Flip this constant to roll back.
+  const AI_AUTHOR_MODEL = "gpt-5.5";
 
   NS.OpenAIClient = OpenAIClient;
   NS.estimateOpenAIImageCost = estimateOpenAIImageCost;
@@ -12438,8 +12490,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (!input?.logline || typeof input.logline !== "string" || input.logline.trim().length < 8) {
       throw new Error("aiAuthorProject: input.logline is required (min 8 chars)");
     }
-    if (mode !== "bootstrap_bible" && mode !== "generate_storyboard") {
-      throw new Error(`aiAuthorProject: unknown mode "${mode}" (expected "bootstrap_bible" or "generate_storyboard")`);
+    if (mode !== "bootstrap_bible" && mode !== "generate_storyboard"
+        && mode !== "fix_cast_coverage" && mode !== "fill_shot_summaries") {
+      throw new Error(`aiAuthorProject: unknown mode "${mode}" (expected "bootstrap_bible" | "generate_storyboard" | "fix_cast_coverage" | "fill_shot_summaries")`);
     }
     if (!State.openai) {
       throw new Error("aiAuthorProject: OpenAI client not configured. Set the OpenAI API key in Connection settings.");
@@ -12470,24 +12523,51 @@ JSON object only. No commentary. No fences. No trailing text.`;
 
     let system, user;
     if (mode === "bootstrap_bible") {
-      // The system prompt asks for a complete starting bible. Output is a
-      // JSON object with proposals[] where each proposal's `proposed` field
-      // is a JSON-stringified entity body. Field paths use the
-      // entity-routing prefix scheme so applyBootstrapProposals can persist
-      // each proposal to the right store.
+      // v4.42.1: prompt strengthened against the 2026-05-20 multi-character
+      // drop bug. Three new rules (A/B/C) + a 2-character few-shot example
+      // + a HARD shot count contract. Defense-in-depth: post-call validator
+      // (detectMultiCharacterDrops) still scans the result for any
+      // characters that slipped through this prompt.
       system = [
         "You are a film director's AI authoring assistant.",
         "Given a logline + medium + style hints, propose a COMPLETE starting bible for a short film:",
-        "1 project meta, 2-4 characters, 1-3 environments, " + shotCount + " shots.",
+        "1 project meta, 2-4 characters, 1-3 environments, EXACTLY " + shotCount + " shots (do NOT return fewer or more).",
         "",
-        "Output ONLY a JSON object with this exact shape:",
-        '{"proposals":[',
-        '  {"field":"project","current":"(none)","proposed":"<JSON string of project body>","rationale":"why these project choices"},',
-        '  {"field":"character.<slug>","current":"(none)","proposed":"<JSON string of character body>","rationale":"role in story"},',
-        '  {"field":"environment.<slug>","current":"(none)","proposed":"<JSON string of env body>","rationale":"why this location"},',
-        '  {"field":"shot.<slug>","current":"(none)","proposed":"<JSON string of shot body>","rationale":"dramatic function"}',
+        "════════ MULTI-CHARACTER COVERAGE RULES ════════",
+        "RULE A: For each shot, include in cast_in_frame EVERY character",
+        "visually present in the scene OR named in the focal_point /",
+        "description prose, even if only one speaks. If two characters argue,",
+        "chase, react, or share frame — BOTH go in cast_in_frame.",
+        "",
+        "RULE B: Use role_in_shot = 'in-frame' for visible characters,",
+        "'speaks' for the primary speaker, 'observing' for a character",
+        "present but not the focal subject. Multiple cast members per shot",
+        "is the NORMAL case for any interaction (chase, dialogue, conflict,",
+        "reaction shot).",
+        "",
+        "RULE C: If a character is referenced narratively but NOT on-screen",
+        "(off-camera voice, hidden, mentioned in narration), put them in",
+        "cast_off_frame instead — never silently drop them from the shot.",
+        "",
+        "POSITIVE EXAMPLE (multi-character coverage done right):",
+        '  Shot: "the Boy crouches behind a rock while the Lion Guard",',
+        '         "prowls past, eyes scanning the savannah"',
+        '  cast_in_frame: [',
+        '    { character_id: "boy",        role_in_shot: "in-frame",  action: "crouches behind rock" },',
+        '    { character_id: "lion_guard", role_in_shot: "in-frame",  action: "prowls past, scanning" }',
+        '  ]',
+        "  (BOTH characters are in the frame — the Boy is the focal subject",
+        "  but the Lion Guard is also visible, so BOTH must appear.)",
+        "",
+        "════════ JSON OUTPUT SHAPE ════════",
+        'Output ONLY a JSON object: {"proposals":[',
+        '  {"field":"project","current":"(none)","proposed":"<JSON string>","rationale":"..."},',
+        '  {"field":"character.<slug>","current":"(none)","proposed":"<JSON string>","rationale":"..."},',
+        '  {"field":"environment.<slug>","current":"(none)","proposed":"<JSON string>","rationale":"..."},',
+        '  {"field":"shot.<slug>","current":"(none)","proposed":"<JSON string>","rationale":"..."}',
         ']}',
         "",
+        "════════ ENTITY BODIES ════════",
         "PROJECT body MUST include: display_name, description, medium, logline, style_canon (1-3 sentences),",
         "default_shot_duration_seconds (" + perShotDuration + "), aspect (16:9 unless logline implies otherwise).",
         "",
@@ -12502,13 +12582,17 @@ JSON object only. No commentary. No fences. No trailing text.`;
         "display_name, timecode {duration_seconds: " + perShotDuration + "},",
         "the_moment {verb, focal_point, emotional_beat, description},",
         "camera {framing (wide|medium|close-up|two-shot|over-shoulder), movement (locked|pan|dolly|handheld), aspect_ratio: '16:9'},",
-        "cast_in_frame [{character_id: '<matches a character.id from this same proposal>', role_in_shot: 'in-frame'|'speaks'|'observing', action}],",
+        "cast_in_frame [{character_id, role_in_shot, action}] — apply RULES A/B/C above,",
+        "cast_off_frame [{character_id}] (optional — for narration-only references),",
         "location {location_id: '<matches an environment.id from this same proposal>'},",
         "audio {ambient (1-sentence description), generate_native: true},",
         "generation {mode: 'image_to_video'}.",
         "",
-        "CRITICAL: character_id references in shots MUST point at character.id values you propose in THIS pass.",
-        "Same for location_id. The composer will refuse shots referencing non-existent entities.",
+        "════════ HARD CONTRACTS ════════",
+        "• EXACTLY " + shotCount + " shot proposals. Not " + (shotCount-1) + ", not " + (shotCount+1) + ". The user explicitly asked for this count.",
+        "• character_id references in shots MUST point at character.id values from THIS proposal.",
+        "• location_id references MUST point at environment.id values from THIS proposal.",
+        "• Apply RULES A/B/C to EVERY shot. The composer fails downstream when cast is incomplete.",
         "",
         "Keep prose cinematic but accessible. The user is NOT a professional director — focal_point and emotional_beat",
         "should be plain-English descriptions of what's literally on screen and how the moment feels.",
@@ -12520,13 +12604,87 @@ JSON object only. No commentary. No fences. No trailing text.`;
         shot_count: shotCount,
         duration_total_seconds: durationTotal,
         per_shot_duration_seconds: perShotDuration,
-        instruction: "Propose the complete starting bible. Return JSON only. Use snake_case slugs throughout.",
+        instruction: "Propose the complete starting bible. Return JSON only. EXACTLY " + shotCount + " shots. Apply multi-character coverage rules.",
+      });
+    } else if (mode === "fix_cast_coverage") {
+      // v4.42.1 F2-c: per-shot AI fix for a multi-character drop detected
+      // by detectMultiCharacterDrops. Input.shot is the bootstrap-proposed
+      // shot; input.missing_characters[] is the list of characters whose
+      // display_name appears in focal_point/description but who are NOT
+      // in cast_in_frame. The model returns a CORRECTED cast_in_frame
+      // array including the missing entities.
+      system = [
+        "You are a film director's AI authoring assistant.",
+        "A previous AI pass dropped some characters from a shot's cast_in_frame even though",
+        "they appear in the shot's prose. Your job is to return the CORRECTED cast_in_frame",
+        "for THIS ONE shot — include the originally-listed characters PLUS the missing ones.",
+        "",
+        "Output ONLY a JSON object: " +
+        '{"proposals":[{"field":"shot.<id>.cast_in_frame","current":"<JSON of original array>","proposed":"<JSON of corrected array>","rationale":"named in focal_point/description"}]}',
+        "",
+        "Use role_in_shot: 'in-frame' for the missing characters unless the prose makes it",
+        "obvious they're 'observing' (passive presence) or 'speaks' (primary speaker).",
+        "Each entry needs character_id + role_in_shot + action (1 short phrase).",
+        "",
+        "Return EXACTLY 1 proposal — the corrected cast_in_frame for this shot.",
+      ].join("\n");
+      user = JSON.stringify({
+        shot_id: input.shot_id,
+        focal_point: input.shot?.the_moment?.focal_point,
+        description: input.shot?.the_moment?.description,
+        current_cast_in_frame: input.shot?.cast_in_frame || [],
+        missing_characters: input.missing_characters || [],
+        instruction: "Return the corrected cast_in_frame array. Return JSON only.",
+      });
+    } else if (mode === "fill_shot_summaries") {
+      // v4.42.1 F6: batched shot summary generation. Called by
+      // applyBootstrapProposals AFTER all shots are persisted, in one
+      // chat call instead of N per-shot calls. Cheaper, and the cost
+      // surfaces in the bootstrap cost ledger line.
+      const shots = Array.isArray(input.shots) ? input.shots : [];
+      system = [
+        "You write one-sentence shot summaries (≤140 chars each, plain text)",
+        "for a film director's storyboard. For each shot below, emit a SINGLE",
+        "sentence describing WHAT THE SHOT DOES at a story level. Focus on the",
+        "dramatic beat — not technical fields like camera, duration, audio.",
+        "",
+        "Output ONLY: " +
+        '{"proposals":[{"field":"shot.<id>.shot_summary","current":"","proposed":"<single sentence>","rationale":"dramatic function"}]}',
+        "",
+        "Return EXACTLY " + shots.length + " proposals — one per shot in the input array, same order.",
+      ].join("\n");
+      user = JSON.stringify({
+        project_display_name: project?.display_name,
+        medium: project?.medium,
+        shots: shots.map(s => ({
+          id: s.id,
+          shot_number: s.shot_number,
+          focal_point: s.the_moment?.focal_point,
+          emotional_beat: s.the_moment?.emotional_beat,
+          description: s.the_moment?.description,
+          cast_in_frame: (s.cast_in_frame || []).map(c => c.character_id),
+        })),
+        instruction: "Return one summary per shot. Return JSON only.",
       });
     } else {
       // generate_storyboard — uses existing cast/env, proposes only shots.
+      // v4.42.1: applies the same multi-character coverage rules as
+      // bootstrap_bible so the same drop bug doesn't slip in here.
       system = [
         "You are a film director's AI authoring assistant.",
-        "Given an EXISTING project + cast + environments, propose " + shotCount + " shots that USE the existing entities.",
+        "Given an EXISTING project + cast + environments, propose EXACTLY " + shotCount + " shots that USE the existing entities.",
+        "",
+        "════════ MULTI-CHARACTER COVERAGE RULES ════════",
+        "RULE A: For each shot, include in cast_in_frame EVERY character",
+        "visually present OR named in the focal_point / description prose.",
+        "Two characters interacting = both in cast_in_frame.",
+        "",
+        "RULE B: role_in_shot = 'in-frame' for visible, 'speaks' for the",
+        "primary speaker, 'observing' for present-but-not-focal. Multiple",
+        "cast members per shot is the NORMAL case for any interaction.",
+        "",
+        "RULE C: Off-camera but narratively present → cast_off_frame, not",
+        "silent drop.",
         "",
         "Output ONLY a JSON object: " +
           '{"proposals":[{"field":"shot.<slug>","current":"(none)","proposed":"<JSON string of shot body>","rationale":"dramatic function"}]}',
@@ -12536,6 +12694,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
         "",
         "CRITICAL: cast_in_frame[].character_id MUST be from the existing bible (see ctx.cast_bible).",
         "location.location_id MUST be from existing environments (see ctx.env_bible).",
+        "Return EXACTLY " + shotCount + " shot proposals — not fewer, not more.",
       ].join("\n");
       user = JSON.stringify({
         project: {
@@ -12573,13 +12732,104 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const proposals = Array.isArray(result.parsed?.proposals) ? result.parsed.proposals : [];
     // Guard: drop proposals that don't have both a field and a proposed body.
     const filtered = proposals.filter(p => p && p.field && p.proposed);
+
+    // v4.42.1 F3: post-call shot-count assertion. If the model returned a
+    // different number of shots than the user requested, surface it on
+    // the result envelope. Caller decides whether to warn (cost-protected)
+    // or auto-retry (not enabled by default). For modes that don't
+    // produce shots (fill_shot_summaries/fix_cast_coverage), the
+    // contract is checked differently — those compare proposals.length
+    // to the expected per-mode count.
+    let shot_count_warning = null;
+    if (mode === "bootstrap_bible" || mode === "generate_storyboard") {
+      const actualShots = filtered.filter(p => p.field?.startsWith("shot.")).length;
+      if (actualShots !== shotCount) {
+        shot_count_warning = {
+          expected: shotCount,
+          actual: actualShots,
+          message: `Model returned ${actualShots} shots; you requested ${shotCount}. ${actualShots < shotCount ? "Try a richer logline or split into multiple bootstrap passes." : "Lower the target if you want a tighter cut."}`,
+        };
+      }
+    }
+
     return {
       proposals: filtered,
       cost_usd: result.cost_usd_estimated || 0,
       model: result.model,
+      shot_count_warning,
     };
   }
   NS.aiAuthorProject = aiAuthorProject;
+
+  // v4.42.1 F2-b: detect multi-character drops in proposed shots.
+  //
+  // Scans every "shot.*" proposal's prose (focal_point + description) for
+  // character display_names that appear in the prose but whose
+  // character_id is NOT in that shot's cast_in_frame. Returns a list of
+  // { shot_field, shot_body, missing_characters[] } for the caller to
+  // decorate the preview modal with per-shot "⚠ Generate fix" affordances.
+  //
+  // This is the same regex-match strategy as v4.38's
+  // validateFocalSupportedByCast, repurposed to run on PROPOSED entities
+  // BEFORE they're persisted to IDB.
+  //
+  // Pure function; no Storage calls; no AI calls. Cheap to run on every
+  // bootstrap result.
+  function detectMultiCharacterDrops(proposals) {
+    if (!Array.isArray(proposals)) return [];
+    const characterEntries = [];
+    for (const p of proposals) {
+      if (!p.field?.startsWith("character.")) continue;
+      try {
+        const body = typeof p.proposed === "string" ? JSON.parse(p.proposed) : p.proposed;
+        if (body?.id && body?.display_name) {
+          characterEntries.push({ id: body.id, display_name: body.display_name });
+        }
+      } catch { /* skip malformed */ }
+    }
+    if (characterEntries.length < 2) return [];  // can't have multi-char drops with <2 chars
+
+    const drops = [];
+    for (const p of proposals) {
+      if (!p.field?.startsWith("shot.")) continue;
+      let shotBody;
+      try {
+        shotBody = typeof p.proposed === "string" ? JSON.parse(p.proposed) : p.proposed;
+      } catch { continue; }
+      const focal = String(shotBody?.the_moment?.focal_point || "");
+      const desc = String(shotBody?.the_moment?.description || "");
+      const text = (focal + " " + desc).toLowerCase();
+      if (text.length < 5) continue;
+
+      const namedInCast = new Set(
+        (shotBody.cast_in_frame || [])
+          .map(c => typeof c === "string" ? c : c?.character_id)
+          .filter(Boolean)
+      );
+      const namedOffCast = new Set(
+        (shotBody.cast_off_frame || [])
+          .map(c => typeof c === "string" ? c : c?.character_id)
+          .filter(Boolean)
+      );
+      const missing = [];
+      for (const c of characterEntries) {
+        const re = new RegExp(`\\b${c.display_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").toLowerCase()}\\b`, "i");
+        if (!re.test(text)) continue;
+        if (namedInCast.has(c.id) || namedOffCast.has(c.id)) continue;
+        missing.push(c);
+      }
+      if (missing.length > 0) {
+        drops.push({
+          shot_field: p.field,
+          shot_id: shotBody.id,
+          shot_body: shotBody,
+          missing_characters: missing,
+        });
+      }
+    }
+    return drops;
+  }
+  NS.detectMultiCharacterDrops = detectMultiCharacterDrops;
   NS.AI_AUTHOR_PROJECT_COST_CEILING = AI_AUTHOR_PROJECT_COST_CEILING;
 
   // v4.42 M-AI-1b: persist a set of accepted bootstrap proposals into IDB.
@@ -12685,6 +12935,21 @@ JSON object only. No commentary. No fences. No trailing text.`;
       }
     }
 
+    // v4.42.1 F2-c: per-shot multi-character fix application.
+    // After Phase 1-3 land the project/cast/env, any accepted "shot.<id>.cast_in_frame"
+    // sub-proposal from the AI-driven cast-coverage fix takes precedence
+    // over the original shot's cast_in_frame when Phase 4 writes.
+    const castFixOverrides = new Map(); // shot_id → corrected cast_in_frame
+    for (const p of accepted) {
+      const m = p.field?.match(/^shot\.([^.]+)\.cast_in_frame$/);
+      if (m) {
+        try {
+          const arr = parseProposed(p.proposed);
+          if (Array.isArray(arr)) castFixOverrides.set(m[1], arr);
+        } catch { /* skip malformed */ }
+      }
+    }
+
     // Phase 4: shots. Recompute timecode based on shot_number ordering so
     // back-to-back shots have continuous in/out times.
     const shotProposals = accepted.filter(p => p.field?.startsWith("shot."));
@@ -12701,6 +12966,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // Sort by shot_number, then assign in/out timecodes from cumulative durations.
     shotBodies.sort((a, b) => (a.body.shot_number || 0) - (b.body.shot_number || 0));
     let cursorSeconds = 0;
+    const persistedShots = [];  // v4.42.1 F6: for batched summary fill below
     for (const { body, field } of shotBodies) {
       try {
         const duration = Math.max(4, Math.min(15, Number(body.timecode?.duration_seconds) || 8));
@@ -12709,6 +12975,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
         body.timecode.in = formatTimecode(cursorSeconds);
         body.timecode.out = formatTimecode(cursorSeconds + duration);
         cursorSeconds += duration;
+        // v4.42.1 F2-c: if a per-shot cast-coverage fix was accepted,
+        // override the body's cast_in_frame with the corrected array.
+        if (castFixOverrides.has(body.id)) {
+          body.cast_in_frame = castFixOverrides.get(body.id);
+        }
         // Seed required arrays so downstream code doesn't trip.
         body.takes = body.takes || [];
         body.audio = body.audio || {};
@@ -12718,13 +12989,64 @@ JSON object only. No commentary. No fences. No trailing text.`;
         body.shot_summary = body.shot_summary || "";
         body.shot_summary_source = "auto";
         await Storage.put("shots", body);
+        persistedShots.push(body);
         applied.shots++;
       } catch (err) {
         errors.push({ field, error: err.message });
       }
     }
 
-    return { applied, errors, project_id: createdProjectId };
+    // v4.42.1 F6: batched shot_summary fill. Fires ONE chat call covering
+    // all newly-persisted shots. Replaces N per-shot maybeRefreshShotSummary
+    // calls that previously ran post-reload (and weren't reflected in the
+    // bootstrap cost preview). Sums into the same cost line as the
+    // bootstrap call via the trackCost path in handleAIProducerSubmit.
+    let summaryCostUsd = 0;
+    if (persistedShots.length > 0 && State.openai) {
+      try {
+        const project = await Storage.Projects.getActive();
+        const summaryResult = await aiAuthorProject(
+          { logline: "(batched summary fill)", shot_count_target: persistedShots.length },
+          { project, characters: [], environments: [] },
+          "fill_shot_summaries"
+        );
+        // Apply summaries by shot_id matching
+        const summaryMap = new Map();
+        for (const p of summaryResult.proposals || []) {
+          const m = p.field?.match(/^shot\.([^.]+)\.shot_summary$/);
+          if (m && p.proposed) {
+            // Accept either a raw string or a JSON-wrapped string from the model
+            let value = p.proposed;
+            if (typeof value === "string") {
+              const trimmed = value.trim();
+              if ((trimmed.startsWith("\"") && trimmed.endsWith("\"")) || trimmed.startsWith("{")) {
+                try { value = JSON.parse(trimmed); } catch { /* leave as-is */ }
+              }
+            }
+            if (typeof value === "object" && value?.summary) value = value.summary;
+            summaryMap.set(m[1], String(value).slice(0, 140));
+          }
+        }
+        for (const shot of persistedShots) {
+          const summary = summaryMap.get(shot.id);
+          if (summary) {
+            shot.shot_summary = summary;
+            shot.shot_summary_source = "auto";
+            shot.shot_summary_generated_at = Date.now();
+            await Storage.put("shots", shot);
+          }
+        }
+        summaryCostUsd = summaryResult.cost_usd || 0;
+      } catch (err) {
+        console.warn("[v4.42.1 batched shot summaries]", err.message);
+        // Non-fatal: shots persist with empty shot_summary; the existing
+        // boot-time maybeRefreshShotSummary pass will catch them later.
+      }
+    }
+    // Also override pasted cast_in_frame entries that weren't in
+    // castFixOverrides — they were already applied above; nothing to do.
+
+    return { applied, errors, project_id: createdProjectId, summary_cost_usd: summaryCostUsd };
   }
   NS.applyBootstrapProposals = applyBootstrapProposals;
 
@@ -19863,13 +20185,14 @@ JSON object only. No commentary. No fences. No trailing text.`;
 
           <div style="display:grid; grid-template-columns:1fr 110px 110px; gap:12px; margin-bottom:14px;">
             <div>
-              <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Medium</label>
-              <select id="elx-producer-medium" style="${FIELD_INPUT_STYLE}">
-                <option value="animated_3d">3D animated</option>
-                <option value="animated_2d">2D animated</option>
-                <option value="live_action">Live action</option>
-                <option value="motion_graphics">Motion graphics</option>
+              <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Format</label>
+              <select id="elx-producer-medium" style="${FIELD_INPUT_STYLE}" title="Drives composer prompt biases (camera language, lighting, performance style). The 'Format' is independent of art style — use style hints / chips below for art direction.">
+                <option value="photoreal">Realistic humans (photoreal CG)</option>
+                <option value="live_action">Live action (cameras + actors)</option>
+                <option value="animated_3d" selected>Stylized 3D animation</option>
+                <option value="animated_2d">Hand-drawn 2D animation</option>
                 <option value="documentary">Documentary</option>
+                <option value="motion_graphics">Motion graphics</option>
               </select>
             </div>
             <div>
@@ -19882,9 +20205,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
             </div>
           </div>
 
-          <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Style hints (optional)</label>
+          <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Art style</label>
+          <div id="elx-producer-style-chips" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
+            <!-- chips injected by adaptScreenOne -->
+          </div>
           <textarea id="elx-producer-style-hints" rows="2"
-            placeholder="Stylized 3D animation, dark fantasy palette, low-key lighting, observational camera. Tone reverent and grounded."
+            placeholder="Click a chip above to pre-fill, OR type your own art-direction notes here. Example: 'Photoreal cinematic. Naturalistic skin, no stylization. Anamorphic 35mm framing.'"
             style="${FIELD_INPUT_STYLE} resize:vertical; min-height:50px; font-size:13px; line-height:1.5;"></textarea>
         </div>
 
@@ -19918,6 +20244,53 @@ JSON object only. No commentary. No fences. No trailing text.`;
         </details>
       </div>
     `;
+
+    // v4.42.1 F5: art-style chips. Each chip click pre-fills the
+    // style_hints textarea with a 1-2 sentence template the user can
+    // edit before submit. Eight chips covering the most common
+    // visual-direction shorthands.
+    const STYLE_CHIPS = [
+      { label: "Realistic", medium: "photoreal", text: "Photoreal cinematic. Naturalistic skin, no stylization. Anamorphic 35mm framing. Roger Deakins-grade natural light." },
+      { label: "3D animation (Pixar)", medium: "animated_3d", text: "Premium stylized 3D animation. Soft expressive faces, rim lighting, vibrant palette. Feature-film quality." },
+      { label: "3D dark fantasy (Lionn)", medium: "animated_3d", text: "Premium stylized 3D animated dark fantasy. Reverent tone, low-key lighting, silhouette legibility. Identity-locked across shots." },
+      { label: "Hand-drawn 2D", medium: "animated_2d", text: "Hand-drawn 2D animation. Bold linework, flat-shaded palette. No 3D rendering tells." },
+      { label: "Anime", medium: "animated_2d", text: "Anime cel-shaded. Expressive eyes, dynamic motion lines, saturated color blocks. Limited-frame animation aesthetic." },
+      { label: "Documentary", medium: "documentary", text: "Observational documentary. Available light, grounded camera, naturalistic performance. Real environments." },
+      { label: "Noir", medium: "live_action", text: "High-contrast monochrome cinematography. Deep shadows, rim-lit faces, slatted light. 1940s framing." },
+      { label: "Storybook illustration", medium: "animated_2d", text: "Painterly storybook illustration. Watercolor tones, soft edges, intimate framing." },
+    ];
+    const chipsRoot = $("#elx-producer-style-chips", s1Section);
+    if (chipsRoot) {
+      chipsRoot.innerHTML = STYLE_CHIPS.map((c, i) => `
+        <button type="button" data-chip-idx="${i}"
+          style="background:#0a0a0c; color:#c9a25a; border:1px solid #2a2a35;
+                 padding:5px 10px; border-radius:14px; font-size:11.5px;
+                 cursor:pointer; line-height:1.3; font-family:inherit;
+                 transition:background .12s, border-color .12s;">${esc(c.label)}</button>
+      `).join("");
+      chipsRoot.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-chip-idx]");
+        if (!btn) return;
+        const idx = Number(btn.dataset.chipIdx);
+        const chip = STYLE_CHIPS[idx];
+        if (!chip) return;
+        // Fill textarea + sync medium dropdown (chip's medium wins).
+        const hintsEl = $("#elx-producer-style-hints");
+        if (hintsEl) {
+          hintsEl.value = chip.text;
+          hintsEl.focus();
+        }
+        const mediumEl = $("#elx-producer-medium");
+        if (mediumEl) mediumEl.value = chip.medium;
+        // Highlight selected chip
+        chipsRoot.querySelectorAll("[data-chip-idx]").forEach(b => {
+          const isSelected = b === btn;
+          b.style.background = isSelected ? "#c9a25a" : "#0a0a0c";
+          b.style.color = isSelected ? "#14141a" : "#c9a25a";
+          b.style.borderColor = isSelected ? "#c9a25a" : "#2a2a35";
+        });
+      });
+    }
 
     // Update the inline mode-info hint based on active project state.
     const refreshModeInfo = async () => {
@@ -20004,25 +20377,72 @@ JSON object only. No commentary. No fences. No trailing text.`;
         return;
       }
 
+      // v4.42.1 F2-b/c: scan proposed shots for multi-character drops. If
+      // any shot's prose names a character not in its cast_in_frame, fire
+      // a per-shot fix_cast_coverage call to propose a corrected cast.
+      // The corrected cast lands as a sub-proposal alongside the original
+      // shot in the preview modal — user clicks Accept per row.
+      let dropProposals = [];
+      let dropFixCostUsd = 0;
+      try {
+        const drops = detectMultiCharacterDrops(result.proposals);
+        if (drops.length > 0) {
+          setStatus(`⚠ Detected ${drops.length} shot${drops.length === 1 ? "" : "s"} with potentially-dropped characters. Generating fixes…`);
+          for (const drop of drops) {
+            try {
+              const fix = await aiAuthorProject(
+                {
+                  logline: "(cast coverage fix)",
+                  shot_id: drop.shot_id,
+                  shot: drop.shot_body,
+                  missing_characters: drop.missing_characters,
+                },
+                ctx,
+                "fix_cast_coverage"
+              );
+              if (Array.isArray(fix?.proposals)) {
+                for (const fp of fix.proposals) {
+                  fp.field = fp.field || `shot.${drop.shot_id}.cast_in_frame`;
+                  fp.rationale = fp.rationale
+                    ? `[multi-char fix] ${fp.rationale}`
+                    : `[multi-char fix] Adds ${drop.missing_characters.map(c => c.display_name).join(" + ")} (named in focal_point/description but missing from cast_in_frame).`;
+                  dropProposals.push(fp);
+                }
+              }
+              dropFixCostUsd += fix?.cost_usd || 0;
+            } catch (err) {
+              console.warn(`[v4.42.1 multi-char fix for ${drop.shot_id}]`, err.message);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[v4.42.1 detectMultiCharacterDrops]", err.message);
+      }
+
       // Group proposals for the preview by entity type for readability.
+      const allProposals = [...result.proposals, ...dropProposals];
       const subtitle = (() => {
         const pCount = result.proposals.filter(p => p.field === "project").length;
         const cCount = result.proposals.filter(p => p.field?.startsWith("character.")).length;
         const eCount = result.proposals.filter(p => p.field?.startsWith("environment.")).length;
-        const sCount = result.proposals.filter(p => p.field?.startsWith("shot.")).length;
+        const sCount = result.proposals.filter(p => p.field?.startsWith("shot.") && !p.field.includes(".cast_in_frame")).length;
+        const fixCount = dropProposals.length;
         const parts = [];
         if (pCount) parts.push(`${pCount} project`);
         if (cCount) parts.push(`${cCount} character${cCount === 1 ? "" : "s"}`);
         if (eCount) parts.push(`${eCount} location${eCount === 1 ? "" : "s"}`);
         if (sCount) parts.push(`${sCount} shot${sCount === 1 ? "" : "s"}`);
-        return `GPT proposed ${parts.join(" + ")}. Accept the ones you want; reject the rest. Each accepted entity will be persisted to your project.`;
+        if (fixCount) parts.push(`${fixCount} cast-coverage fix${fixCount === 1 ? "" : "es"}`);
+        const warn = result.shot_count_warning ? `<br>⚠ ${esc(result.shot_count_warning.message)}` : "";
+        const fixHint = fixCount > 0 ? `<br>⚠ AI may have dropped characters from some shots — accept the cast-coverage fixes to restore them.` : "";
+        return `GPT proposed ${parts.join(" + ")}. Accept the ones you want; reject the rest.${warn}${fixHint}`;
       })();
 
       const accepted = await openFixPreviewModal({
         title: mode === "bootstrap_bible" ? "✨ New film from logline" : "+ New shots for active project",
         subtitle,
-        proposals: result.proposals,
-        cost_usd: result.cost_usd,
+        proposals: allProposals,
+        cost_usd: (result.cost_usd || 0) + dropFixCostUsd,
       });
       if (accepted.length === 0) {
         setStatus("No proposals accepted. The project is unchanged.", "info");
@@ -20031,7 +20451,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
 
       setStatus(`Persisting ${accepted.length} entit${accepted.length === 1 ? "y" : "ies"}…`);
       const applyResult = await applyBootstrapProposals(accepted);
-      if (result.cost_usd) await trackCost(result.cost_usd, `AI Producer ${mode}`);
+      // v4.42.1 F6: cost ledger captures bootstrap + drop-fixes + batched
+      // shot_summary fill as ONE line so the user sees the full AI cost
+      // of the operation.
+      const totalCostUsd = (result.cost_usd || 0) + dropFixCostUsd + (applyResult.summary_cost_usd || 0);
+      if (totalCostUsd > 0) await trackCost(totalCostUsd, `AI Producer ${mode} (gen+fix+summaries)`);
 
       const summary = [
         applyResult.applied.project ? `1 project` : "",
