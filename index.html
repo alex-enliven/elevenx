@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="a6df40db0580" data-build-time="2026-05-20T14:43:40.405Z">
+<meta name="elevenx-build" content="d4643a6623bd" data-build-time="2026-05-20T15:10:20.901Z">
 <script>
 (function(){
-  var info = { hash: "a6df40db0580", time: "2026-05-20T14:43:40.405Z" };
+  var info = { hash: "d4643a6623bd", time: "2026-05-20T15:10:20.901Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: a6df40db0580 @ 2026-05-20T14:43:40.405Z -->
+<!-- elevenx-build: d4643a6623bd @ 2026-05-20T15:10:20.901Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9288,6 +9288,261 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
 </script>
 
 <script>
+/* === elevenx/lib/anthropicClient.js === */
+(window.ElevenX = window.ElevenX || {});
+(() => {
+/**
+ * elevenx/lib/anthropicClient.js
+ * ────────────────────────────────────────────────────────────────────────
+ * Minimal browser-side Anthropic Messages API client routed through the
+ * shared Cloudflare Worker proxy. Mirrors the OpenAIClient surface so
+ * aiAuthorProject can swap providers transparently.
+ *
+ * Auth flow:
+ *   - Worker holds ANTHROPIC_API_KEY as a secret (never ships to browser)
+ *   - Worker injects x-api-key + anthropic-version: 2023-06-01 headers
+ *   - Browser POSTs to {workerUrl}/anthropic/v1/messages with the body
+ *
+ * JSON-output strategy:
+ *   Anthropic doesn't have OpenAI's `response_format: {type: "json_object"}`.
+ *   The established pattern is to use a forced tool call: define a single
+ *   "submit_proposal" tool with input_schema, set
+ *   `tool_choice: { type: "tool", name: "submit_proposal" }`. The model
+ *   MUST call that tool, and the structured arguments come back as JSON
+ *   in `content[0].input`. We extract that and surface it as `parsed`
+ *   in the returned envelope — same shape OpenAIClient.chatCompletion
+ *   returns.
+ *
+ * Cost tracking:
+ *   Anthropic's response includes `usage: { input_tokens, output_tokens }`.
+ *   CLAUDE_PRICING_PER_1K is a per-model rate table; estimateClaudeChatCost
+ *   does the math. Pricing as of 2026-05-20 (verify at anthropic.com/pricing).
+ */
+
+(() => {
+  const NS = (window.ElevenX = window.ElevenX || {});
+
+  // Pricing per 1K tokens (input / output). Verify at anthropic.com/pricing.
+  // Defaults to Opus 4.7 rates if the model is unknown.
+  const CLAUDE_PRICING_PER_1K = {
+    "claude-opus-4-7":        { in: 0.015, out: 0.075 },   // headline quality, default for ElevenX
+    "claude-opus-4-7-20251022": { in: 0.015, out: 0.075 }, // dated variant
+    "claude-sonnet-4-5":      { in: 0.003, out: 0.015 },   // budget alternative, still excellent
+    "claude-haiku-4-5":       { in: 0.0008, out: 0.004 }, // cheapest tier
+  };
+  function estimateClaudeChatCost(model, inputTokens, outputTokens) {
+    // Be tolerant of dated suffix variants — strip the trailing "-YYYYMMDD"
+    // if the exact model isn't in the table.
+    const lookup = CLAUDE_PRICING_PER_1K[model]
+      || CLAUDE_PRICING_PER_1K[String(model || "").replace(/-\d{8}$/, "")]
+      || CLAUDE_PRICING_PER_1K["claude-opus-4-7"];
+    return (inputTokens / 1000) * lookup.in + (outputTokens / 1000) * lookup.out;
+  }
+
+  // v4.42.2 default — Claude Opus 4.7. Flip this constant to switch the
+  // entire AI authoring layer to a different Claude model. Project-level
+  // override via project.ai_author_model takes precedence at the call site.
+  const CLAUDE_DEFAULT_MODEL = "claude-opus-4-7";
+
+  class AnthropicClient {
+    /**
+     * @param {object} opts
+     * @param {string} opts.workerUrl   — base URL of the Cloudflare Worker proxy
+     * @param {boolean} [opts.dryRun]
+     * @param {function} [opts.onLog]
+     * @param {function} [opts.fetch]   — inject for tests
+     */
+    constructor(opts = {}) {
+      this.dryRun  = !!opts.dryRun;
+      if (!opts.workerUrl && !this.dryRun) {
+        throw new Error("AnthropicClient requires opts.workerUrl (unless dryRun: true)");
+      }
+      this.workerUrl = (opts.workerUrl || "").replace(/\/+$/, "");
+      this.onLog     = opts.onLog || (() => {});
+      const fetchImpl = opts.fetch || globalThis.fetch;
+      this.fetch = fetchImpl ? fetchImpl.bind(globalThis) : null;
+      if (!this.fetch && !this.dryRun) {
+        throw new Error("AnthropicClient: no fetch implementation available");
+      }
+    }
+
+    /**
+     * Chat completion via Anthropic Messages API.
+     *
+     * Signature matches OpenAIClient.chatCompletion so aiAuthorProject can
+     * route transparently:
+     *   { system?, user, model?, temperature?, max_tokens?, response_format? }
+     *
+     * When response_format.type === "json_object", we wrap the call in a
+     * forced tool_use to get structured JSON back. The tool schema is
+     * intentionally permissive — the orchestrator validates the shape.
+     *
+     * Returns the same envelope OpenAIClient does:
+     *   { content, parsed, raw, cost_usd_estimated, model }
+     */
+    async chatCompletion(body) {
+      if (!body?.user) throw new Error("chatCompletion: body.user is required");
+      const model = body.model || CLAUDE_DEFAULT_MODEL;
+      const wantsJson = body.response_format?.type === "json_object";
+
+      // Anthropic Messages API requires max_tokens. Default high enough for
+      // bootstrap-bible-class outputs (~4K).
+      const max_tokens = typeof body.max_tokens === "number" ? body.max_tokens : 4000;
+
+      const requestBody = {
+        model,
+        max_tokens,
+        messages: [{ role: "user", content: body.user }],
+        temperature: typeof body.temperature === "number" ? body.temperature : 0.7,
+      };
+      if (body.system) requestBody.system = body.system;
+
+      // JSON output via forced tool use. The tool schema accepts an
+      // arbitrary `proposals` array — the orchestrator validates the
+      // entries downstream. Generic enough to handle bootstrap_bible,
+      // fix_cast_coverage, and fill_shot_summaries with the same tool.
+      if (wantsJson) {
+        requestBody.tools = [
+          {
+            name: "submit_proposal",
+            description: "Return the proposed entities as JSON. Always call this tool exactly once with the proposals array.",
+            input_schema: {
+              type: "object",
+              properties: {
+                proposals: {
+                  type: "array",
+                  description: "Array of proposal entries. Each entry has field, current, proposed, rationale.",
+                  items: {
+                    type: "object",
+                    properties: {
+                      field: { type: "string" },
+                      current: { type: "string" },
+                      proposed: { type: "string" },
+                      rationale: { type: "string" },
+                    },
+                    required: ["field", "proposed"],
+                  },
+                },
+              },
+              required: ["proposals"],
+            },
+          },
+        ];
+        requestBody.tool_choice = { type: "tool", name: "submit_proposal" };
+      } else if (Array.isArray(body.tools)) {
+        // Pass-through for callers that want their own tool list.
+        requestBody.tools = body.tools;
+        if (body.tool_choice) requestBody.tool_choice = body.tool_choice;
+      }
+
+      if (this.dryRun) {
+        this.onLog(`[dry-run] anthropic chatCompletion ${model} (${(body.user || "").length} chars)`);
+        return { dryRun: true, request: requestBody };
+      }
+
+      const url = `${this.workerUrl}/anthropic/v1/messages`;
+      this.onLog(`→ POST /anthropic/v1/messages (${model}, ${(body.user || "").length} chars in${wantsJson ? ", tool_use JSON mode" : ""})`);
+
+      const res = await this._fetchWithRetry(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      }, "anthropic messages");
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`anthropic messages ${res.status}: ${text.slice(0, 400)}`);
+      }
+
+      const json = await res.json();
+
+      // Anthropic response shape:
+      //   { content: [{ type: "text", text } | { type: "tool_use", name, input }],
+      //     usage: { input_tokens, output_tokens }, stop_reason }
+      // For our JSON mode, we expect ONE tool_use block whose `input` is the
+      // structured proposals object. For plain text, concatenate text blocks.
+      let content = "";
+      let parsed = null;
+      const blocks = Array.isArray(json?.content) ? json.content : [];
+      for (const block of blocks) {
+        if (block?.type === "tool_use" && block?.name === "submit_proposal") {
+          parsed = block.input || null;
+          if (parsed) {
+            // Surface the JSON as `content` so callers that prefer text
+            // get a usable string too.
+            content = JSON.stringify(parsed);
+          }
+        } else if (block?.type === "text" && typeof block.text === "string") {
+          content += (content ? "\n" : "") + block.text;
+        }
+      }
+
+      // Fallback: if forced-tool didn't fire (rare), try parsing text as JSON.
+      if (wantsJson && parsed === null && content) {
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          const match = content.match(/\{[\s\S]*\}/);
+          if (match) {
+            try { parsed = JSON.parse(match[0]); } catch { /* leave null */ }
+          }
+        }
+      }
+
+      const usage = json?.usage || {};
+      const inputTokens = usage.input_tokens || Math.ceil(((body.system || "").length + (body.user || "").length) / 4);
+      const outputTokens = usage.output_tokens || 200;
+      const cost_usd_estimated = estimateClaudeChatCost(model, inputTokens, outputTokens);
+
+      return { content, parsed, raw: json, cost_usd_estimated, model };
+    }
+
+    // Retry helper — mirrors OpenAIClient._fetchWithRetry exactly.
+    // Retries transient 5xx + network errors with exponential backoff.
+    async _fetchWithRetry(url, opts = {}, label = "fetch") {
+      const maxAttempts = 4;
+      const baseDelayMs = 2000;
+      let lastError = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const res = await this.fetch(url, opts);
+          if (res.ok) return res;
+          if (res.status < 500) return res; // 4xx → return as-is, caller decides
+          const body = await res.clone().text().catch(() => "");
+          lastError = new Error(`${label} ${res.status} — ${body.slice(0, 300)}`);
+          if (attempt < maxAttempts) {
+            const delay = baseDelayMs * Math.pow(2, attempt - 1);
+            this.onLog(`  ⚠ ${label} returned ${res.status} (transient) — retrying in ${delay/1000}s (attempt ${attempt+1}/${maxAttempts})`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          return res;
+        } catch (err) {
+          lastError = err;
+          if (attempt < maxAttempts) {
+            const delay = baseDelayMs * Math.pow(2, attempt - 1);
+            this.onLog(`  ⚠ ${label} threw '${err.message}' — retrying in ${delay/1000}s (attempt ${attempt+1}/${maxAttempts})`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (lastError) throw lastError;
+      throw new Error(`${label}: exhausted ${maxAttempts} attempts`);
+    }
+  }
+
+  NS.AnthropicClient = AnthropicClient;
+  NS.estimateClaudeChatCost = estimateClaudeChatCost;
+  NS.CLAUDE_DEFAULT_MODEL = CLAUDE_DEFAULT_MODEL;
+  NS.CLAUDE_PRICING_PER_1K = CLAUDE_PRICING_PER_1K;
+})();
+
+})();
+</script>
+
+<script>
 /* === namespace shortcuts === */
 (() => {
   const NS = window.ElevenX;
@@ -9394,7 +9649,12 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   //     derived reference; subsequent keyframe gens for the same
   //     character prefer the derived ref over the cast bible ref so
   //     facial identity stays stable shot-to-shot (Finding F).
-  const DB_VER  = 6;
+  //
+  // v7: AI Director model picker (v4.42.2). Adds project.ai_author_model
+  // (default "gpt-5.5") so the user can pick gpt-5.5 / gpt-4o /
+  // claude-opus-4-7 / claude-sonnet-4-5 per project. aiAuthorProject
+  // routes to State.openai or State.anthropic based on the prefix.
+  const DB_VER  = 7;
 
   // The stores that get the project_id filter treatment.
   const PROJECT_SCOPED = ["characters", "environments", "assets", "shots", "takes", "conversations"];
@@ -9572,16 +9832,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             };
           }
         }
-        // v5 → v6: structural inputs from the 2026-05-19 shot-by-shot audit.
-        // Triple-fronted migration — projects get aspect; shots get
-        // shot_summary + audit_source; characters get derived_refs = {}.
-        //
-        // Idempotent: every assignment is guarded by `=== undefined` so a
-        // partial-state DB (e.g. a crash mid-migration on a prior version)
-        // doesn't double-write.
-        if (oldVersion < 6) {
-          // Projects: seed aspect = "16:9" on existing rows (matches the
-          // production assumption — all ElevenX films shipped 16:9 to date).
+        // v5 → v7: per-row schema bumps consolidated into ONE cursor walk
+        // per store so concurrent cursors on the same store can't race
+        // (caught 2026-05-20: v6's project cursor was being clobbered by
+        // v7's project cursor when a fresh IDB ran all migrations at once).
+        // Idempotent — every assignment guards on `=== undefined`.
+        if (oldVersion < 7) {
+          // Projects: v6 added `aspect`, v7 added `ai_author_model`.
           const projOs = txn.objectStore("projects");
           const pcur = projOs.openCursor();
           pcur.onsuccess = (ev) => {
@@ -9589,14 +9846,21 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             if (!c) return;
             const row = c.value;
             let dirty = false;
-            if (row.aspect === undefined) { row.aspect = "16:9"; dirty = true; }
+            // v6
+            if (oldVersion < 6 && row.aspect === undefined) {
+              row.aspect = "16:9";
+              dirty = true;
+            }
+            // v7
+            if (row.ai_author_model === undefined) {
+              row.ai_author_model = "gpt-5.5";
+              dirty = true;
+            }
             if (dirty) c.update(row);
             c.continue();
           };
-          // Shots: seed shot_summary + shot_summary_source. Auto-gen happens
-          // lazily on the first save AFTER v4.40 deploys; empty string here
-          // just keeps reads non-null.
-          if (db.objectStoreNames.contains("shots")) {
+          // Shots: v6 added shot_summary + shot_summary_source.
+          if (oldVersion < 6 && db.objectStoreNames.contains("shots")) {
             const shOs = txn.objectStore("shots");
             const scur = shOs.openCursor();
             scur.onsuccess = (ev) => {
@@ -9610,11 +9874,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
               c.continue();
             };
           }
-          // Characters: seed derived_refs = {}. The cross-shot character
-          // chain (Finding F) writes into this map keyed by shot_id when
-          // a take ships; refUrlFor prefers the most-recent entry over the
-          // cast bible ref so identity stays stable across shots.
-          if (db.objectStoreNames.contains("characters")) {
+          // Characters: v6 added derived_refs.
+          if (oldVersion < 6 && db.objectStoreNames.contains("characters")) {
             const chOs = txn.objectStore("characters");
             const ccur = chOs.openCursor();
             ccur.onsuccess = (ev) => {
@@ -9766,7 +10027,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
        *   - medium: "live_action" (most users start here; switch to animated_3d for Lionn)
        *   - default_shot_duration_seconds: 8 (a teaser-friendly mid-range)
        */
-      async create({ id, display_name, description, medium, logline, style_canon, default_shot_duration_seconds, aspect }) {
+      async create({ id, display_name, description, medium, logline, style_canon, default_shot_duration_seconds, aspect, ai_author_model }) {
         const slug = id || display_name
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, "_")
@@ -9786,6 +10047,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           // v4.40 INPUT-1: default to 16:9 (the production assumption);
           // the project edit modal lets users flip to 9:16, 1:1, 4:3, 3:4.
           aspect: aspect || "16:9",
+          // v4.42.2: AI Director model. gpt-5.5 default (faster, cheaper);
+          // user flips to claude-opus-4-7 for tougher multi-character work.
+          ai_author_model: ai_author_model || "gpt-5.5",
           is_seeded: false,
           created_at: new Date().toISOString().slice(0, 10),
         };
@@ -9821,6 +10085,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           // v4.37: cross-shot audio bed (the ambient bed prompt + cached
           // audio). Listed here so the Projects.update path can patch them.
           "ambient_bed", "ambient_bed_audio",
+          // v4.42.2: AI Director model picker. Allowed values:
+          //   gpt-5.5 (default) | gpt-4o | claude-opus-4-7 | claude-sonnet-4-5
+          // aiAuthorProject routes to OpenAI vs Anthropic based on prefix.
+          "ai_author_model",
         ];
         const merged = { ...existing };
         for (const k of ALLOWED) {
@@ -9932,7 +10200,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     NS.BUILD_INFO = window.__getBuildInfo();
   }
 
-  const { Storage, SEED_DATA, FalClient, OpenAIClient, ElevenLabsClient, composer, modeResolver } = NS;
+  const { Storage, SEED_DATA, FalClient, OpenAIClient, ElevenLabsClient, AnthropicClient, composer, modeResolver } = NS;
 
   // ─── State ──────────────────────────────────────────────────────────
   const State = {
@@ -9940,6 +10208,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     elevenKey: null,            // ElevenLabs xi-api-key (direct browser→EL)
     fal: null,                  // FalClient instance, lazily constructed
     openai: null,               // OpenAIClient instance, lazily constructed
+    anthropic: null,            // v4.42.2: AnthropicClient instance (lazy)
     eleven: null,               // ElevenLabsClient instance, lazily constructed
     costSpentUsd: 0,
     activeJobs: 0,
@@ -10687,6 +10956,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         await saveCredential("worker_url", url);
         State.fal    = new FalClient({ workerUrl: url, onLog: m => console.log("[fal]", m) });
         State.openai = new OpenAIClient({ workerUrl: url, onLog: m => console.log("[openai]", m) });
+        if (AnthropicClient) {
+          State.anthropic = new AnthropicClient({ workerUrl: url, onLog: m => console.log("[anthropic]", m) });
+        }
         savedKeys.push("Worker URL");
       }
       if (elKey) {
@@ -10718,6 +10990,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
       State.elevenKey = null;
       State.fal = null;
       State.openai = null;
+      State.anthropic = null;
       State.eleven = null;
       await saveCredential("worker_url", "");
       await saveCredential("eleven_key", "");
@@ -12494,10 +12767,22 @@ JSON object only. No commentary. No fences. No trailing text.`;
         && mode !== "fix_cast_coverage" && mode !== "fill_shot_summaries") {
       throw new Error(`aiAuthorProject: unknown mode "${mode}" (expected "bootstrap_bible" | "generate_storyboard" | "fix_cast_coverage" | "fill_shot_summaries")`);
     }
-    if (!State.openai) {
-      throw new Error("aiAuthorProject: OpenAI client not configured. Set the OpenAI API key in Connection settings.");
-    }
+    // v4.42.2: route by project-level model preference. Default gpt-5.5
+    // (existing OpenAI worker route). Claude models route through the
+    // new /anthropic worker route. Prefix-based switching so we don't
+    // need a per-model lookup table here — the clients own their model
+    // catalogs.
     const { project, characters, environments } = ctx || {};
+    const aiAuthorModel = (input.model || project?.ai_author_model || NS.AI_AUTHOR_MODEL || "gpt-5.5").trim();
+    const isClaude = aiAuthorModel.startsWith("claude-");
+    const llmClient = isClaude ? State.anthropic : State.openai;
+    if (!llmClient) {
+      const which = isClaude ? "Anthropic" : "OpenAI";
+      const hint = isClaude
+        ? "Worker must have ANTHROPIC_API_KEY set + the worker must be redeployed with the /anthropic/* route (v4.42.2 proxy.worker.js)."
+        : "Set the OpenAI API key in Connection settings.";
+      throw new Error(`aiAuthorProject: ${which} client not configured. ${hint}`);
+    }
     const logline = input.logline.trim();
     const medium = (input.medium || project?.medium || "live_action").trim();
     const styleHints = (input.style_hints || "").trim();
@@ -12722,9 +13007,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
       throw new Error(`aiAuthorProject: estimated cost $${estimatedCostUsd.toFixed(2)} exceeds ceiling $${AI_AUTHOR_PROJECT_COST_CEILING.toFixed(2)} — reduce shot_count_target or shorten logline`);
     }
 
-    const result = await State.openai.chatCompletion({
+    const result = await llmClient.chatCompletion({
       system,
       user,
+      model: aiAuthorModel,
       response_format: { type: "json_object" },
       temperature: 0.7,  // higher than aiAuthorShot's 0.4 — bootstrap needs more creative variation
       max_tokens: 4000,
@@ -23780,6 +24066,17 @@ JSON object only. No commentary. No fences. No trailing text.`;
               ONE image captures the project's intended look (lighting, palette, composition density). Used as a style reference for cast/env refs AND keyframe gens. If no upload exists, the first approved start-frame becomes the implicit anchor automatically (v4.40 INPUT-2).
             </div>
 
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">AI Director model</label>
+            <select id="elx-proj-ai-model" style="${FIELD_INPUT_STYLE} margin-bottom:6px;">
+              <option value="gpt-5.5">gpt-5.5 — faster, ~$0.10/bootstrap (default)</option>
+              <option value="gpt-4o">gpt-4o — older fallback, ~$0.04/bootstrap</option>
+              <option value="claude-opus-4-7">claude-opus-4-7 — most coherent multi-character scenes, ~$0.20/bootstrap</option>
+              <option value="claude-sonnet-4-5">claude-sonnet-4-5 — strong + cheap, ~$0.05/bootstrap</option>
+            </select>
+            <div style="font-size:10.5px; color:#6a6a78; margin-top:-2px; margin-bottom:14px; line-height:1.4;">
+              Drives the AI Producer chat (Screen 1) — story → storyboard bootstrap, suggest-fix, Author with AI. Claude models route through the Cloudflare Worker's /anthropic proxy (worker redeploy required — see <code>proxy.worker.js</code>).
+            </div>
+
             <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Description (internal note, optional)</label>
             <textarea id="elx-proj-desc" rows="2" placeholder="Genre / audience / tone — anything that helps you remember the project"
                    style="${FIELD_INPUT_STYLE} resize:vertical; margin-bottom:14px;"></textarea>
@@ -23905,6 +24202,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       $("#elx-proj-medium", panel).value           = editRow?.medium || "live_action";
       $("#elx-proj-default-duration", panel).value = editRow?.default_shot_duration_seconds ?? 8;
       $("#elx-proj-aspect", panel).value           = resolveProjectAspect(editRow);
+      $("#elx-proj-ai-model", panel).value         = editRow?.ai_author_model || "gpt-5.5";
       $("#elx-proj-style-canon", panel).value      = editRow?.style_canon || "";
       $("#elx-proj-desc", panel).value             = editRow?.description || "";
       editIdInput.value = editRow?.id || "";
@@ -23949,6 +24247,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const medium         = $("#elx-proj-medium", panel).value;
       const defaultDur     = Number($("#elx-proj-default-duration", panel).value) || 8;
       const aspect         = $("#elx-proj-aspect", panel).value || "16:9";
+      const aiAuthorModel  = $("#elx-proj-ai-model", panel).value || "gpt-5.5";
       const styleCanon     = $("#elx-proj-style-canon", panel).value.trim();
       const desc           = $("#elx-proj-desc", panel).value.trim();
       if (!editingId && !name) {
@@ -23962,6 +24261,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             medium,
             default_shot_duration_seconds: defaultDur,
             aspect,
+            ai_author_model: aiAuthorModel,
             style_canon: styleCanon,
             description: desc,
           });
@@ -23975,6 +24275,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             style_canon: styleCanon,
             default_shot_duration_seconds: defaultDur,
             aspect,
+            ai_author_model: aiAuthorModel,
           });
           await Storage.Projects.setActive(row.id);
           toast(`Created "${row.display_name}" — reloading…`, { tone: "ok" });
@@ -24619,6 +24920,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
     if (State.workerUrl) {
       State.fal    = new FalClient({ workerUrl: State.workerUrl, onLog: m => console.log("[fal]", m) });
       State.openai = new OpenAIClient({ workerUrl: State.workerUrl, onLog: m => console.log("[openai]", m) });
+      // v4.42.2: Anthropic Messages API via the same worker proxy
+      // (/anthropic/v1/*). Enables Claude Opus 4.7 as the AI Director
+      // model. Lazy at boot — only constructs the client; doesn't fire
+      // until aiAuthorProject routes to it based on project.ai_author_model.
+      if (AnthropicClient) {
+        State.anthropic = new AnthropicClient({ workerUrl: State.workerUrl, onLog: m => console.log("[anthropic]", m) });
+      }
     }
     if (State.elevenKey) {
       State.eleven = new ElevenLabsClient({ apiKey: State.elevenKey, onLog: m => console.log("[eleven]", m) });
