@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="78db102d0a2d" data-build-time="2026-06-09T17:51:50.197Z">
+<meta name="elevenx-build" content="40253d1337a7" data-build-time="2026-06-09T18:04:02.162Z">
 <script>
 (function(){
-  var info = { hash: "78db102d0a2d", time: "2026-06-09T17:51:50.197Z" };
+  var info = { hash: "40253d1337a7", time: "2026-06-09T18:04:02.162Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 78db102d0a2d @ 2026-06-09T17:51:50.197Z -->
+<!-- elevenx-build: 40253d1337a7 @ 2026-06-09T18:04:02.162Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9654,7 +9654,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // (default "gpt-5.5") so the user can pick gpt-5.5 / gpt-4o /
   // claude-opus-4-7 / claude-sonnet-4-5 per project. aiAuthorProject
   // routes to State.openai or State.anthropic based on the prefix.
-  const DB_VER  = 7;
+  //
+  // v8: @-mention typeahead (v4.44 M-AI-2). Adds shot._mentions[] — an
+  // array of { field_path, char_offset, entity_type, entity_id } annotations
+  // recorded whenever the user types @CharacterName or @LocationName in a
+  // prose field. On shot save, the resolver derives cast_in_frame +
+  // location.location_id from these annotations so the typeahead replaces
+  // the checkbox-grid + dropdown workflow without changing the underlying
+  // schema for those fields.
+  const DB_VER  = 8;
 
   // The stores that get the project_id filter treatment.
   const PROJECT_SCOPED = ["characters", "environments", "assets", "shots", "takes", "conversations"];
@@ -9832,12 +9840,12 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             };
           }
         }
-        // v5 → v7: per-row schema bumps consolidated into ONE cursor walk
+        // v5 → v8: per-row schema bumps consolidated into ONE cursor walk
         // per store so concurrent cursors on the same store can't race
         // (caught 2026-05-20: v6's project cursor was being clobbered by
         // v7's project cursor when a fresh IDB ran all migrations at once).
         // Idempotent — every assignment guards on `=== undefined`.
-        if (oldVersion < 7) {
+        if (oldVersion < 8) {
           // Projects: v6 added `aspect`, v7 added `ai_author_model`.
           const projOs = txn.objectStore("projects");
           const pcur = projOs.openCursor();
@@ -9859,8 +9867,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
             if (dirty) c.update(row);
             c.continue();
           };
-          // Shots: v6 added shot_summary + shot_summary_source.
-          if (oldVersion < 6 && db.objectStoreNames.contains("shots")) {
+          // Shots: v6 added shot_summary + shot_summary_source. v8 added
+          // _mentions[] for the @-mention typeahead. Single cursor walk.
+          if (db.objectStoreNames.contains("shots")) {
             const shOs = txn.objectStore("shots");
             const scur = shOs.openCursor();
             scur.onsuccess = (ev) => {
@@ -9868,8 +9877,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
               if (!c) return;
               const row = c.value;
               let dirty = false;
-              if (row.shot_summary === undefined) { row.shot_summary = ""; dirty = true; }
-              if (row.shot_summary_source === undefined) { row.shot_summary_source = "auto"; dirty = true; }
+              if (oldVersion < 6 && row.shot_summary === undefined) {
+                row.shot_summary = ""; dirty = true;
+              }
+              if (oldVersion < 6 && row.shot_summary_source === undefined) {
+                row.shot_summary_source = "auto"; dirty = true;
+              }
+              if (!Array.isArray(row._mentions)) {
+                row._mentions = []; dirty = true;
+              }
               if (dirty) c.update(row);
               c.continue();
             };
@@ -10743,6 +10759,248 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   };
   NS.errors = getErrorLog;
   NS._ERROR_BUFFER_CAP = _ERROR_BUFFER_CAP;
+
+  // v4.44 M-AI-2: @-mention typeahead for cast + locations.
+  //
+  // Triggered by typing `@` in a prose field. Filters cast+locations by
+  // display_name prefix, inserts the selected name on Enter, and records
+  // a structured mention into shot._mentions[]. On shot save, the
+  // resolver derives cast_in_frame + location.location_id from these
+  // annotations — the typeahead replaces the checkbox-grid + dropdown
+  // workflow without changing the underlying schema for those fields.
+  //
+  // Mounts on any <input type="text"> OR <textarea>. WeakMap-keyed so
+  // each field has its own mention list; helpers expose them at save time.
+  //
+  // The popover positions absolutely below the field (simple but works for
+  // both inputs and textareas; pixel-accurate caret positioning in
+  // textareas is a separate rabbit hole).
+  const _mentionRegistry = new WeakMap();
+  function _detectMentionContext(el) {
+    const text = el.value;
+    const cursor = el.selectionStart;
+    if (cursor == null) return null;
+    let i = cursor - 1;
+    while (i >= 0) {
+      const c = text[i];
+      if (c === "@") {
+        // Found @ — must be at start or preceded by whitespace
+        if (i === 0 || /\s/.test(text[i - 1])) {
+          return { atIndex: i, query: text.slice(i + 1, cursor) };
+        }
+        return null;
+      }
+      if (/\s/.test(c)) return null;  // hit whitespace before @
+      i--;
+    }
+    return null;
+  }
+  function _entityCatalog(characters, environments) {
+    const out = [];
+    for (const c of characters || []) {
+      if (!c?.id || !c?.display_name) continue;
+      out.push({ entity_type: "character", entity_id: c.id, display_name: c.display_name });
+    }
+    for (const e of environments || []) {
+      if (!e?.id || !e?.display_name) continue;
+      out.push({ entity_type: "location", entity_id: e.id, display_name: e.display_name });
+    }
+    return out;
+  }
+  function _filterEntities(catalog, query) {
+    const q = String(query || "").toLowerCase().trim();
+    if (!q) return catalog.slice(0, 8);
+    const starts = catalog.filter(e => e.display_name.toLowerCase().startsWith(q));
+    const contains = catalog.filter(e => !starts.includes(e) && e.display_name.toLowerCase().includes(q));
+    return [...starts, ...contains].slice(0, 8);
+  }
+  function mountMentionAutocomplete(el, opts) {
+    if (!el || !opts) return null;
+    const { characters, environments, fieldPath } = opts;
+    const catalog = _entityCatalog(characters, environments);
+    if (catalog.length === 0) return null;  // nothing to mention; bail silently
+    _mentionRegistry.set(el, []);
+
+    let popover = null;
+    let highlightedIdx = 0;
+    let currentMatches = [];
+    let currentMentionCtx = null;
+
+    const closePopover = () => {
+      if (popover) { popover.remove(); popover = null; }
+      currentMentionCtx = null;
+      currentMatches = [];
+      highlightedIdx = 0;
+    };
+    const openPopover = (mentionCtx) => {
+      currentMentionCtx = mentionCtx;
+      currentMatches = _filterEntities(catalog, mentionCtx.query);
+      highlightedIdx = 0;
+      if (!popover) {
+        popover = document.createElement("div");
+        popover.dataset.mentionPopover = "1";
+        popover.style.cssText = `
+          position: absolute; z-index: 9700;
+          background: #14141a; border: 1px solid #2a2a35; border-radius: 8px;
+          padding: 4px 0; min-width: 220px; max-width: 320px;
+          box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+          font-family: Inter, system-ui, sans-serif;
+        `;
+        document.body.appendChild(popover);
+      }
+      const rect = el.getBoundingClientRect();
+      popover.style.top = `${rect.bottom + window.scrollY + 4}px`;
+      popover.style.left = `${rect.left + window.scrollX}px`;
+      renderPopover();
+    };
+    const renderPopover = () => {
+      if (!popover) return;
+      if (currentMatches.length === 0) {
+        popover.innerHTML = `<div style="padding:8px 12px; font-size:12px; color:#9a9aab;">No matches.</div>`;
+        return;
+      }
+      popover.innerHTML = currentMatches.map((m, idx) => {
+        const isActive = idx === highlightedIdx;
+        const icon = m.entity_type === "character" ? "◉" : "▢";
+        const sub = m.entity_type === "character" ? "character" : "location";
+        return `
+          <div data-mention-idx="${idx}" style="
+            padding: 6px 12px; cursor: pointer; font-size: 13px;
+            background: ${isActive ? "rgba(201,162,90,0.15)" : "transparent"};
+            color: ${isActive ? "#e8e8ee" : "#c8c8d4"};
+            display: flex; align-items: baseline; gap: 8px;
+          ">
+            <span style="color:#c9a25a; font-size:11px;">${icon}</span>
+            <span style="flex:1;">${esc(m.display_name)}</span>
+            <span style="font-size:10.5px; color:#6a6a78;">${sub}</span>
+          </div>
+        `;
+      }).join("");
+      popover.querySelectorAll("[data-mention-idx]").forEach(node => {
+        node.addEventListener("mousedown", (e) => {
+          e.preventDefault();  // don't blur the textarea
+          highlightedIdx = Number(node.dataset.mentionIdx);
+          commitSelection();
+        });
+      });
+    };
+    const commitSelection = () => {
+      if (!currentMentionCtx || currentMatches.length === 0) return closePopover();
+      const sel = currentMatches[highlightedIdx];
+      if (!sel) return closePopover();
+      const text = el.value;
+      const { atIndex } = currentMentionCtx;
+      const cursor = el.selectionStart;
+      const before = text.slice(0, atIndex);
+      const after = text.slice(cursor);
+      const inserted = sel.display_name;
+      el.value = before + inserted + after;
+      // Place cursor right after the inserted name
+      const newCursor = atIndex + inserted.length;
+      el.setSelectionRange(newCursor, newCursor);
+      // Record the mention
+      const mentions = _mentionRegistry.get(el) || [];
+      mentions.push({
+        field_path: fieldPath,
+        char_offset: atIndex,
+        entity_type: sel.entity_type,
+        entity_id: sel.entity_id,
+      });
+      _mentionRegistry.set(el, mentions);
+      closePopover();
+      // Fire input event so anything else listening (e.g. autosave) re-runs.
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+
+    const onInput = () => {
+      const ctx = _detectMentionContext(el);
+      if (!ctx) return closePopover();
+      openPopover(ctx);
+    };
+    const onKeyDown = (e) => {
+      if (!popover) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        highlightedIdx = Math.min(currentMatches.length - 1, highlightedIdx + 1);
+        renderPopover();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        highlightedIdx = Math.max(0, highlightedIdx - 1);
+        renderPopover();
+      } else if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        commitSelection();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closePopover();
+      }
+    };
+    const onBlur = () => {
+      // Small delay so a click on the popover can commit before close
+      setTimeout(closePopover, 150);
+    };
+
+    el.addEventListener("input", onInput);
+    el.addEventListener("keydown", onKeyDown);
+    el.addEventListener("blur", onBlur);
+
+    return {
+      destroy() {
+        el.removeEventListener("input", onInput);
+        el.removeEventListener("keydown", onKeyDown);
+        el.removeEventListener("blur", onBlur);
+        closePopover();
+        _mentionRegistry.delete(el);
+      },
+      getMentions() {
+        return _mentionRegistry.get(el) || [];
+      },
+    };
+  }
+  NS.mountMentionAutocomplete = mountMentionAutocomplete;
+
+  // Read-back accessor — used by shot save handlers to pull the mention list.
+  function getMentionsForElement(el) {
+    return _mentionRegistry.get(el) || [];
+  }
+  NS.getMentionsForElement = getMentionsForElement;
+
+  // Resolver — merges accumulated @-mentions into the shot being saved.
+  // Idempotent and additive: characters already in cast_in_frame are NOT
+  // duplicated; location.location_id is only set if currently empty (so
+  // the explicit dropdown wins when both are provided).
+  function resolveShotMentionsIntoUpdated(updated, mentionsList, characters, environments) {
+    if (!Array.isArray(mentionsList) || mentionsList.length === 0) {
+      updated._mentions = Array.isArray(updated._mentions) ? updated._mentions : [];
+      return { added_cast: 0, set_location: false };
+    }
+    updated._mentions = mentionsList.slice();
+    updated.cast_in_frame = updated.cast_in_frame || [];
+    let added_cast = 0;
+    let set_location = false;
+    const knownCharIds = new Set((characters || []).map(c => c.id));
+    const knownEnvIds = new Set((environments || []).map(e => e.id));
+    for (const m of mentionsList) {
+      if (m.entity_type === "character" && knownCharIds.has(m.entity_id)) {
+        if (!updated.cast_in_frame.some(c => c.character_id === m.entity_id)) {
+          updated.cast_in_frame.push({
+            character_id: m.entity_id,
+            role_in_shot: "in_frame",
+          });
+          added_cast++;
+        }
+      } else if (m.entity_type === "location" && knownEnvIds.has(m.entity_id)) {
+        updated.location = updated.location || {};
+        // Only set if not already set by the explicit dropdown — dropdown wins.
+        if (!updated.location.location_id) {
+          updated.location.location_id = m.entity_id;
+          set_location = true;
+        }
+      }
+    }
+    return { added_cast, set_location };
+  }
+  NS.resolveShotMentionsIntoUpdated = resolveShotMentionsIntoUpdated;
 
   function toast(msg, opts = {}) {
     const wrap = $("#toasts");
@@ -23106,7 +23364,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // AI Producer chat (Tier 1 backlog) is the eventual front door for
   // converting briefs into full bibles. These forms cover the manual fallback.
 
-  function openFormModal({ title, formHtml, onSubmit }) {
+  function openFormModal({ title, formHtml, onSubmit, onMount }) {
     if ($("#elx-form-modal")) return;
     const panel = document.createElement("div");
     panel.id = "elx-form-modal";
@@ -23155,6 +23413,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
         toast(`Save failed: ${err.message}`, { tone: "err", duration: 7000 });
       }
     });
+    // v4.44: post-mount hook so callers can attach @-mention autocomplete
+    // (or any other input enhancement) after the DOM exists.
+    if (typeof onMount === "function") {
+      try { onMount(panel); } catch (err) { console.warn("[openFormModal onMount]", err); }
+    }
     return panel;
   }
 
@@ -23945,9 +24208,37 @@ JSON object only. No commentary. No fences. No trailing text.`;
         )}
       </div>
     `;
+    // v4.44 M-AI-2: track mentioned cast + locations across the two
+    // prose fields (focal_point input + moment_description textarea).
+    // Captured at mount, read at save.
+    let mentionTargets = [];
     openFormModal({
       title: `Edit shot S${String(s.shot_number || "?").padStart(2,"0")}`,
       formHtml,
+      onMount: (panel) => {
+        const focalEl = panel.querySelector("[name='focal_point']");
+        const descEl = panel.querySelector("[name='moment_description']");
+        if (focalEl) {
+          mountMentionAutocomplete(focalEl, {
+            characters, environments, fieldPath: "the_moment.focal_point",
+          });
+          mentionTargets.push({ el: focalEl, fieldPath: "the_moment.focal_point" });
+        }
+        if (descEl) {
+          mountMentionAutocomplete(descEl, {
+            characters, environments, fieldPath: "the_moment.description",
+          });
+          mentionTargets.push({ el: descEl, fieldPath: "the_moment.description" });
+        }
+        // Subtle inline hint above focal_point so users discover the
+        // feature without a separate modal.
+        if (focalEl) {
+          const hint = document.createElement("div");
+          hint.style.cssText = "font-size:10.5px; color:#6a6a78; margin-top:4px; line-height:1.4;";
+          hint.innerHTML = "Tip: type <strong style='color:#c9a25a;'>@</strong> to mention a cast member or location — they'll auto-link to the shot's cast/location.";
+          focalEl.parentElement?.appendChild(hint);
+        }
+      },
       onSubmit: async (form) => {
         const fd = new FormData(form);
         const display_name = String(fd.get("display_name") || s.display_name).trim();
@@ -24055,6 +24346,21 @@ JSON object only. No commentary. No fences. No trailing text.`;
           director_note: String(fd.get("director_note") || "").trim(),
           watch_points,
         };
+        // v4.44 M-AI-2: merge @-mentions into updated.cast_in_frame +
+        // updated.location.location_id. Idempotent (won't duplicate
+        // checkbox-selected cast) and dropdown wins on location conflict.
+        const allMentions = [];
+        for (const t of mentionTargets) {
+          const ms = getMentionsForElement(t.el);
+          for (const m of ms) allMentions.push(m);
+        }
+        const resolveResult = resolveShotMentionsIntoUpdated(updated, allMentions, characters, environments);
+        if (resolveResult.added_cast > 0 || resolveResult.set_location) {
+          const parts = [];
+          if (resolveResult.added_cast > 0) parts.push(`${resolveResult.added_cast} cast`);
+          if (resolveResult.set_location) parts.push("location");
+          toast(`@-mention wired ${parts.join(" + ")} into the shot.`, { duration: 4500 });
+        }
         await Storage.put("shots", updated);
         toast(`Saved shot S${String(shot_number).padStart(2,"0")} "${display_name}"`, { tone: "ok", duration: 6000 });
         await renderStoryboard();
