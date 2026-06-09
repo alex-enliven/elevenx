@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="d4643a6623bd" data-build-time="2026-05-20T15:10:20.901Z">
+<meta name="elevenx-build" content="f1bb34375d80" data-build-time="2026-06-09T17:45:22.729Z">
 <script>
 (function(){
-  var info = { hash: "d4643a6623bd", time: "2026-05-20T15:10:20.901Z" };
+  var info = { hash: "f1bb34375d80", time: "2026-06-09T17:45:22.729Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: d4643a6623bd @ 2026-05-20T15:10:20.901Z -->
+<!-- elevenx-build: f1bb34375d80 @ 2026-06-09T17:45:22.729Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -10672,6 +10672,73 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   const fmtUsd = (n) => `$${(Number(n) || 0).toFixed(2)}`;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+  // v4.43 — observability foundation. Central error reporting helper
+  // routing every caught error through three sinks:
+  //   1. console.error (with structured context tag)
+  //   2. IDB ring buffer (settings.error_log — FIFO, capped at 100)
+  //   3. User-visible toast (when context.userFacing === true)
+  //
+  // The ring buffer is the single biggest debug-loop fix this session.
+  // Pre-v4.43, ~81 try/catch sites in main.js routed to console.warn or
+  // a one-off `toast(err.message, {tone:"err"})`. The user couldn't
+  // audit "what went wrong in this session" without scrolling 200
+  // console lines. `await ElevenX.errors()` now dumps the buffer for
+  // bug reports; `ElevenX.errors.clear()` wipes it post-debug.
+  //
+  // Usage:
+  //   try { ... } catch (err) {
+  //     await reportError(err, { tag: "bootstrap", userFacing: true,
+  //       shotId, mode });
+  //   }
+  //
+  // Accepts any thrown value: Error, string, plain object. Stack
+  // trace pulled from err.stack when present.
+  const _ERROR_BUFFER_CAP = 100;
+  async function reportError(err, context = {}) {
+    const tag = context.tag || "unknown";
+    const message = (err && err.message) || (typeof err === "string" ? err : "(unknown error)");
+    const stack = (err && err.stack) || null;
+    const timestamp = Date.now();
+    // Sink 1 — console with structured tag prefix
+    try {
+      console.error(`[${tag}] ${message}`, err, context);
+    } catch { /* console can fail in degraded envs; never block on it */ }
+    // Sink 2 — IDB ring buffer (FIFO eviction at _ERROR_BUFFER_CAP)
+    try {
+      const buf = (await Storage.getSetting("error_log", [])) || [];
+      // Strip tag + userFacing from persisted context (they're already represented at the top level + sink choice)
+      const persistedCtx = { ...context };
+      delete persistedCtx.tag;
+      delete persistedCtx.userFacing;
+      delete persistedCtx.toastDuration;
+      buf.push({ timestamp, tag, message, stack, context: persistedCtx });
+      while (buf.length > _ERROR_BUFFER_CAP) buf.shift();
+      await Storage.setSetting("error_log", buf);
+    } catch (writeErr) {
+      // If we can't persist, at least sink 1 captured it
+      try { console.warn("[reportError] failed to persist:", writeErr.message); } catch {}
+    }
+    // Sink 3 — user toast when the error is user-facing
+    if (context.userFacing) {
+      const prefix = tag === "unknown" ? "" : `[${tag}] `;
+      toast(`${prefix}${message}`, { tone: "err", duration: context.toastDuration || 8000 });
+    }
+  }
+  NS.reportError = reportError;
+
+  // DevTools accessor — async because the buffer lives in IDB. Returns the
+  // buffer in chronological order (oldest first). `.clear()` wipes.
+  //   await ElevenX.errors()        → [{ timestamp, tag, message, stack, context }, ...]
+  //   await ElevenX.errors.clear()  → undefined
+  async function getErrorLog() {
+    return (await Storage.getSetting("error_log", [])) || [];
+  }
+  getErrorLog.clear = async function() {
+    await Storage.setSetting("error_log", []);
+  };
+  NS.errors = getErrorLog;
+  NS._ERROR_BUFFER_CAP = _ERROR_BUFFER_CAP;
+
   function toast(msg, opts = {}) {
     const wrap = $("#toasts");
     if (!wrap) { console.log("[toast]", msg); return; }
@@ -13324,7 +13391,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
         }
         summaryCostUsd = summaryResult.cost_usd || 0;
       } catch (err) {
-        console.warn("[v4.42.1 batched shot summaries]", err.message);
+        await reportError(err, {
+          tag: "batched-shot-summaries", userFacing: false,
+          shot_count: persistedShots.length,
+        });
         // Non-fatal: shots persist with empty shot_summary; the existing
         // boot-time maybeRefreshShotSummary pass will catch them later.
       }
@@ -19835,13 +19905,17 @@ JSON object only. No commentary. No fences. No trailing text.`;
       toast(`Take rolled · ${fmtUsd(estCost)} · ${renderEngine}`);
       // CONTINUITY CHAIN — extract last frame, seed next shot's start image
       // if its continuity strategy is "inherit_end_of_previous".
-      chainToNextShot(shot, take).catch(err => console.warn("[chain]", err));
+      chainToNextShot(shot, take).catch(err => reportError(err, {
+        tag: "chain-to-next-shot", userFacing: false, shotId: shot.id, takeId: take.id,
+      }));
       // v4.40 INPUT-3 — chain CHARACTER IDENTITY across shots. Persist the
       // approved start-frame on every cast character as a derived_ref;
       // subsequent gens for those characters prefer this ref over the cast
       // bible portrait → facial identity stays stable shot-to-shot
       // (Finding F in the 2026-05-19 shot-by-shot audit).
-      persistCharacterDerivedRefs(shot).catch(err => console.warn("[v4.40 derived-refs]", err));
+      persistCharacterDerivedRefs(shot).catch(err => reportError(err, {
+        tag: "derived-refs", userFacing: false, shotId: shot.id,
+      }));
       renderStoryboard();
       if (State.activeShotId === shotId) renderShotEditor(shotId);
       // v4.36: auto-fire ElevenLabs voice overlay for dialogue shots.
@@ -19864,14 +19938,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const autoVO = project?.auto_vo_overlay !== false;  // default ON
       if (hasSpeechForVO && autoVO && State.eleven) {
         // Fire-and-forget; the handler shows its own GPS overlay + toasts.
-        handleGenerateVoiceOverlay(shotId, take.id).catch(err => {
-          console.warn("[v4.36 auto-VO failed]", err);
-        });
+        handleGenerateVoiceOverlay(shotId, take.id).catch(err => reportError(err, {
+          tag: "auto-vo", userFacing: false, shotId, takeId: take.id,
+        }));
       } else if (hasSpeechForVO && autoVO && !State.eleven) {
         toast(`Shot has dialogue but ElevenLabs isn't configured — set the API key in Connection to enable auto-VO.`, { tone: "warn", duration: 7000 });
       }
     } catch (err) {
-      console.error(err);
       // v4.26: detect timeout-with-pending-job and surface the recovery
       // affordance instead of treating it as a generic failure. The
       // shot's _pending_seedance was already persisted via onSubmit, so
@@ -19883,9 +19956,25 @@ JSON object only. No commentary. No fences. No trailing text.`;
           `Polling timed out for ${shot.display_name || shotId} — but the fal job may still be running. The request_id is saved. Run: await ElevenX.__recoverPendingTake("${shotId}") to resume polling without re-submitting.${reqId ? " request_id=" + reqId + "…" : ""}`,
           { tone: "warn", duration: 14000 }
         );
-        console.warn(`[v4.26] pending fal job saved for ${shotId}: request_id=${err._fal_pending?.request_id || "?"}`);
+        // v4.43: still capture into ring buffer with the pending-job marker
+        // so post-debug audit can correlate the timeout with the request_id.
+        await reportError(err, {
+          tag: "roll-shot-timeout",
+          userFacing: false,
+          shotId,
+          request_id: err._fal_pending?.request_id,
+          endpoint: err._fal_pending?.endpoint,
+        });
       } else {
-        toast(`Error: ${err.message}`, { tone: "err", duration: 8000 });
+        // Real failure — capture + toast via reportError so the ring buffer
+        // gets the shot context for bug reports.
+        await reportError(err, {
+          tag: "roll-shot",
+          userFacing: true,
+          shotId,
+          engine: routing?.engine,
+          mode: routing?.composer_mode,
+        });
       }
     } finally {
       setGPS(false);
@@ -20775,10 +20864,18 @@ JSON object only. No commentary. No fences. No trailing text.`;
         }, 1200);
       }
     } catch (err) {
-      console.error("[v4.42 AI Producer]", err);
       setGPS(false);
       setStatus(`✗ ${esc(err.message)}`, "err");
-      toast(`AI Producer failed: ${err.message}`, { tone: "err", duration: 8000 });
+      // v4.43: route through reportError so the chat-panel failure is
+      // in the ring buffer for post-debug audit (was a one-off
+      // toast+console.error pair).
+      await reportError(err, {
+        tag: "ai-producer",
+        userFacing: true,
+        mode,
+        logline_length: logline.length,
+        shotCount,
+      });
     }
   }
   NS.handleAIProducerSubmit = handleAIProducerSubmit;
@@ -21528,9 +21625,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (State.activeShotId === shotId) renderShotEditor(shotId);
       renderStoryboard();
     } catch (err) {
-      console.error("[v4.39 suggest-fix]", err);
       setGPS(false);
-      toast(`Fix proposal failed: ${err.message}`, { tone: "err", duration: 7000 });
+      await reportError(err, {
+        tag: "suggest-fix",
+        userFacing: true,
+        shotId,
+        issueKind,
+      });
     }
   }
   NS.handleSuggestFix = handleSuggestFix;
@@ -21571,9 +21672,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (State.activeShotId === shotId) renderShotEditor(shotId);
       renderStoryboard();
     } catch (err) {
-      console.error("[v4.39 AI author]", err);
       setGPS(false);
-      toast(`AI author failed: ${err.message}`, { tone: "err", duration: 7000 });
+      await reportError(err, {
+        tag: "ai-author-shot",
+        userFacing: true,
+        shotId,
+      });
     }
   }
   NS.handleAIAuthorShot = handleAIAuthorShot;
