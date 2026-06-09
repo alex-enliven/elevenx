@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="dba92262788f" data-build-time="2026-06-09T19:40:57.006Z">
+<meta name="elevenx-build" content="153fad3cfbe0" data-build-time="2026-06-09T21:58:35.094Z">
 <script>
 (function(){
-  var info = { hash: "dba92262788f", time: "2026-06-09T19:40:57.006Z" };
+  var info = { hash: "153fad3cfbe0", time: "2026-06-09T21:58:35.094Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: dba92262788f @ 2026-06-09T19:40:57.006Z -->
+<!-- elevenx-build: 153fad3cfbe0 @ 2026-06-09T21:58:35.094Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -13491,7 +13491,44 @@ JSON object only. No commentary. No fences. No trailing text.`;
       });
     } catch (err) {
       const is404 = isClaude && /\b404\b/.test(err?.message || "");
-      if (!is404) throw err;  // not the worker-not-redeployed case — rethrow
+      // v4.47.1: OpenAI invalid-model hardening. gpt-5.5 became the default
+      // in v4.42.1 but has never been called live — if the model ID isn't
+      // valid on the user's account, OpenAI 400s with "model ... does not
+      // exist". Catch that specific shape and retry ONCE on gpt-4o (the
+      // last live-validated model) so the rehearsal doesn't die on step 1.
+      // Tight match (model + not-found/does-not-exist/invalid) so real
+      // errors (rate limits, malformed body) still surface.
+      const isBadOpenAIModel = !isClaude
+        && aiAuthorModel !== "gpt-4o"
+        && /model/i.test(err?.message || "")
+        && /(not.?found|does not exist|invalid|unknown)/i.test(err?.message || "");
+      if (isBadOpenAIModel && State.openai) {
+        toast(
+          `⚠ Model "${aiAuthorModel}" rejected by OpenAI — used gpt-4o instead. Check the model ID in project settings → AI Director model.`,
+          { tone: "warn", duration: 8000 }
+        );
+        await reportError(err, {
+          tag: "openai-bad-model-fallback",
+          userFacing: false,
+          attempted_model: aiAuthorModel,
+          fallback_model: "gpt-4o",
+        });
+        result = await State.openai.chatCompletion({
+          system,
+          user,
+          model: "gpt-4o",
+          response_format: { type: "json_object" },
+          temperature: 0.7,
+          max_tokens: 4000,
+        });
+        result._aiAuthorProject_fallback = {
+          from: aiAuthorModel,
+          to: "gpt-4o",
+          reason: "openai-bad-model",
+        };
+      } else if (!is404) {
+        throw err;  // not a known-fallback case — rethrow
+      } else {
 
       const fallbackEnabled = ctx?.project?.ai_author_fallback_on_404 !== false;  // default true
       if (fallbackEnabled && State.openai) {
@@ -13529,6 +13566,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
           `OR (b) switch this project's AI Director model back to gpt-5.5 in project settings → AI Director model.`
         );
       }
+      }  // close v4.47.1 else (the anthropic-404 branch)
     }
     const proposals = Array.isArray(result.parsed?.proposals) ? result.parsed.proposals : [];
     // Guard: drop proposals that don't have both a field and a proposed body.
@@ -20951,6 +20989,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
     else if (action === "finish-ambient-preview")  handleAmbientPreview();
     else if (action === "finish-ambient-clear")    handleAmbientClear();
     else if (action === "finish-export-fcpxml") handleExportFcpxml();
+    // v4.47.1: the complete DaVinci handoff — fcpxml + all referenced media
+    // written into one user-picked folder (File System Access API).
+    else if (action === "finish-export-bundle") handleExportMediaBundle();
     // v4.46 M-AI-5 Part A: per-shot SFX event generation. Triggered from the
     // shot editor toolbar or storyboard tile when the shot has events without
     // cached ElevenLabs audio.
@@ -23009,7 +23050,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
         <div class="elx-finish__export">
           <div class="elx-finish__label">Export</div>
           <div class="elx-finish__export-row">
-            <button class="btn btn--sm" data-action="finish-export-fcpxml">⬇ Download FCPXML (DaVinci / FCP)</button>
+            <button class="btn btn--sm" data-action="finish-export-bundle" title="Writes ONE folder: the .fcpxml timeline + every media file (takes/, vo/, sfx/, audio/) at the exact paths the XML references. Drag the folder into DaVinci's media pool, import the timeline — everything resolves online.">⬇ Export media bundle (DaVinci)</button>
+            <button class="btn btn--sm btn--ghost" data-action="finish-export-fcpxml" title="Timeline XML only — media files NOT included. Clips will be offline in DaVinci unless you've already exported the bundle.">⬇ FCPXML only</button>
             <button class="btn btn--sm btn--ghost" data-action="finish-export-manifest">⬇ Download provenance JSON</button>
           </div>
           <div class="elx-finish__export-hint">FCPXML imports into DaVinci Resolve as a timeline. Each clip references the approved take by URL. Provenance JSON includes every take's prompt, seed, model, and cost — for git provenance + reproducibility.</div>
@@ -23369,6 +23411,167 @@ JSON object only. No commentary. No fences. No trailing text.`;
     ].filter(Boolean).join(" + ");
     toast(`FCPXML exported · ${trackNote}`, { duration: 6000 });
   }
+
+  // ─── v4.47.1 — media bundle export (the missing half of the DaVinci handoff) ──
+  //
+  // BLOCKER caught in the pre-rehearsal evaluation (2026-06-09): buildFcpxml
+  // emits src paths like `takes/<id>.mp4` / `vo/<id>.mp3` / `sfx/<shot>_<i>.mp3`
+  // / `audio/ambient_bed.mp3` — but nothing ever wrote those files. All media
+  // lives as dataURLs in IDB. Importing the FCPXML alone gives DaVinci a
+  // timeline of 100% offline clips. The RC criterion "film stitches in
+  // DaVinci" was unreachable.
+  //
+  // This export writes ONE folder containing the .fcpxml AND every media
+  // file at the EXACT relative path the XML references. User picks a folder
+  // (File System Access API, Chrome/Edge), drags the folder into DaVinci's
+  // media pool, imports the timeline — everything resolves online.
+  //
+  // Fallback when showDirectoryPicker is unavailable (Firefox/Safari):
+  // sequential downloads with `__`-flattened path names (takes__<id>.mp4)
+  // + a toast explaining the user must recreate the subfolders. Functional
+  // but clunky — the FS Access path is the intended UX.
+
+  function dataUrlToBlob(dataUrl) {
+    const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+    if (!match) throw new Error("dataUrlToBlob: not a base64 data URL");
+    const [, mime, b64] = match;
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+
+  // Collect every media file the FCPXML references, as { path, blob } pairs.
+  // Paths MUST match buildFcpxml's src attributes exactly — a drift between
+  // the two means offline media in DaVinci, which is the bug class this
+  // feature exists to kill. Keep them in lockstep.
+  function collectMediaBundleFiles({ approved, project, score }) {
+    const files = [];
+    const skipped = [];
+    for (const { shot, take } of approved) {
+      // Video take — takes/<take.id>.mp4
+      if (take.videoDataUrl?.startsWith("data:")) {
+        files.push({ path: `takes/${take.id}.mp4`, dataUrl: take.videoDataUrl });
+      } else {
+        skipped.push(`takes/${take.id}.mp4 (no inline video data)`);
+      }
+      // VO overlay — vo/<take.id>.mp3
+      if (take.audioOverlay?.dataUrl?.startsWith("data:")) {
+        files.push({ path: `vo/${take.id}.mp3`, dataUrl: take.audioOverlay.dataUrl });
+      }
+      // SFX events — sfx/<shot.id>_<i>.mp3 (index must match buildFcpxml's loop)
+      const events = Array.isArray(shot.audio?.sfx_events) ? shot.audio.sfx_events : [];
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (ev?.audio?.dataUrl?.startsWith("data:") && ev?.text) {
+          files.push({ path: `sfx/${shot.id}_${i}.mp3`, dataUrl: ev.audio.dataUrl });
+        }
+      }
+    }
+    // Ambient bed — audio/ambient_bed.mp3
+    if (project?.ambient_bed_audio?.dataUrl?.startsWith("data:")) {
+      files.push({ path: `audio/ambient_bed.mp3`, dataUrl: project.ambient_bed_audio.dataUrl });
+    }
+    // Score — audio/<filename>
+    if (score?.dataUrl?.startsWith("data:") && score.filename) {
+      files.push({ path: `audio/${score.filename}`, dataUrl: score.dataUrl });
+    }
+    return { files, skipped };
+  }
+
+  async function handleExportMediaBundle() {
+    const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
+    const approved = shots
+      .map(s => ({ shot: s, take: (s.takes || []).find(t => t.status === "approved") }))
+      .filter(p => p.take?.videoDataUrl);
+    if (approved.length === 0) {
+      toast("No approved takes to export.", { tone: "warn" });
+      return;
+    }
+    const score = await Storage.getSetting("episode_score", null);
+    const project = await Storage.Projects.getActive();
+    const ambientBed = project?.ambient_bed_audio?.dataUrl ? project.ambient_bed_audio : null;
+    const xml = buildFcpxml({
+      shots: approved,
+      score,
+      ambientBed,
+      episodeTitle: project?.display_name || "Episode 1",
+    });
+    const fcpxmlName = `${(project?.display_name || "elevenx").replace(/\s+/g, "_")}.fcpxml`;
+    const { files, skipped } = collectMediaBundleFiles({ approved, project, score });
+
+    const totalBytesApprox = files.reduce((sum, f) => sum + Math.round(f.dataUrl.length * 0.75), 0);
+    const sizeMb = (totalBytesApprox / (1024 * 1024)).toFixed(1);
+
+    if (typeof window.showDirectoryPicker === "function") {
+      // ── Preferred path: write the real folder structure ───────────────
+      let root;
+      try {
+        root = await window.showDirectoryPicker({ mode: "readwrite" });
+      } catch (err) {
+        if (err?.name === "AbortError") return;  // user cancelled the picker — not an error
+        await reportError(err, { tag: "media-bundle", userFacing: true });
+        return;
+      }
+      setGPS(true, `Writing media bundle`, `${files.length + 1} files · ~${sizeMb} MB`, 10);
+      let written = 0;
+      const errors = [];
+      try {
+        // The .fcpxml at the root
+        const xmlHandle = await root.getFileHandle(fcpxmlName, { create: true });
+        const xmlWriter = await xmlHandle.createWritable();
+        await xmlWriter.write(new Blob([xml], { type: "application/xml" }));
+        await xmlWriter.close();
+        written++;
+        // Media files into their subdirectories
+        const dirCache = new Map();
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i];
+          setGPS(true, `Writing ${f.path}`, `${i + 1}/${files.length}`, Math.round(10 + (i / files.length) * 85));
+          try {
+            const [dirName, fileName] = [f.path.slice(0, f.path.indexOf("/")), f.path.slice(f.path.indexOf("/") + 1)];
+            let dir = dirCache.get(dirName);
+            if (!dir) {
+              dir = await root.getDirectoryHandle(dirName, { create: true });
+              dirCache.set(dirName, dir);
+            }
+            const fh = await dir.getFileHandle(fileName, { create: true });
+            const w = await fh.createWritable();
+            await w.write(dataUrlToBlob(f.dataUrl));
+            await w.close();
+            written++;
+          } catch (err) {
+            errors.push({ path: f.path, error: err.message });
+          }
+        }
+      } finally {
+        setGPS(false);
+      }
+      if (errors.length > 0) {
+        await reportError(new Error(`media bundle: ${errors.length} file(s) failed`), {
+          tag: "media-bundle", userFacing: false, errors,
+        });
+      }
+      const skipNote = skipped.length > 0 ? ` · ${skipped.length} skipped (see console)` : "";
+      if (skipped.length > 0) console.warn("[media-bundle] skipped:", skipped);
+      toast(
+        errors.length === 0
+          ? `✓ Media bundle written · ${written} files · ~${sizeMb} MB${skipNote}. Drag the folder into DaVinci's media pool, then import the .fcpxml.`
+          : `Media bundle: ${written} written, ${errors.length} failed${skipNote}. See ElevenX.errors().`,
+        { tone: errors.length === 0 ? "ok" : "warn", duration: 9000 }
+      );
+    } else {
+      // ── Fallback: sequential downloads with flattened names ────────────
+      toast(`Browser lacks folder-write access — downloading ${files.length + 1} files with "__" path prefixes. Recreate the subfolders (takes/, vo/, sfx/, audio/) manually before importing into DaVinci.`, { tone: "warn", duration: 10000 });
+      triggerDownload(new Blob([xml], { type: "application/xml" }), fcpxmlName);
+      for (const f of files) {
+        triggerDownload(dataUrlToBlob(f.dataUrl), f.path.replace(/\//g, "__"));
+        await sleep(350);  // browsers throttle rapid programmatic downloads
+      }
+    }
+  }
+  NS.handleExportMediaBundle = handleExportMediaBundle;
+  NS.collectMediaBundleFiles = collectMediaBundleFiles;
 
   function buildFcpxml({ shots, score, ambientBed, episodeTitle }) {
     // FPS assumption: 30 (Seedance default). Use 30/1 timebase.
