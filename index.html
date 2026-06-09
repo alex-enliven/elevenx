@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="f0ee7ff5269c" data-build-time="2026-06-09T18:11:23.014Z">
+<meta name="elevenx-build" content="dba92262788f" data-build-time="2026-06-09T19:40:57.006Z">
 <script>
 (function(){
-  var info = { hash: "f0ee7ff5269c", time: "2026-06-09T18:11:23.014Z" };
+  var info = { hash: "dba92262788f", time: "2026-06-09T19:40:57.006Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: f0ee7ff5269c @ 2026-06-09T18:11:23.014Z -->
+<!-- elevenx-build: dba92262788f @ 2026-06-09T19:40:57.006Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -17759,10 +17759,22 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // beat description. Surface BELOW name on the storyboard tile so
       // directors can scan the film at-a-glance without opening each shot.
       const summary = String(s.shot_summary || "").trim();
+      // v4.46 M-AI-5 Part A: SFX events badge — surfaces when the shot has
+      // events authored but missing cached audio. Single click fires
+      // handleGenerateSfxEvents to pay ElevenLabs cost in bulk.
+      const sfxEvents = Array.isArray(s.audio?.sfx_events) ? s.audio.sfx_events : [];
+      const sfxPending = sfxEvents.filter(ev => ev?.text && !ev?.audio?.dataUrl).length;
+      const sfxReady = sfxEvents.filter(ev => ev?.audio?.dataUrl).length;
+      const sfxBadge = sfxPending > 0
+        ? `<button class="elx-shot__sfx-cta" data-action="generate-sfx" data-shot-id="${esc(s.id)}" title="Generate ElevenLabs audio for ${sfxPending} pending SFX event${sfxPending === 1 ? "" : "s"}" style="position:absolute; top:8px; right:8px; background:rgba(20,20,26,0.92); color:#c9a25a; border:1px solid #c9a25a; padding:3px 7px; border-radius:3px; font-size:10px; font-weight:600; cursor:pointer;">🎚️ ${sfxPending} SFX</button>`
+        : sfxReady > 0
+        ? `<span title="${sfxReady} SFX event${sfxReady === 1 ? "" : "s"} ready in FCPXML" style="position:absolute; top:8px; right:8px; background:rgba(74,222,128,0.12); color:#4ade80; border:1px solid rgba(74,222,128,0.35); padding:3px 7px; border-radius:3px; font-size:10px; font-weight:600;">🎚️ ${sfxReady}✓</span>`
+        : "";
       card.innerHTML = `
         <div class="elx-shot__thumb-only" style="${thumbStyle}">
           <span class="mode-pill ${modeClass} elx-shot__mode-corner">${modeShort}</span>
           ${issueBadge}
+          ${sfxBadge}
           <div class="elx-shot__overlay">
             <span class="elx-shot__num">${esc(shotNum)}</span>
             <span class="elx-shot__name">${esc(s.display_name || s.id)}</span>
@@ -20939,6 +20951,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
     else if (action === "finish-ambient-preview")  handleAmbientPreview();
     else if (action === "finish-ambient-clear")    handleAmbientClear();
     else if (action === "finish-export-fcpxml") handleExportFcpxml();
+    // v4.46 M-AI-5 Part A: per-shot SFX event generation. Triggered from the
+    // shot editor toolbar or storyboard tile when the shot has events without
+    // cached ElevenLabs audio.
+    else if (action === "generate-sfx") handleGenerateSfxEvents(target.dataset.shotId);
     else if (action === "finish-export-manifest") handleExportProvenance();
     else if (action === "open-shot-editor") navigateToShot(target.dataset.shotId);
     else if (action === "tree-nav-shot")    navigateToShot(target.dataset.shotId);
@@ -23231,6 +23247,86 @@ JSON object only. No commentary. No fences. No trailing text.`;
     renderFinishScreen();
   }
 
+  // ─── v4.46 M-AI-5 Part A — per-event SFX generation ─────────────────
+  // For every shot.audio.sfx_events[] entry without cached audio, fires
+  // an ElevenLabs /v1/sound-generation call and caches the resulting
+  // dataUrl onto the event. Idempotent — events with `audio.dataUrl`
+  // are skipped.
+  //
+  // Cost: ~$0.04-0.08 per event (1-3 second SFX clip). The shot edit
+  // modal warns the user how many events will fire; this is the click
+  // that pays the bill.
+  async function handleGenerateSfxEvents(shotId) {
+    if (!State.eleven) {
+      toast("Add your ElevenLabs API key in Connection first.", { tone: "warn" });
+      showConnectionPanel();
+      return;
+    }
+    const shot = await Storage.get("shots", shotId);
+    if (!shot) {
+      toast(`Shot ${shotId} not found.`, { tone: "err" });
+      return;
+    }
+    const events = Array.isArray(shot.audio?.sfx_events) ? shot.audio.sfx_events : [];
+    const pending = events.filter(e => !e.audio?.dataUrl && e.text);
+    if (pending.length === 0) {
+      toast(events.length === 0
+        ? "No SFX events to generate. Author them in the shot edit modal first."
+        : "All SFX events already have cached audio.", { tone: events.length === 0 ? "warn" : "info" });
+      return;
+    }
+    const estCost = pending.length * 0.06;
+    if (!confirm(`Generate audio for ${pending.length} SFX event${pending.length === 1 ? "" : "s"}? Est cost ~$${estCost.toFixed(2)} (ElevenLabs sound-generation).`)) return;
+
+    setGPS(true, `Generating SFX (${pending.length} event${pending.length === 1 ? "" : "s"})`, "elevenlabs · sound-generation", 30);
+    let ok = 0, fail = 0;
+    let totalCost = 0;
+    for (let i = 0; i < pending.length; i++) {
+      const ev = pending[i];
+      const idx = events.indexOf(ev);
+      setGPS(true, `SFX ${i + 1}/${pending.length}: "${ev.text}"`, "elevenlabs", Math.round(30 + (i / pending.length) * 60));
+      try {
+        const result = await State.eleven.soundGenerate({
+          text: ev.text,
+          duration_seconds: Math.max(0.5, Math.min(30, Number(ev.duration) || 1.0)),
+          prompt_influence: 0.5,
+        });
+        ev.audio = {
+          dataUrl: result.dataUrl,
+          byteSize: result.byteSize,
+          cost_usd: result.cost_usd_estimated || 0.06,
+          model_id: result.model_id,
+          prompt_text: ev.text,
+          generated_at: Date.now(),
+        };
+        events[idx] = ev;
+        totalCost += result.cost_usd_estimated || 0.06;
+        ok++;
+      } catch (err) {
+        fail++;
+        await reportError(err, {
+          tag: "sfx-event-gen",
+          userFacing: false,
+          shotId, event_idx: idx, event_text: ev.text,
+        });
+      }
+    }
+    // Persist the shot with updated event audio
+    shot.audio = shot.audio || {};
+    shot.audio.sfx_events = events;
+    await Storage.put("shots", shot);
+    if (totalCost > 0) await trackCost(totalCost, `elevenlabs sfx ${shotId}`);
+    setGPS(false);
+    if (fail === 0) {
+      toast(`✓ Generated ${ok} SFX event${ok === 1 ? "" : "s"} · ${fmtUsd(totalCost)}`, { tone: "ok", duration: 5000 });
+    } else {
+      toast(`${ok} SFX ok, ${fail} failed · ${fmtUsd(totalCost)}. See ElevenX.errors() for details.`, { tone: "warn", duration: 7000 });
+    }
+    // Refresh storyboard so the shot card reflects updated state
+    renderStoryboard();
+  }
+  NS.handleGenerateSfxEvents = handleGenerateSfxEvents;
+
   // ─── FCPXML export ──────────────────────────────────────────────────
   // Generates a DaVinci-Resolve-compatible FCPXML 1.10 timeline containing
   // every approved take as a clip on the V1/A1 tracks, in shot_number order.
@@ -23249,26 +23345,49 @@ JSON object only. No commentary. No fences. No trailing text.`;
       return;
     }
     const score = await Storage.getSetting("episode_score", null);
-    const xml = buildFcpxml({ shots: approved, score, episodeTitle: "Episode 1 · The Standup" });
+    const project = await Storage.Projects.getActive();
+    // v4.46 M-AI-5 Part A: include 4 audio tracks (video + score on top
+    // already; ambient bed + SFX events on top of that).
+    const ambientBed = project?.ambient_bed_audio?.dataUrl ? project.ambient_bed_audio : null;
+    const xml = buildFcpxml({
+      shots: approved,
+      score,
+      ambientBed,
+      episodeTitle: project?.display_name || "Episode 1",
+    });
     const blob = new Blob([xml], { type: "application/xml" });
-    triggerDownload(blob, `EP01_TheStandup_${new Date().toISOString().slice(0,10)}.fcpxml`);
-    toast(`FCPXML exported · ${approved.length} clip${approved.length===1?"":"s"}`);
+    triggerDownload(blob, `${(project?.display_name || "elevenx").replace(/\s+/g, "_")}_${new Date().toISOString().slice(0,10)}.fcpxml`);
+    // Surface the audio-track count so the user knows what to expect in DaVinci
+    const sfxTotal = approved.reduce((sum, p) => sum + (p.shot.audio?.sfx_events?.filter(e => e.audio?.dataUrl).length || 0), 0);
+    const voTotal = approved.filter(p => p.take.audioOverlay?.dataUrl).length;
+    const trackNote = [
+      `${approved.length} video clip${approved.length === 1 ? "" : "s"}`,
+      voTotal > 0 ? `${voTotal} VO overlay${voTotal === 1 ? "" : "s"}` : null,
+      sfxTotal > 0 ? `${sfxTotal} SFX event${sfxTotal === 1 ? "" : "s"}` : null,
+      ambientBed ? `ambient bed` : null,
+      score?.dataUrl ? `score` : null,
+    ].filter(Boolean).join(" + ");
+    toast(`FCPXML exported · ${trackNote}`, { duration: 6000 });
   }
 
-  function buildFcpxml({ shots, score, episodeTitle }) {
+  function buildFcpxml({ shots, score, ambientBed, episodeTitle }) {
     // FPS assumption: 30 (Seedance default). Use 30/1 timebase.
     const fps = 30;
-    const tbStr = `${fps * 100}/${100}s`; // 3000/100s
+    // Time helper — converts seconds to FCPXML rational time string.
+    const tStr = (sec) => `${Math.round(sec * fps * 100)}/${100}s`;
+
     let timelineOffset = 0;
+    // v4.46 M-AI-5 Part A: track the per-shot start offset so SFX events
+    // (with `at` relative to the shot start) land at the right absolute
+    // timeline position. VO overlays land at the shot's start offset.
+    const shotOffsets = []; // [{ shotId, startSec, durationSec }]
     const clips = shots.map(({ shot, take }) => {
       const dur = shot.timecode?.duration_seconds || 8;
-      const durFrames = Math.round(dur * fps);
-      const start = `${Math.round(timelineOffset * fps * 100)}/${100}s`;
-      const duration = `${durFrames * 100}/${100}s`;
+      const startSec = timelineOffset;
+      shotOffsets.push({ shotId: shot.id, startSec, durationSec: dur, take });
+      const start = tStr(startSec);
+      const duration = tStr(dur);
       timelineOffset += dur;
-      // Take note: in a real DaVinci import the src would be a file path.
-      // Here we use the take ID — the colorist can match this to the take
-      // files (which they'd save separately).
       return `
         <asset-clip name="S${String(shot.shot_number).padStart(2,"0")} ${escapeXml(shot.display_name || shot.id)}"
                     offset="${start}"
@@ -23288,27 +23407,104 @@ JSON object only. No commentary. No fences. No trailing text.`;
         </asset-clip>
       `;
     }).join("\n");
-    const totalDur = `${Math.round(timelineOffset * fps * 100)}/${100}s`;
+    const totalDur = tStr(timelineOffset);
 
     // Resources block — one asset per approved take
     const assets = shots.map(({ take, shot }) => {
       const durSec = shot.timecode?.duration_seconds || 8;
-      const durFrames = Math.round(durSec * fps);
       return `
     <asset id="r-${take.id}"
            name="${escapeXml(`take-${take.id.slice(0,8)}.mp4`)}"
            src="${escapeXml(`takes/${take.id}.mp4`)}"
            start="0s"
-           duration="${durFrames * 100}/${100}s"
+           duration="${tStr(durSec)}"
            hasVideo="1"
            hasAudio="1"
            format="r1"/>`;
     }).join("");
 
+    // v4.46 M-AI-5 Part A: VO overlay assets + clips. Each shot's take
+    // can carry an ElevenLabs voice overlay (audioOverlay.dataUrl). Emit
+    // as audioRole="dialogue" so DaVinci routes it to A1/A2 alongside
+    // the native take audio.
+    const voClips = [];
+    const voAssets = [];
+    for (const o of shotOffsets) {
+      if (o.take?.audioOverlay?.dataUrl) {
+        const assetId = `r-vo-${o.take.id}`;
+        voAssets.push(`
+    <asset id="${assetId}"
+           name="${escapeXml(`vo-${o.take.id.slice(0,8)}.mp3`)}"
+           src="${escapeXml(`vo/${o.take.id}.mp3`)}"
+           start="0s"
+           duration="${tStr(o.durationSec)}"
+           hasAudio="1"
+           format="r-audio"/>`);
+        voClips.push(`
+        <asset-clip name="VO S${String(o.shotId || "").slice(0, 8)}"
+                    offset="${tStr(o.startSec)}"
+                    duration="${tStr(o.durationSec)}"
+                    start="0s"
+                    ref="${assetId}"
+                    audioRole="dialogue.vo"/>`);
+      }
+    }
+
+    // v4.46 M-AI-5 Part A: SFX event assets + clips. Each shot's
+    // audio.sfx_events[] with cached audio emits an asset-clip on
+    // audioRole="effects" at offset = shot_start + event.at.
+    const sfxClips = [];
+    const sfxAssets = [];
+    for (const o of shotOffsets) {
+      const shot = shots.find(p => p.shot.id === o.shotId)?.shot;
+      const events = Array.isArray(shot?.audio?.sfx_events) ? shot.audio.sfx_events : [];
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (!ev?.audio?.dataUrl || !ev?.text) continue;
+        const sfxDur = Math.max(0.1, Number(ev.duration) || 1.0);
+        const sfxAt = Math.max(0, Number(ev.at) || 0);
+        const assetId = `r-sfx-${o.shotId}-${i}`;
+        sfxAssets.push(`
+    <asset id="${assetId}"
+           name="${escapeXml(`sfx-${ev.text.slice(0,20).replace(/\s+/g, "_")}.mp3`)}"
+           src="${escapeXml(`sfx/${o.shotId}_${i}.mp3`)}"
+           start="0s"
+           duration="${tStr(sfxDur)}"
+           hasAudio="1"
+           format="r-audio"/>`);
+        sfxClips.push(`
+        <asset-clip name="SFX ${escapeXml(ev.text)}"
+                    offset="${tStr(o.startSec + sfxAt)}"
+                    duration="${tStr(sfxDur)}"
+                    start="0s"
+                    ref="${assetId}"
+                    audioRole="effects"/>`);
+      }
+    }
+
+    // v4.46 M-AI-5 Part A: ambient bed (project-level). Spans the full
+    // timeline length on audioRole="music.ambient" — DaVinci can loop it
+    // if needed, but at 30s the bed should cover most short films directly.
+    const ambientClip = ambientBed?.dataUrl ? `
+        <asset-clip name="Ambient bed"
+                    offset="0s"
+                    duration="${totalDur}"
+                    start="0s"
+                    ref="r-ambient"
+                    audioRole="music.ambient"/>` : "";
+    const ambientAsset = ambientBed?.dataUrl ? `
+    <asset id="r-ambient"
+           name="ambient_bed.mp3"
+           src="audio/ambient_bed.mp3"
+           start="0s"
+           duration="${totalDur}"
+           hasAudio="1"
+           format="r-audio"/>` : "";
+
     const scoreClip = score?.dataUrl ? `
         <asset-clip name="${escapeXml(score.filename)}"
-                    offset="${Math.round(timecodeToSeconds(score.enters_at_timecode || "00:54") * fps * 100)}/${100}s"
-                    duration="${Math.round(90 * fps * 100)}/${100}s"
+                    offset="${tStr(timecodeToSeconds(score.enters_at_timecode || "00:54"))}"
+                    duration="${tStr(90)}"
                     start="0s"
                     ref="r-score"
                     audioRole="music"/>` : "";
@@ -23317,7 +23513,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
            name="${escapeXml(score.filename)}"
            src="audio/${escapeXml(score.filename)}"
            start="0s"
-           duration="${Math.round(90 * fps * 100)}/${100}s"
+           duration="${tStr(90)}"
            hasAudio="1"
            format="r-audio"/>` : "";
 
@@ -23325,13 +23521,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
 <!DOCTYPE fcpxml>
 <fcpxml version="1.10">
   <resources>
-    <format id="r1" name="FFVideoFormat1080p${fps}" frameDuration="100/${fps * 100}s" width="1920" height="1080"/>${scoreAsset ? "\n    " + scoreAsset : ""}${assets}
+    <format id="r1" name="FFVideoFormat1080p${fps}" frameDuration="100/${fps * 100}s" width="1920" height="1080"/>${scoreAsset ? "\n    " + scoreAsset : ""}${ambientAsset ? "\n    " + ambientAsset : ""}${assets}${voAssets.join("")}${sfxAssets.join("")}
   </resources>
   <library>
     <event name="${escapeXml(episodeTitle)}">
       <project name="${escapeXml(episodeTitle)} master">
         <sequence format="r1" duration="${totalDur}" tcStart="0s" tcFormat="NDF">
-          <spine>${clips}${scoreClip}
+          <spine>${clips}${voClips.join("")}${sfxClips.join("")}${ambientClip}${scoreClip}
           </spine>
         </sequence>
       </project>
@@ -24199,6 +24395,21 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const watchPointsText = (s.watch_points || [])
       .map(w => `${w.failure || ""}${w.surgical_fix ? " → " + w.surgical_fix : ""}`)
       .filter(Boolean).join("\n");
+    // v4.46 M-AI-5 Part A: serialize sfx_events back to authoring text.
+    // Format: "at: 0.8 — shadow whoosh (1.2s)" per line. The "✓ generated"
+    // suffix lands on events that already have cached audio so the user
+    // sees which ones are committed cost vs. drafts.
+    const sfxEventsText = (s.audio?.sfx_events || [])
+      .map(ev => {
+        const at = (ev.at != null) ? `at: ${Number(ev.at).toFixed(2)}` : "at: 0.0";
+        const text = String(ev.text || "").trim();
+        const dur = (ev.duration != null) ? ` (${Number(ev.duration).toFixed(2)}s)` : "";
+        const generated = ev.audio?.dataUrl ? " · ✓ generated" : "";
+        return `${at} — ${text}${dur}${generated}`;
+      })
+      .filter(line => line.trim().length > 5)
+      .join("\n");
+
     // Serialize cast_in_frame[] dialogue back into "Name: line" format for the existing dialogue textarea
     const dialogueText = (s.cast_in_frame || [])
       .filter(c => c.dialogue?.en || (typeof c.dialogue === "string" && c.dialogue))
@@ -24347,6 +24558,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
       <div style="margin-top:14px; padding-top:14px; border-top:1px solid #2a2a35;">
         ${fieldHtml("Audio ambient", `<input name="audio_ambient" type="text" value="${esc(s.audio?.ambient || "")}" placeholder="Low wind, distant stone creak" style="${FIELD_INPUT_STYLE}">`)}
         ${fieldHtml(
+          "Sound effects (one per line: 'at: <sec> — <text> (<duration>s)')",
+          `<textarea name="sfx_events" rows="3" placeholder="One per line — e.g.\nat: 0.8 — shadow whoosh (1.2s)\nat: 2.5 — boy gasps (0.5s)" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(sfxEventsText)}</textarea>`,
+          `v4.46 — per-event ElevenLabs SFX layered into FCPXML as audioRole="effects". Click "🎚️ Generate SFX audio" on the shot card after saving to fire ElevenLabs calls for any events without "✓ generated".`
+        )}
+        ${fieldHtml(
           "Director note",
           `<textarea name="director_note" rows="2" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(s.director_note || "")}</textarea>`,
           "Goes in [Director Note] block at the prompt's tail (high autoregressive attention)."
@@ -24490,11 +24706,41 @@ JSON object only. No commentary. No fences. No trailing text.`;
           },
           // v4.45 M-AI-3: speed_ramp preset biases the [Action Sequence] block
           speed_ramp: String(fd.get("speed_ramp") || "auto"),
-          audio: {
-            ...(s.audio || {}),
-            ambient: String(fd.get("audio_ambient") || "").trim(),
-            generate_native: true,
-          },
+          audio: (() => {
+            // v4.46 M-AI-5 Part A: parse sfx_events textarea back into the
+            // structured array. Preserves cached audio on existing events
+            // (matched by at + text) so re-saving doesn't blow away the
+            // ElevenLabs cost already paid. New / modified events land
+            // without audio — handleGenerateSfxEvents fires per-event.
+            const sfxRaw = String(fd.get("sfx_events") || "").trim();
+            const existingSfx = Array.isArray(s.audio?.sfx_events) ? s.audio.sfx_events : [];
+            const parsedSfx = [];
+            if (sfxRaw) {
+              for (const line of sfxRaw.split(/\n+/).map(l => l.trim()).filter(Boolean)) {
+                // Match: "at: <num> — <text> [(<num>s)] [· ✓ generated]"
+                const m = line.match(/^at:\s*([0-9.]+)\s*[—\-:]\s*(.+?)(?:\s*\(([0-9.]+)s\))?(?:\s*·\s*✓.*)?$/i);
+                if (!m) continue;
+                const at = Number(m[1]) || 0;
+                const text = m[2].trim();
+                const duration = m[3] ? Number(m[3]) : 1.0;
+                if (!text) continue;
+                // Match by at+text against existing to preserve cached audio
+                const prior = existingSfx.find(p => Math.abs((p.at || 0) - at) < 0.05 && (p.text || "").trim() === text);
+                parsedSfx.push({
+                  at,
+                  text,
+                  duration,
+                  audio: prior?.audio || null,  // preserve cache or null for fresh
+                });
+              }
+            }
+            return {
+              ...(s.audio || {}),
+              ambient: String(fd.get("audio_ambient") || "").trim(),
+              generate_native: true,
+              sfx_events: parsedSfx,
+            };
+          })(),
           location: { location_id: String(fd.get("location_id") || "") || null },
           cast_in_frame: castInFrame,
           cast_lockdown_required: castInFrame.length >= 3,
