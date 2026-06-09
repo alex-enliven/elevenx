@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="40253d1337a7" data-build-time="2026-06-09T18:04:02.162Z">
+<meta name="elevenx-build" content="f0ee7ff5269c" data-build-time="2026-06-09T18:11:23.014Z">
 <script>
 (function(){
-  var info = { hash: "40253d1337a7", time: "2026-06-09T18:04:02.162Z" };
+  var info = { hash: "f0ee7ff5269c", time: "2026-06-09T18:11:23.014Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 40253d1337a7 @ 2026-06-09T18:04:02.162Z -->
+<!-- elevenx-build: f0ee7ff5269c @ 2026-06-09T18:11:23.014Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -7080,6 +7080,13 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
       styleCanonParts.push(`World rules (always obeyed):\n${rules.join("\n")}`);
     }
   }
+  // v4.45 M-AI-3: genre bias appended to canon (Higgsfield-style preset).
+  // "general" returns empty strings — no bias. Other genres add canon +
+  // aesthetic + lighting qualifiers that cascade into the matching blocks.
+  const genreBias = genrePromptBias(project.genre);
+  if (genreBias.canonExtra) {
+    styleCanonParts.push(`Genre (${project.genre}): ${genreBias.canonExtra}`);
+  }
   if (styleCanonParts.length > 0) {
     blocks.push(`[Style Canon] ${styleCanonParts.join("\n\n")}`);
   }
@@ -7125,6 +7132,9 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
       "soft warm skin tones, slight green-cyan lift",
     ];
   }
+  // v4.45 M-AI-3: genre + lighting bias added to [Aesthetic] block
+  if (genreBias.aestheticExtra) aestheticParts.push(genreBias.aestheticExtra);
+  if (genreBias.lightingExtra) aestheticParts.push(`Lighting bias: ${genreBias.lightingExtra}`);
   blocks.push(`[Aesthetic] ${aestheticParts.filter(Boolean).join(". ")}.`);
 
   // ── [Storyline] — narrative context (v3.1: theme + visual rule + audience) ──
@@ -7224,7 +7234,14 @@ function composeSeedance({ shot, cast, environment, project, series, episode, mo
   const camera = shot.camera || {};
   const audio = shot.audio || {};
   const actionBeat = composeActionBeat({ shot, cast, environment, criticalProps, camera, audio, duration: safeDur });
-  blocks.push(`[Action Sequence]\n${actionBeat}`);
+  // v4.45 M-AI-3: speed_ramp preset prepends a motion-grammar qualifier.
+  // "auto" returns empty; presets land 1-2 sentence biases at the top of
+  // the [Action Sequence] block so Seedance sees the timing intent first.
+  const speedRampBias = speedRampPromptBias(shot.speed_ramp);
+  const actionBlockBody = speedRampBias.actionExtra
+    ? `${speedRampBias.actionExtra}\n\n${actionBeat}`
+    : actionBeat;
+  blocks.push(`[Action Sequence]\n${actionBlockBody}`);
 
   // ── Dialogue + Voiceover (v4.16: stripped from prompt body) ──────────
   // Audit (2026-05-16) traced the "videos don't match the reference" /
@@ -8429,6 +8446,91 @@ function composeEnvironmentReferencePrompt(environment, kind = "wide", project) 
 }
 
 
+
+// ─── v4.45 M-AI-3 — Genre + Speed Ramp preset bias ────────────────────
+//
+// One UI choice on the project → cascading prompt biases across every
+// shot's composer output. Mirrors Higgsfield Cinema Studio's 7-genre
+// system + their 8 speed-ramp presets, calibrated for Seedance.
+//
+// genrePromptBias(genre) returns { canonExtra, aestheticExtra, lightingExtra }
+// strings that get appended to the matching composer blocks. "general"
+// returns empty strings — no bias, lets style_canon do the work.
+//
+// speedRampPromptBias(speedRamp) returns { actionExtra } — a 1-2 sentence
+// motion-grammar qualifier prepended to the [Action Sequence] block.
+// "auto" returns empty — Seedance picks based on focal_point verbs.
+
+const GENRE_PRESETS = ["general", "action", "horror", "comedy", "noir", "drama", "epic"];
+const SPEED_RAMP_PRESETS = ["auto", "linear", "flash_in", "flash_out", "slow_mo", "bullet_time", "impact", "ramp_up"];
+
+function genrePromptBias(genre) {
+  switch (String(genre || "general").toLowerCase()) {
+    case "action":
+      return {
+        canonExtra: "Kinetic energy, urgent pacing, dynamic camera angles. Action beats land hard with visible impact.",
+        aestheticExtra: "high-contrast lighting, saturated highlights, motion-emphasis composition",
+        lightingExtra: "raking side-light for shape definition, harsh shadows during impacts",
+      };
+    case "horror":
+      return {
+        canonExtra: "Tension-first staging. Dread builds through what's withheld. Sound + shadow do more work than what's on screen.",
+        aestheticExtra: "low-key lighting, deep blacks, desaturated palette with selective color, negative space dominates",
+        lightingExtra: "single-source motivated light, faces partially obscured, rim lighting from below when dread peaks",
+      };
+    case "comedy":
+      return {
+        canonExtra: "Bright, legible staging. Performances are the focus — let faces read clearly. Timing favors held beats over fast cuts.",
+        aestheticExtra: "high-key lighting, soft contrast, saturated but cheerful palette, wide framings that show full body language",
+        lightingExtra: "soft fill, no deep shadows, even key on faces",
+      };
+    case "noir":
+      return {
+        canonExtra: "High-contrast monochrome cinematography. Deep shadows, rim-lit faces, slatted light through blinds. 1940s framing instincts.",
+        aestheticExtra: "monochrome or near-monochrome palette, hard top-light, fedora-era composition",
+        lightingExtra: "single hard key from high angle, deep black shadows, venetian-blind shadows across faces",
+      };
+    case "drama":
+      return {
+        canonExtra: "Performance-led. Camera holds on faces. Time stretches around emotional beats.",
+        aestheticExtra: "naturalistic lighting, restrained palette, medium close-ups dominate, depth-of-field isolates the subject",
+        lightingExtra: "soft motivated light, gentle key-to-fill ratio, eye light always present",
+      };
+    case "epic":
+      return {
+        canonExtra: "Operatic scale. Wide compositions establish the world before resolving on character. Music does heavy lifting.",
+        aestheticExtra: "wide vistas, scale-emphasizing composition, rich color grading, depth-rich layered staging",
+        lightingExtra: "naturalistic but elevated — golden-hour bias, atmospheric haze, god-rays where motivated",
+      };
+    case "general":
+    default:
+      return { canonExtra: "", aestheticExtra: "", lightingExtra: "" };
+  }
+}
+
+function speedRampPromptBias(speedRamp) {
+  switch (String(speedRamp || "auto").toLowerCase()) {
+    case "flash_in":
+      return { actionExtra: "Speed ramp: begins SLOW for the first half, then accelerates rapidly to climax. Motion blur on the speed-up." };
+    case "flash_out":
+      return { actionExtra: "Speed ramp: begins FAST at the action peak, then decelerates into stillness. Holds on the final pose." };
+    case "slow_mo":
+      return { actionExtra: "Speed ramp: ENTIRE shot is slow motion (40-60% speed). Motion is fluid, dramatic. Sound design carries weight." };
+    case "bullet_time":
+      return { actionExtra: "Speed ramp: BULLET TIME at the critical beat — time slows to ~10% while the camera continues moving at natural speed. Effect peaks for ~0.5 seconds." };
+    case "impact":
+      return { actionExtra: "Speed ramp: NATURAL speed through the lead-up, then SUDDEN SLOW on the impact frame, then snap back to natural. Marks the critical hit." };
+    case "ramp_up":
+      return { actionExtra: "Speed ramp: starts at NORMAL speed and accelerates throughout the shot. Tension builds via acceleration." };
+    case "linear":
+      return { actionExtra: "Speed ramp: linear — no acceleration or deceleration. Constant 100% speed throughout." };
+    case "auto":
+    default:
+      return { actionExtra: "" };
+  }
+}
+
+
 /* === auto-exposed to ElevenX namespace === */
 window.ElevenX.composeSeedance = composeSeedance;
 window.ElevenX.composeVoiceover = composeVoiceover;
@@ -8444,6 +8546,10 @@ window.ElevenX.composeCastReferencePrompt = composeCastReferencePrompt;
 window.ElevenX.composeCastReferenceEditPrompt = composeCastReferenceEditPrompt;
 window.ElevenX.composeEnvironmentReferenceEditPrompt = composeEnvironmentReferenceEditPrompt;
 window.ElevenX.composeEnvironmentReferencePrompt = composeEnvironmentReferencePrompt;
+window.ElevenX.GENRE_PRESETS = GENRE_PRESETS;
+window.ElevenX.SPEED_RAMP_PRESETS = SPEED_RAMP_PRESETS;
+window.ElevenX.genrePromptBias = genrePromptBias;
+window.ElevenX.speedRampPromptBias = speedRampPromptBias;
 
 })();
 </script>
@@ -9564,6 +9670,11 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
     mediumPromptSpecForKeyframe:           NS.mediumPromptSpecForKeyframe,
     // v4.16: composeVoiceover for the per-shot ElevenLabs plan
     composeVoiceover:                      NS.composeVoiceover,
+    // v4.45 M-AI-3: Genre + Speed Ramp preset biases
+    genrePromptBias:                       NS.genrePromptBias,
+    speedRampPromptBias:                   NS.speedRampPromptBias,
+    GENRE_PRESETS:                         NS.GENRE_PRESETS,
+    SPEED_RAMP_PRESETS:                    NS.SPEED_RAMP_PRESETS,
   };
   NS.modeResolver = {
     resolveMode:    NS.resolveMode,
@@ -9662,7 +9773,13 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // location.location_id from these annotations so the typeahead replaces
   // the checkbox-grid + dropdown workflow without changing the underlying
   // schema for those fields.
-  const DB_VER  = 8;
+  //
+  // v9: Genre + Speed Ramp presets (v4.45 M-AI-3, Higgsfield-style cinematic
+  // primitives). project.genre default "general" cascades into composer
+  // [Style Canon] + [Aesthetic] + [Camera] bias. shot.speed_ramp default
+  // "auto" adds 1-2 qualifier sentences to the [Action Sequence] block per
+  // preset. One UI choice → many composer-prompt decisions.
+  const DB_VER  = 9;
 
   // The stores that get the project_id filter treatment.
   const PROJECT_SCOPED = ["characters", "environments", "assets", "shots", "takes", "conversations"];
@@ -9845,8 +9962,9 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         // (caught 2026-05-20: v6's project cursor was being clobbered by
         // v7's project cursor when a fresh IDB ran all migrations at once).
         // Idempotent — every assignment guards on `=== undefined`.
-        if (oldVersion < 8) {
-          // Projects: v6 added `aspect`, v7 added `ai_author_model`.
+        if (oldVersion < 9) {
+          // Projects: v6 added `aspect`, v7 added `ai_author_model`,
+          // v9 added `genre`. Single cursor walk over projects.
           const projOs = txn.objectStore("projects");
           const pcur = projOs.openCursor();
           pcur.onsuccess = (ev) => {
@@ -9864,11 +9982,17 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
               row.ai_author_model = "gpt-5.5";
               dirty = true;
             }
+            // v9: genre defaults to "general" so existing projects don't
+            // get sudden bias when v4.45 ships. User flips it explicitly.
+            if (row.genre === undefined) {
+              row.genre = "general";
+              dirty = true;
+            }
             if (dirty) c.update(row);
             c.continue();
           };
-          // Shots: v6 added shot_summary + shot_summary_source. v8 added
-          // _mentions[] for the @-mention typeahead. Single cursor walk.
+          // Shots: v6 added shot_summary + shot_summary_source, v8 added
+          // _mentions[], v9 added speed_ramp. Single cursor walk.
           if (db.objectStoreNames.contains("shots")) {
             const shOs = txn.objectStore("shots");
             const scur = shOs.openCursor();
@@ -9885,6 +10009,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
               }
               if (!Array.isArray(row._mentions)) {
                 row._mentions = []; dirty = true;
+              }
+              // v9: speed_ramp defaults to "auto" — model picks based on
+              // focal_point verbs. Explicit values bias [Action Sequence].
+              if (row.speed_ramp === undefined) {
+                row.speed_ramp = "auto"; dirty = true;
               }
               if (dirty) c.update(row);
               c.continue();
@@ -10043,7 +10172,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
        *   - medium: "live_action" (most users start here; switch to animated_3d for Lionn)
        *   - default_shot_duration_seconds: 8 (a teaser-friendly mid-range)
        */
-      async create({ id, display_name, description, medium, logline, style_canon, default_shot_duration_seconds, aspect, ai_author_model }) {
+      async create({ id, display_name, description, medium, logline, style_canon, default_shot_duration_seconds, aspect, ai_author_model, genre }) {
         const slug = id || display_name
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, "_")
@@ -10066,6 +10195,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           // v4.42.2: AI Director model. gpt-5.5 default (faster, cheaper);
           // user flips to claude-opus-4-7 for tougher multi-character work.
           ai_author_model: ai_author_model || "gpt-5.5",
+          // v4.45: Genre preset. "general" default applies no extra bias;
+          // user picks action/horror/noir/drama/epic/comedy for cascading
+          // composer prompt biases.
+          genre: genre || "general",
           is_seeded: false,
           created_at: new Date().toISOString().slice(0, 10),
         };
@@ -10110,6 +10243,10 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           // back to gpt-5.5? Default true (no-surprise UX). Flip to false
           // to surface the actionable error instead.
           "ai_author_fallback_on_404",
+          // v4.45: Genre preset. 7 values cascade into composer prompt
+          // biases (Style Canon + Aesthetic + Camera + Lighting).
+          // general | action | horror | comedy | noir | drama | epic
+          "genre",
         ];
         const merged = { ...existing };
         for (const k of ALLOWED) {
@@ -24124,20 +24261,24 @@ JSON object only. No commentary. No fences. No trailing text.`;
         ${fieldHtml("Display name", `<input name="display_name" type="text" required value="${esc(s.display_name || "")}" style="${FIELD_INPUT_STYLE}">`)}
       </div>
       ${fieldHtml(
-        "The moment — verb",
-        `<input name="verb" type="text" value="${esc(m.verb || "")}" placeholder="approaches / cuts off / pauses" style="${FIELD_INPUT_STYLE}">`
+        "Main action",
+        `<input name="verb" type="text" value="${esc(m.verb || "")}" placeholder="approaches / cuts off / pauses" style="${FIELD_INPUT_STYLE}">`,
+        "The verb that drives the shot."
       )}
       ${fieldHtml(
-        "The moment — focal point",
-        `<input name="focal_point" type="text" value="${esc(m.focal_point || "")}" placeholder="Moonlit ruins of the Lion Courtyard" style="${FIELD_INPUT_STYLE}">`
+        "What we see",
+        `<input name="focal_point" type="text" value="${esc(m.focal_point || "")}" placeholder="Moonlit ruins of the Lion Courtyard" style="${FIELD_INPUT_STYLE}">`,
+        "A single sentence describing what's literally in the frame."
       )}
       ${fieldHtml(
-        "The moment — description",
-        `<textarea name="moment_description" rows="2" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(m.description || "")}</textarea>`
+        "What happens (detail)",
+        `<textarea name="moment_description" rows="2" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(m.description || "")}</textarea>`,
+        "Optional — a paragraph if the focal sentence isn't enough. Use @ to mention cast / locations."
       )}
       ${fieldHtml(
-        "Emotional beat",
-        `<input name="emotional_beat" type="text" value="${esc(m.emotional_beat || "")}" placeholder="thesis shot / fear lands / etc." style="${FIELD_INPUT_STYLE}">`
+        "How it feels",
+        `<input name="emotional_beat" type="text" value="${esc(m.emotional_beat || "")}" placeholder="thesis shot / fear lands / etc." style="${FIELD_INPUT_STYLE}">`,
+        "The emotional intent the scene should land."
       )}
       <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
         ${fieldHtml(
@@ -24157,6 +24298,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
         ${fieldHtml("Lens (mm)", `<input name="lens" type="text" value="${esc(cam.lens || "")}" placeholder="35mm / 24mm / 50mm" style="${FIELD_INPUT_STYLE}">`)}
         ${fieldHtml("Depth of field", `<input name="depth" type="text" value="${esc(cam.depth || "")}" placeholder="shallow / deep" style="${FIELD_INPUT_STYLE}">`)}
       </div>
+      ${fieldHtml(
+        "Speed ramp",
+        `<select name="speed_ramp" style="${FIELD_INPUT_STYLE}">
+          <option value="auto" ${(s.speed_ramp || "auto") === "auto" ? "selected" : ""}>Auto — Seedance picks based on the action</option>
+          <option value="linear" ${s.speed_ramp === "linear" ? "selected" : ""}>Linear — constant 100% speed throughout</option>
+          <option value="flash_in" ${s.speed_ramp === "flash_in" ? "selected" : ""}>Flash In — slow → fast climax with motion blur</option>
+          <option value="flash_out" ${s.speed_ramp === "flash_out" ? "selected" : ""}>Flash Out — fast peak → decelerate into stillness</option>
+          <option value="slow_mo" ${s.speed_ramp === "slow_mo" ? "selected" : ""}>Slow Motion — entire shot at 40-60% speed</option>
+          <option value="bullet_time" ${s.speed_ramp === "bullet_time" ? "selected" : ""}>Bullet Time — ~10% speed at critical beat, camera continues</option>
+          <option value="impact" ${s.speed_ramp === "impact" ? "selected" : ""}>Impact — natural → sudden slow on hit → snap back</option>
+          <option value="ramp_up" ${s.speed_ramp === "ramp_up" ? "selected" : ""}>Ramp Up — accelerates throughout, tension builds</option>
+        </select>`,
+        "Higgsfield-style motion grammar preset. Prepends a 1-2 sentence timing qualifier to the [Action Sequence] block."
+      )}
       ${fieldHtml(
         "Location",
         `<select name="location_id" style="${FIELD_INPUT_STYLE}">${envOptions}</select>`,
@@ -24333,6 +24488,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
             lens: String(fd.get("lens") || "").trim(),
             depth: String(fd.get("depth") || "").trim() || "shallow",
           },
+          // v4.45 M-AI-3: speed_ramp preset biases the [Action Sequence] block
+          speed_ramp: String(fd.get("speed_ramp") || "auto"),
           audio: {
             ...(s.audio || {}),
             ambient: String(fd.get("audio_ambient") || "").trim(),
@@ -24531,6 +24688,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
               Medium drives composer language. Duration is the per-shot Seedance length (4–15s, shot-overridable). Aspect forces Seedream keyframes to match the Seedance/Kling video output (v4.40 — square keyframes were the structural root of mid-clip style mismatch).
             </div>
 
+            <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Genre</label>
+            <select id="elx-proj-genre" style="${FIELD_INPUT_STYLE} margin-bottom:6px;">
+              <option value="general">General — no extra bias (default)</option>
+              <option value="action">Action — kinetic energy, urgent pacing, impact frames</option>
+              <option value="horror">Horror — low-key lighting, dread, what's withheld</option>
+              <option value="comedy">Comedy — bright high-key, soft contrast, full body language</option>
+              <option value="noir">Noir — high-contrast monochrome, hard top-light, slatted shadows</option>
+              <option value="drama">Drama — performance-led, naturalistic light, held beats</option>
+              <option value="epic">Epic — operatic scale, wide vistas, golden-hour bias</option>
+            </select>
+            <div style="font-size:10.5px; color:#6a6a78; margin-top:-2px; margin-bottom:14px; line-height:1.4;">
+              One choice biases the composer's [Style Canon] + [Aesthetic] blocks across every shot. Higgsfield-style cinematic primitive.
+            </div>
+
             <label style="display:block; font-size:11px; color:#9a9aab; margin-bottom:5px; letter-spacing:0.04em; text-transform:uppercase;">Style canon (prepended to every shot prompt)</label>
             <textarea id="elx-proj-style-canon" rows="5" placeholder="${esc(STYLE_CANON_PLACEHOLDER)}"
                    style="${FIELD_INPUT_STYLE} resize:vertical; margin-bottom:12px;"></textarea>
@@ -24678,6 +24849,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       $("#elx-proj-default-duration", panel).value = editRow?.default_shot_duration_seconds ?? 8;
       $("#elx-proj-aspect", panel).value           = resolveProjectAspect(editRow);
       $("#elx-proj-ai-model", panel).value         = editRow?.ai_author_model || "gpt-5.5";
+      $("#elx-proj-genre", panel).value            = editRow?.genre || "general";
       $("#elx-proj-style-canon", panel).value      = editRow?.style_canon || "";
       $("#elx-proj-desc", panel).value             = editRow?.description || "";
       editIdInput.value = editRow?.id || "";
@@ -24723,6 +24895,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const defaultDur     = Number($("#elx-proj-default-duration", panel).value) || 8;
       const aspect         = $("#elx-proj-aspect", panel).value || "16:9";
       const aiAuthorModel  = $("#elx-proj-ai-model", panel).value || "gpt-5.5";
+      const genre          = $("#elx-proj-genre", panel).value || "general";
       const styleCanon     = $("#elx-proj-style-canon", panel).value.trim();
       const desc           = $("#elx-proj-desc", panel).value.trim();
       if (!editingId && !name) {
@@ -24737,6 +24910,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             default_shot_duration_seconds: defaultDur,
             aspect,
             ai_author_model: aiAuthorModel,
+            genre,
             style_canon: styleCanon,
             description: desc,
           });
@@ -24751,6 +24925,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             default_shot_duration_seconds: defaultDur,
             aspect,
             ai_author_model: aiAuthorModel,
+            genre,
           });
           await Storage.Projects.setActive(row.id);
           toast(`Created "${row.display_name}" — reloading…`, { tone: "ok" });
