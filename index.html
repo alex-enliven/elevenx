@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="f1bb34375d80" data-build-time="2026-06-09T17:45:22.729Z">
+<meta name="elevenx-build" content="78db102d0a2d" data-build-time="2026-06-09T17:51:50.197Z">
 <script>
 (function(){
-  var info = { hash: "f1bb34375d80", time: "2026-06-09T17:45:22.729Z" };
+  var info = { hash: "78db102d0a2d", time: "2026-06-09T17:51:50.197Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: f1bb34375d80 @ 2026-06-09T17:45:22.729Z -->
+<!-- elevenx-build: 78db102d0a2d @ 2026-06-09T17:51:50.197Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -10089,6 +10089,11 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
           //   gpt-5.5 (default) | gpt-4o | claude-opus-4-7 | claude-sonnet-4-5
           // aiAuthorProject routes to OpenAI vs Anthropic based on prefix.
           "ai_author_model",
+          // v4.43.1: when Anthropic worker route 404s (proxy.worker.js
+          // not redeployed with v4.42.2), should aiAuthorProject auto-fall
+          // back to gpt-5.5? Default true (no-surprise UX). Flip to false
+          // to surface the actionable error instead.
+          "ai_author_fallback_on_404",
         ];
         const merged = { ...existing };
         for (const k of ALLOWED) {
@@ -13074,14 +13079,62 @@ JSON object only. No commentary. No fences. No trailing text.`;
       throw new Error(`aiAuthorProject: estimated cost $${estimatedCostUsd.toFixed(2)} exceeds ceiling $${AI_AUTHOR_PROJECT_COST_CEILING.toFixed(2)} — reduce shot_count_target or shorten logline`);
     }
 
-    const result = await llmClient.chatCompletion({
-      system,
-      user,
-      model: aiAuthorModel,
-      response_format: { type: "json_object" },
-      temperature: 0.7,  // higher than aiAuthorShot's 0.4 — bootstrap needs more creative variation
-      max_tokens: 4000,
-    });
+    // v4.43.1: Claude routes through /anthropic/* on the Cloudflare Worker.
+    // If the worker hasn't been redeployed with the v4.42.2 update, the
+    // call 404s with a confusing "anthropic messages 404" error. Catch
+    // 404 specifically when routing to claude-* and either auto-fallback
+    // to gpt-5.5 (default) or surface a clear actionable error.
+    let result;
+    try {
+      result = await llmClient.chatCompletion({
+        system,
+        user,
+        model: aiAuthorModel,
+        response_format: { type: "json_object" },
+        temperature: 0.7,  // higher than aiAuthorShot's 0.4 — bootstrap needs more creative variation
+        max_tokens: 4000,
+      });
+    } catch (err) {
+      const is404 = isClaude && /\b404\b/.test(err?.message || "");
+      if (!is404) throw err;  // not the worker-not-redeployed case — rethrow
+
+      const fallbackEnabled = ctx?.project?.ai_author_fallback_on_404 !== false;  // default true
+      if (fallbackEnabled && State.openai) {
+        // Auto-fallback to gpt-5.5 — observable via toast + ring buffer
+        toast(
+          `⚠ Claude unavailable (worker not redeployed) — used gpt-5.5 instead. Update proxy.worker.js + ANTHROPIC_API_KEY to enable Claude.`,
+          { tone: "warn", duration: 8000 }
+        );
+        await reportError(err, {
+          tag: "anthropic-404-fallback",
+          userFacing: false,
+          attempted_model: aiAuthorModel,
+          fallback_model: "gpt-5.5",
+          worker_redeploy_required: true,
+        });
+        result = await State.openai.chatCompletion({
+          system,
+          user,
+          model: "gpt-5.5",
+          response_format: { type: "json_object" },
+          temperature: 0.7,
+          max_tokens: 4000,
+        });
+        // Stamp the model + fallback flag so caller can surface what actually ran
+        result._aiAuthorProject_fallback = {
+          from: aiAuthorModel,
+          to: "gpt-5.5",
+          reason: "anthropic-404",
+        };
+      } else {
+        // Fallback disabled OR no OpenAI client — surface a clear actionable error
+        throw new Error(
+          `aiAuthorProject: Anthropic /v1/messages returned 404. ` +
+          `Either (a) redeploy proxy.worker.js with the v4.42.2 /anthropic/* route + set the ANTHROPIC_API_KEY secret in the Cloudflare Worker dashboard, ` +
+          `OR (b) switch this project's AI Director model back to gpt-5.5 in project settings → AI Director model.`
+        );
+      }
+    }
     const proposals = Array.isArray(result.parsed?.proposals) ? result.parsed.proposals : [];
     // Guard: drop proposals that don't have both a field and a proposed body.
     const filtered = proposals.filter(p => p && p.field && p.proposed);
@@ -13110,6 +13163,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
       cost_usd: result.cost_usd_estimated || 0,
       model: result.model,
       shot_count_warning,
+      // v4.43.1: present when the call fell back from claude-* → gpt-5.5
+      // due to a 404 (worker not redeployed). Chat panel can render this
+      // as a soft warning above the proposals so the user knows the
+      // run wasn't the model they picked.
+      fallback_info: result._aiAuthorProject_fallback || null,
     };
   }
   NS.aiAuthorProject = aiAuthorProject;
@@ -20810,7 +20868,14 @@ JSON object only. No commentary. No fences. No trailing text.`;
         if (fixCount) parts.push(`${fixCount} cast-coverage fix${fixCount === 1 ? "" : "es"}`);
         const warn = result.shot_count_warning ? `<br>⚠ ${esc(result.shot_count_warning.message)}` : "";
         const fixHint = fixCount > 0 ? `<br>⚠ AI may have dropped characters from some shots — accept the cast-coverage fixes to restore them.` : "";
-        return `GPT proposed ${parts.join(" + ")}. Accept the ones you want; reject the rest.${warn}${fixHint}`;
+        // v4.43.1: when Claude 404'd and we fell back to gpt-5.5, the
+        // subtitle says so explicitly. Users picking claude-opus-4-7 deserve
+        // to know their run actually ran on gpt-5.5 because the worker
+        // wasn't redeployed.
+        const fallbackBanner = result.fallback_info
+          ? `<br>⚠ Wanted <strong>${esc(result.fallback_info.from)}</strong> but the worker doesn't have the /anthropic route yet — used <strong>${esc(result.fallback_info.to)}</strong> instead. Redeploy proxy.worker.js to enable Claude.`
+          : "";
+        return `GPT proposed ${parts.join(" + ")}. Accept the ones you want; reject the rest.${warn}${fixHint}${fallbackBanner}`;
       })();
 
       const accepted = await openFixPreviewModal({
