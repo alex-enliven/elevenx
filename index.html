@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="c9a0ae1b0254" data-build-time="2026-06-10T12:09:18.064Z">
+<meta name="elevenx-build" content="5f7474d2a470" data-build-time="2026-06-10T12:21:40.027Z">
 <script>
 (function(){
-  var info = { hash: "c9a0ae1b0254", time: "2026-06-10T12:09:18.064Z" };
+  var info = { hash: "5f7474d2a470", time: "2026-06-10T12:21:40.027Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: c9a0ae1b0254 @ 2026-06-10T12:09:18.064Z -->
+<!-- elevenx-build: 5f7474d2a470 @ 2026-06-10T12:21:40.027Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -8679,6 +8679,43 @@ function blockingMovementLine(shot, environment) {
   ].join("").replace(/\.\.$/, ".");
 }
 
+// Cross-shot continuity: when shot N's end zone is (or connects to) shot
+// N+1's start zone, N+1's START keyframe prompt carries arrival context —
+// direction preservation, lighting carry-over, and the place just left.
+// Returns null when the shots aren't spatially linked (no behavior change).
+function buildShotContinuityBlock(prevShot, shot, prevEnvironment, environment) {
+  const pb = prevShot?.blocking;
+  const cb = shot?.blocking;
+  if (!pb?.end?.zone || !cb?.start?.zone) return null;
+  const prevEnvId = prevShot?.location?.location_id;
+  const currEnvId = shot?.location?.location_id;
+  if (!prevEnvId || !currEnvId) return null;
+  const sameSpot = prevEnvId === currEnvId && pb.end.zone === cb.start.zone;
+  const prevZone = zoneById(prevEnvironment, pb.end.zone);
+  const currZone = zoneById(environment, cb.start.zone);
+  const fwdTarget = prevEnvId === currEnvId ? cb.start.zone : `${currEnvId}:${cb.start.zone}`;
+  const revTarget = prevEnvId === currEnvId ? pb.end.zone : `${prevEnvId}:${pb.end.zone}`;
+  const connected = sameSpot
+    || (prevZone?.connects_to || []).includes(fwdTarget)
+    || (currZone?.connects_to || []).includes(revTarget);
+  if (!connected) return null;
+  const lines = [
+    `[Continuity from previous shot] This shot continues directly from the previous one.`,
+  ];
+  if (sameSpot) {
+    lines.push(`Same place as the previous shot's final frame (${currZone?.name || cb.start.zone}) — a new camera angle on the SAME location, not a new location.`);
+  } else {
+    lines.push(`The character arrives from ${prevZone?.name || pb.end.zone}${prevEnvId !== currEnvId ? " (the connected space they just left — it may read in the background)" : ""}.`);
+  }
+  const pf = pb.end?.facing || pb.start?.facing;
+  if (pf === "frame_left" || pf === "frame_right") {
+    const travel = pf === "frame_left" ? "right-to-left" : "left-to-right";
+    lines.push(`They were traveling ${travel} across the frame — preserve that screen direction (the 180° rule).`);
+  }
+  lines.push(`Lighting and time of day are unchanged from the previous shot.`);
+  return lines.join(" ");
+}
+
 
 /* === auto-exposed to ElevenX namespace === */
 window.ElevenX.composeSeedance = composeSeedance;
@@ -8703,6 +8740,7 @@ window.ElevenX.shotIsCrossZone = shotIsCrossZone;
 window.ElevenX.buildSpatialKeyframeBlock = buildSpatialKeyframeBlock;
 window.ElevenX.buildTrackingLockText = buildTrackingLockText;
 window.ElevenX.blockingMovementLine = blockingMovementLine;
+window.ElevenX.buildShotContinuityBlock = buildShotContinuityBlock;
 
 })();
 </script>
@@ -9900,6 +9938,8 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
     buildSpatialKeyframeBlock:             NS.buildSpatialKeyframeBlock,
     buildTrackingLockText:                 NS.buildTrackingLockText,
     blockingMovementLine:                  NS.blockingMovementLine,
+    // v4.47.7: cross-shot arrival context for connected zones
+    buildShotContinuityBlock:              NS.buildShotContinuityBlock,
   };
   NS.modeResolver = {
     resolveMode:    NS.resolveMode,
@@ -13489,8 +13529,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
     }
     if (mode !== "bootstrap_bible" && mode !== "generate_storyboard"
         && mode !== "fix_cast_coverage" && mode !== "fill_shot_summaries"
-        && mode !== "fill_entity") {
-      throw new Error(`aiAuthorProject: unknown mode "${mode}" (expected "bootstrap_bible" | "generate_storyboard" | "fix_cast_coverage" | "fill_shot_summaries" | "fill_entity")`);
+        && mode !== "fill_entity" && mode !== "propose_blocking") {
+      throw new Error(`aiAuthorProject: unknown mode "${mode}" (expected "bootstrap_bible" | "generate_storyboard" | "fix_cast_coverage" | "fill_shot_summaries" | "fill_entity" | "propose_blocking")`);
     }
     // v4.47.2: fill_entity validates entity_type early — same cheap-guard-
     // first ordering as the logline check above.
@@ -13597,7 +13637,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         "stability_note (1 sentence visual identity lock), high_risk (boolean — true for protagonist + on-screen named cast).",
         "",
         "ENVIRONMENT body MUST include: id (snake_case slug), display_name, description,",
-        "architecture {type}, lighting {primary_source, quality, time_of_day}, palette [3-5 colors], props [3-5 items].",
+        "architecture {type}, lighting {primary_source, quality, time_of_day}, palette [3-5 colors], props [3-5 items],",
+        "zones [2-4 named places: {id (snake_case), name, description, connects_to: [zone ids; cross-environment link as '<env_id>:<zone_id>']}],",
+        "landmarks [1-3 fixed features: {id, name, fixed_position (e.g. 'WEST side of the courtyard')}] — the world map shots move through.",
         "",
         "SHOT body MUST include: id (snake_case slug like s01_cold_open), shot_number (1..N),",
         "display_name, timecode {duration_seconds: " + perShotDuration + "},",
@@ -13606,6 +13648,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
         "cast_in_frame [{character_id, role_in_shot, action}] — apply RULES A/B/C above,",
         "cast_off_frame [{character_id}] (optional — for narration-only references),",
         "location {location_id: '<matches an environment.id from this same proposal>'},",
+        "blocking {start: {zone: '<zone id from the shot's environment>', position_note, facing (frame_left|frame_right|toward_camera|away_from_camera)},",
+        "          end: {zone, position_note, facing}, path_note} — null for empty establishing shots.",
+        "When a character MOVES in the shot, start.zone and end.zone MUST differ. Keep screen direction consistent",
+        "across consecutive shots (exits frame-left → next shot enters frame-left travel) — the 180° rule.",
         "audio {ambient (1-sentence description), generate_native: true},",
         "generation {mode: 'image_to_video'}.",
         "",
@@ -13689,6 +13735,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
             "lighting {primary_source, quality, time_of_day},",
             "palette: [3-5 colors], props: [3-5 items],",
             "continuity_locks: [2-3 invariants the model must preserve across every shot here],",
+            "zones: [2-4 named places: {id (snake_case), name, description, connects_to: [zone ids]}] — the world map",
+            "shots move through; include an entry/exit zone if characters arrive or leave,",
+            "landmarks: [1-3 fixed features: {id, name, fixed_position (e.g. 'WEST side')}] — geography that never moves between frames,",
             "ambient_sound (1 sentence).",
           ].join("\n")
         : [
@@ -13757,6 +13806,50 @@ JSON object only. No commentary. No fences. No trailing text.`;
           cast_in_frame: (s.cast_in_frame || []).map(c => c.character_id),
         })),
         instruction: "Return one summary per shot. Return JSON only.",
+      });
+    } else if (mode === "propose_blocking") {
+      // v4.47.7: batched spatial blocking — fill_shot_summaries pattern.
+      // ONE call maps movement for every shot against the env world maps,
+      // so an already-imported project (Lionn) gets blocking without
+      // re-import. Surfaced as "🗺 Map the movement" on the Storyboard.
+      const shots = Array.isArray(input.shots) ? input.shots : [];
+      const envMaps = Array.isArray(input.env_maps) ? input.env_maps : [];
+      system = [
+        "You are a film director's blocking assistant. For EACH shot below,",
+        "decide WHERE the focal character starts and ends inside the shot's",
+        "environment, using ONLY zone ids from that environment's map.",
+        "",
+        "Output ONLY: " +
+        '{"proposals":[{"field":"shot.<id>.blocking","current":"","proposed":"<JSON string of blocking object>","rationale":"<1 sentence>"}]}',
+        "",
+        "blocking object shape: {start: {zone, position_note, facing}, end: {zone, position_note, facing}, path_note}",
+        "facing enum: frame_left | frame_right | toward_camera | away_from_camera.",
+        "",
+        "RULES:",
+        "• zone values MUST be zone ids from the shot's environment map. Never invent zones.",
+        "• Movement in the prose (sprint, walk, cross, exit, enter) → start.zone and end.zone MUST differ; write a path_note.",
+        "• Static shots (standing, speaking, reacting) → same zone start and end, no path_note.",
+        "• 180° RULE: keep screen direction consistent across consecutive shots — a character exiting frame-left",
+        "  travel must continue frame-left travel when they reappear, unless the story shows them turning.",
+        "• Continuity: when consecutive shots share an environment, shot N+1's start.zone should be reachable",
+        "  from shot N's end.zone (same zone or a connected one).",
+        "• Empty establishing shots with no character → proposed = \"null\".",
+        "",
+        "Return EXACTLY " + shots.length + " proposals — one per shot, same order.",
+      ].join("\n");
+      user = JSON.stringify({
+        project_display_name: project?.display_name,
+        env_maps: envMaps,
+        shots: shots.map(s => ({
+          id: s.id,
+          shot_number: s.shot_number,
+          location_id: s.location?.location_id,
+          focal_point: s.the_moment?.focal_point,
+          description: s.the_moment?.description,
+          cast_in_frame: (s.cast_in_frame || []).map(c => c.character_id),
+          current_blocking: s.blocking || null,
+        })),
+        instruction: "Propose blocking for every shot. Return JSON only.",
       });
     } else {
       // generate_storyboard — uses existing cast/env, proposes only shots.
@@ -14117,6 +14210,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
         id: e.id,
         display_name: e.display_name,
         architecture_type: e.architecture?.type,
+        // v4.47.7: the world map — Ask the Producer can reason about
+        // where characters are and how spaces connect.
+        zones: (e.zones || []).map(z => ({ id: z.id, name: z.name, connects_to: z.connects_to || [] })),
+        landmarks: (e.landmarks || []).map(l => `${l.name} — ${l.fixed_position}`),
       })),
       assets: assets.map(a => ({ id: a.id, display_name: a.display_name, kind: a.kind })),
       shots: shots.map(s => ({
@@ -14129,6 +14226,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
         cast_in_frame: (s.cast_in_frame || []).map(c => typeof c === "string" ? c : c?.character_id).filter(Boolean),
         cast_off_frame: (s.cast_off_frame || []).map(c => typeof c === "string" ? c : c?.character_id).filter(Boolean),
         location_id: s.location?.location_id || null,
+        // v4.47.7: compact blocking summary ("zone → zone (facing)")
+        blocking: s.blocking
+          ? `${s.blocking.start?.zone || "?"} → ${s.blocking.end?.zone || "?"}${s.blocking.start?.facing ? ` (${s.blocking.start.facing})` : ""}`
+          : null,
         has_approved_take: (s.takes || []).some(t => t.status === "approved"),
         validation_issues: (s._validation?.issues || []).map(i => i.kind),
       })),
@@ -14403,6 +14504,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         body.audio = body.audio || {};
         if (!Array.isArray(body.audio.sfx_events)) body.audio.sfx_events = [];
         body.keyframes = body.keyframes || {};
+        // v4.47.7: blocking flows through from the bootstrap prompt's shot
+        // spec; explicit null when the model omitted it (static shots).
+        body.blocking = body.blocking || null;
         body._validation = body._validation || { issues: [], schema_version: "v4.41" };
         body.shot_summary = body.shot_summary || "";
         body.shot_summary_source = "auto";
@@ -19629,9 +19733,29 @@ JSON object only. No commentary. No fences. No trailing text.`;
     // (zone + position + facing + the env's fixed landmark geography).
     // Null when shot.blocking is null (legacy/static) → prompt unchanged.
     const spatialBlock = composer.buildSpatialKeyframeBlock?.(shot, slot, environment) || null;
-    const spatialPromptText = spatialBlock
-      ? `${promptText}\n\n${spatialBlock}`
-      : promptText;
+
+    // v4.47.7: cross-shot continuity. START-frame gen of a shot whose
+    // start zone is (or connects to) the previous shot's end zone gets
+    // arrival context — same-place-new-angle vs arrives-from, screen-
+    // direction preservation, lighting carry-over. The cave-walk-out
+    // case: the gate passage exited in S(N) reads in S(N+1)'s background.
+    let continuityBlock = null;
+    if (slot === "start" && shot.blocking?.start?.zone) {
+      try {
+        const allForContinuity = await Storage.getAll("shots");
+        const prevShot = allForContinuity
+          .filter(x => x.id !== shot.id && (x.shot_number || 0) < (shot.shot_number || 0))
+          .sort((a, b) => (b.shot_number || 0) - (a.shot_number || 0))[0] || null;
+        if (prevShot?.blocking?.end?.zone) {
+          const prevEnv = environments.find(x => x.id === prevShot.location?.location_id) || null;
+          continuityBlock = composer.buildShotContinuityBlock?.(prevShot, shot, prevEnv, environment) || null;
+        }
+      } catch { /* continuity is additive — never block keyframe gen */ }
+    }
+
+    const spatialPromptText = [promptText, spatialBlock, continuityBlock]
+      .filter(Boolean)
+      .join("\n\n");
 
     // v4.36: prepend an explicit composition-locking instruction to the
     // prompt when a composition anchor is in play. The first image
@@ -20372,6 +20496,72 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // For image_to_video shots, also handles keyframe generation. Sequential
   // execution so continuity chaining works (each shot's last frame seeds
   // the next shot's start before its roll begins).
+  // ─── v4.47.7 — 🗺 Map the movement (batched blocking proposal) ────────
+  //
+  // One AI call maps start/end zones + screen direction for every shot
+  // against the environments' world maps. The path an already-imported
+  // project (Lionn) takes to get blocking without re-import. Preview →
+  // per-row accept → apply, same trust model as every other AI proposal.
+  async function handleProposeBlocking() {
+    const project = await Storage.Projects.getActive();
+    const shots = (await Storage.getAll("shots"))
+      .sort((a, b) => (a.shot_number || 0) - (b.shot_number || 0))
+      .filter(s => s.generation?.mode !== "built_in_resolve");
+    if (shots.length === 0) { toast("No shots to map yet.", { tone: "warn" }); return; }
+    const envs = await Storage.getAll("environments");
+    const envMaps = envs.map(e => ({
+      id: e.id,
+      display_name: e.display_name,
+      zones: e.zones || [],
+      landmarks: (e.landmarks || []).map(l => ({ name: l.name, fixed_position: l.fixed_position })),
+    }));
+    if (envMaps.every(m => m.zones.length === 0)) {
+      toast("No location has a map yet. Open a location's edit modal and add named places (or ✨ Fill with AI authors them) — then map the movement.", { tone: "warn", duration: 9000 });
+      return;
+    }
+    setGPS(true, "🗺 Mapping the movement…", `${shots.length} shots · one batched AI call`, 30);
+    try {
+      const result = await aiAuthorProject(
+        { logline: `Map character movement through the world for "${project?.display_name || "this project"}"`, shots, env_maps: envMaps },
+        { project },
+        "propose_blocking"
+      );
+      setGPS(false);
+      const proposals = result?.proposals || [];
+      if (proposals.length === 0) { toast("The model returned no blocking proposals.", { tone: "warn" }); return; }
+      const accepted = await openFixPreviewModal({
+        title: "🗺 Map the movement",
+        subtitle: `Where each shot starts and ends in the world · ${proposals.length} shots · ${fmtUsd(result.cost_usd || 0)}`,
+        proposals,
+        cost_usd: result.cost_usd,
+      });
+      let appliedCount = 0;
+      for (const p of accepted) {
+        const m = String(p.field || "").match(/^shot\.(.+)\.blocking$/);
+        if (!m) continue;
+        const shot = await Storage.get("shots", m[1]);
+        if (!shot) continue;
+        let blocking = null;
+        try {
+          blocking = (p.proposed === "null" || p.proposed == null)
+            ? null
+            : (typeof p.proposed === "string" ? JSON.parse(p.proposed) : p.proposed);
+        } catch { continue; }
+        shot.blocking = blocking;
+        await Storage.put("shots", shot);
+        appliedCount++;
+      }
+      if (appliedCount > 0) {
+        toast(`🗺 Blocking applied to ${appliedCount} shot${appliedCount === 1 ? "" : "s"}. Movement shots now track the camera WITH the character.`, { tone: "ok", duration: 8000 });
+        await renderStoryboard();
+      }
+    } catch (err) {
+      await reportError(err, { tag: "propose-blocking", userFacing: true });
+    } finally {
+      setGPS(false);
+    }
+  }
+
   async function handleRollAllPending() {
     if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
     const shots = (await Storage.getAll("shots")).sort((a,b) => (a.shot_number||0) - (b.shot_number||0));
@@ -21738,6 +21928,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
     else if (action === "batch-gen" || action === "batch-reroll") handleBatch(action, target.dataset.batchTab || "cast", target.dataset.batchModel || ACTIVE_IMAGE_MODEL);
     else if (action === "roll-shot")          handleRollShot(target.dataset.shotId);
     else if (action === "roll-all-pending")   handleRollAllPending();
+    else if (action === "propose-blocking")   handleProposeBlocking();
     else if (action === "producer-prompt")    showProducerPromptModal();
     else if (action === "shot-doctor")        showShotDoctorModal();
     else if (action === "gen-keyframe-candidates") handleGenerateKeyframeCandidates(target.dataset.shotId, target.dataset.slot);
@@ -22413,6 +22604,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
                   title="Copy a Claude system prompt that bakes in the current bible's character + location ids. Paste into your Claude conversation as the system message, then feed it a story / scene description — it returns shot JSON that imports cleanly into ElevenX without cross-bible drift or wasted Seedance credits.">🎬 Producer prompt</button>
           <button class="btn btn--sm btn--ghost" data-action="shot-doctor"
                   title="Audit + auto-fix authoring gaps across all shots: derive missing focal_points, attach thematic cast / env refs, generate missing R2V references, retry failed keyframes. Budget-gated at $250 / episode. Style assets are flagged but not auto-generated (director-curated). Produces a markdown report you can copy.">🩺 Shot Doctor</button>
+          <button class="btn btn--sm" data-action="propose-blocking" title="One AI call proposes where each shot starts and ends in the world map — movement shots stop copying the start frame's composition.">🗺 Map the movement</button>
           <button class="btn btn--sm" data-action="roll-all-pending">▶ Roll all pending</button>
         </div>
         <div class="shot-grid" id="elx-shot-grid"></div>
@@ -22689,6 +22881,81 @@ JSON object only. No commentary. No fences. No trailing text.`;
   }
   NS.validateWorldRuleConsistency = validateWorldRuleConsistency;
 
+  // ─── v4.47.7 — spatial validators (soft) ──────────────────────────────
+  // The world map is only useful if violations are visible. Three rules:
+  // unmapped_zone (blocking names a place absent from the env's map),
+  // zone_teleport (consecutive shots jump between unconnected places),
+  // screen_direction_flip (the 180° rule across consecutive movement
+  // shots). Cross-shot rules need ctx.allShots; absent → they pass
+  // quietly (per-shot save paths that don't load the full list).
+
+  function _prevShotOf(shot, allShots) {
+    if (!Array.isArray(allShots)) return null;
+    return allShots
+      .filter(s => s && s.id !== shot.id && (s.shot_number || 0) < (shot.shot_number || 0))
+      .sort((a, b) => (b.shot_number || 0) - (a.shot_number || 0))[0] || null;
+  }
+  function _zoneConnections(environments, envId, zoneId) {
+    const env = (environments || []).find(e => e.id === envId);
+    const z = (env?.zones || []).find(z => z.id === zoneId);
+    return Array.isArray(z?.connects_to) ? z.connects_to : [];
+  }
+
+  function validateUnmappedZone(shot, { environments } = {}) {
+    const b = shot?.blocking;
+    if (!b) return null;
+    const envId = shot.location?.location_id;
+    if (!envId) return null;
+    const env = (environments || []).find(e => e.id === envId);
+    if (!env) return null;  // env_unresolved already covers a missing env
+    const ids = new Set((env.zones || []).map(z => z.id));
+    const bad = [];
+    for (const pt of ["start", "end"]) {
+      const z = b[pt]?.zone;
+      if (z && !ids.has(z)) bad.push(`${pt}: ${z}`);
+    }
+    if (bad.length === 0) return null;
+    return { kind: "unmapped_zone", detail: { env_id: envId, zones: bad, env_has_map: ids.size > 0 } };
+  }
+  NS.validateUnmappedZone = validateUnmappedZone;
+
+  function validateZoneTeleport(shot, { environments, allShots } = {}) {
+    const b = shot?.blocking;
+    if (!b?.start?.zone) return null;
+    const prev = _prevShotOf(shot, allShots);
+    if (!prev?.blocking?.end?.zone) return null;
+    const prevEnvId = prev.location?.location_id;
+    const currEnvId = shot.location?.location_id;
+    if (!prevEnvId || !currEnvId) return null;
+    const pz = prev.blocking.end.zone;
+    const cz = b.start.zone;
+    if (prevEnvId === currEnvId && pz === cz) return null;  // continued
+    // Connections treated as undirected; cross-env links use "<env>:<zone>".
+    const fwdTarget = prevEnvId === currEnvId ? cz : `${currEnvId}:${cz}`;
+    const revTarget = prevEnvId === currEnvId ? pz : `${prevEnvId}:${pz}`;
+    if (_zoneConnections(environments, prevEnvId, pz).includes(fwdTarget)) return null;
+    if (_zoneConnections(environments, currEnvId, cz).includes(revTarget)) return null;
+    return { kind: "zone_teleport", detail: { prev_shot: prev.id, from: `${prevEnvId} / ${pz}`, to: `${currEnvId} / ${cz}` } };
+  }
+  NS.validateZoneTeleport = validateZoneTeleport;
+
+  function validateScreenDirectionFlip(shot, { allShots } = {}) {
+    const b = shot?.blocking;
+    const cross = !!(b?.start?.zone && b?.end?.zone && b.start.zone !== b.end.zone);
+    if (!cross) return null;
+    const f = b.start?.facing;
+    if (f !== "frame_left" && f !== "frame_right") return null;
+    const prev = _prevShotOf(shot, allShots);
+    const pb = prev?.blocking;
+    const prevCross = !!(pb?.start?.zone && pb?.end?.zone && pb.start.zone !== pb.end.zone);
+    if (!prevCross) return null;
+    const pf = pb.start?.facing;
+    if (pf !== "frame_left" && pf !== "frame_right") return null;
+    if (pf === f) return null;  // consistent screen direction
+    return { kind: "screen_direction_flip", detail: { prev_shot: prev.id, prev_direction: pf, this_direction: f } };
+  }
+  NS.validateScreenDirectionFlip = validateScreenDirectionFlip;
+
   // Run all v4.38 authoring-quality rules against a shot. Returns the
   // array of triggered issues (possibly empty). Pure function — no
   // side effects, no Storage calls.
@@ -22701,6 +22968,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
       () => validateCameraStyleConflict(shot, ctx),
       // v4.41: world-rule consistency (ensemble + deny-keyword)
       () => validateWorldRuleConsistency(shot, ctx),
+      // v4.47.7: spatial layer (cross-shot rules pass quietly without ctx.allShots)
+      () => validateUnmappedZone(shot, ctx),
+      () => validateZoneTeleport(shot, ctx),
+      () => validateScreenDirectionFlip(shot, ctx),
     ]) {
       const issue = rule();
       if (issue) out.push(issue);
@@ -22725,8 +22996,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const characters = await Storage.getAll("characters");
       const environments = await Storage.getAll("environments");
       const project = await Storage.Projects.getActive();
-      const ctx = { characters, environments, project };
       const shots = await Storage.getAll("shots");
+      // v4.47.7: allShots enables the cross-shot spatial rules (teleport / 180°)
+      const ctx = { characters, environments, project, allShots: shots };
       let added = 0;
       let autoFixed = 0;
       const autoFixedNames = new Set();
@@ -22735,7 +23007,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
         // v4.38 still get the silent focal-cast auto-fix on next boot.
         // v4.41: bump to "v4.41" so v4.40 shots get the new
         // world_rule_violation rule run against them.
-        if (shot?._validation?.schema_version === "v4.41") continue;
+        if (shot?._validation?.schema_version === "v4.47.7") continue;
         // v4.40 COMPOSITION-1: silent auto-fix BEFORE re-running validators
         // so the fixed issue doesn't get re-added to the issues list.
         const fix = autoFixFocalCastSilent(shot, ctx);
@@ -22752,10 +23024,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
           "location_drift",
           "choreography_overload",
           "camera_style_conflict",
+          // v4.47.7 spatial kinds — re-evaluated each pass
+          "unmapped_zone", "zone_teleport", "screen_direction_flip",
         ]);
         shot._validation.issues = shot._validation.issues.filter(i => !v438Kinds.has(i.kind));
         shot._validation.issues.push(...newIssues);
-        shot._validation.schema_version = "v4.41";
+        shot._validation.schema_version = "v4.47.7";
         added += newIssues.length;
         await Storage.put("shots", shot);
       }
@@ -23024,7 +23298,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       const characters = await Storage.getAll("characters");
       const environments = await Storage.getAll("environments");
       const project = await Storage.Projects.getActive();
-      const newIssues = runAuthoringQualityValidators(shot, { characters, environments, project });
+      const newIssues = runAuthoringQualityValidators(shot, { characters, environments, project, allShots: await Storage.getAll("shots") });
       shot._validation = shot._validation || {};
       const v438Kinds = new Set([
         "focal_unsupported_by_cast", "location_drift",
@@ -23032,10 +23306,12 @@ JSON object only. No commentary. No fences. No trailing text.`;
         // v4.41 — re-validation also clears world_rule_violation so it
         // gets re-evaluated cleanly against the updated project canon.
         "world_rule_violation",
+        // v4.47.7 spatial kinds — re-evaluated each pass
+        "unmapped_zone", "zone_teleport", "screen_direction_flip",
       ]);
       shot._validation.issues = (shot._validation.issues || []).filter(i => !v438Kinds.has(i.kind));
       shot._validation.issues.push(...newIssues);
-      shot._validation.schema_version = "v4.41";
+      shot._validation.schema_version = "v4.47.7";
       await Storage.put("shots", shot);
       // v4.40 COMPOSITION-2: if any of the accepted proposals touched
       // focal_point or description, the existing summary is stale. Clear
@@ -23269,6 +23545,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
         const reasons = (issue.detail?.violations || []).map(v => v.reason).join("; ");
         return `world-rule violation: ${reasons}. The shot's prose or cast composition contradicts the project's style canon. Either rewrite the shot to fit canon, or amend project.style_canon/deny_keywords to explicitly allow it.`;
       }
+      // v4.47.7 spatial layer
+      case "unmapped_zone":
+        return `blocking names places missing from the location's map (${(issue.detail?.zones || []).join(", ")})${issue.detail?.env_has_map ? "" : " — the location has no map yet"}. Add them in the location's edit modal (Map: named places) or re-run 🗺 Map the movement.`;
+      case "zone_teleport":
+        return `character teleports between shots: ${issue.detail?.prev_shot} ends at "${issue.detail?.from}" but this shot starts at "${issue.detail?.to}" with no connection between them. Add a connecting zone, a travel shot, or fix the blocking.`;
+      case "screen_direction_flip":
+        return `screen direction flips vs ${issue.detail?.prev_shot} (${issue.detail?.prev_direction} → ${issue.detail?.this_direction}) — the 180° rule. Audiences read this as the character turning back. Keep travel direction consistent unless the story shows the turn.`;
       default:
         return issue.kind;
     }
@@ -25020,6 +25303,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
     set("props", (body.props || []).join("\n"));
     set("continuity_locks", (body.continuity_locks || []).join("\n"));
     set("ambient_sound", body.ambient_sound);
+    // v4.47.7: AI-authored world map → the line-format textareas. The
+    // edit-modal submit re-parses them via parseZoneLines/parseLandmarkLines.
+    if (Array.isArray(body.zones) && body.zones.length) set("zones", serializeZoneLines(body.zones));
+    if (Array.isArray(body.landmarks) && body.landmarks.length) set("landmarks", serializeLandmarkLines(body.landmarks));
     return applied;
   }
   NS.applyEnvironmentBodyToForm = applyEnvironmentBodyToForm;
@@ -25063,6 +25350,10 @@ JSON object only. No commentary. No fences. No trailing text.`;
       if (!Array.isArray(row.continuity_locks) || row.continuity_locks.length === 0) {
         row.continuity_locks = body.continuity_locks || [];
       }
+      // v4.47.7: the create modal has no map textareas — carry the
+      // AI-authored world map onto the row so it isn't silently dropped.
+      if (!Array.isArray(row.zones) || row.zones.length === 0) row.zones = body.zones || [];
+      if (!Array.isArray(row.landmarks) || row.landmarks.length === 0) row.landmarks = body.landmarks || [];
     }
     return row;
   }
