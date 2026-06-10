@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="8aac39c31436" data-build-time="2026-06-10T10:34:54.025Z">
+<meta name="elevenx-build" content="f0b9d42e57b4" data-build-time="2026-06-10T10:40:02.035Z">
 <script>
 (function(){
-  var info = { hash: "8aac39c31436", time: "2026-06-10T10:34:54.025Z" };
+  var info = { hash: "f0b9d42e57b4", time: "2026-06-10T10:40:02.035Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 8aac39c31436 @ 2026-06-10T10:34:54.025Z -->
+<!-- elevenx-build: f0b9d42e57b4 @ 2026-06-10T10:40:02.035Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9035,7 +9035,16 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
         messages,
         temperature: typeof body.temperature === "number" ? body.temperature : 0.4,
       };
-      if (typeof body.max_tokens === "number") requestBody.max_tokens = body.max_tokens;
+      // v4.47.4: gpt-5-family models reject the legacy `max_tokens`
+      // ("Unsupported parameter ... Use 'max_completion_tokens' instead" —
+      // caught live during the v4.48 rehearsal smoke). OpenAI deprecated
+      // max_tokens in favor of max_completion_tokens, which current models
+      // (gpt-4o included) accept — so we send the NEW name proactively.
+      // The param-compat shim below self-heals the reverse case and any
+      // other unsupported_parameter/value 400 (e.g. temperature, which
+      // gpt-5-family also restricts) without a per-model lookup table —
+      // lookup tables are the bug-generator pattern the playbook bans.
+      if (typeof body.max_tokens === "number") requestBody.max_completion_tokens = body.max_tokens;
       if (body.response_format)               requestBody.response_format = body.response_format;
 
       if (this.dryRun) {
@@ -9046,18 +9055,50 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
       const url = `${this.workerUrl}/openai/v1/chat/completions`;
       this.onLog(`→ POST /openai/v1/chat/completions (${model}, ${(body.user || "").length} chars in)`);
 
-      const res = await this._fetchWithRetry(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      }, "openai chat");
+      // v4.47.4 param-compat loop: on a structured 400 naming an
+      // unsupported parameter/value, rename or strip the named param and
+      // retry. Max 3 attempts; each fix applies at most once. Anything
+      // else (rate limits, auth, malformed) throws exactly as before.
+      let res, json = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        res = await this._fetchWithRetry(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+        }, "openai chat");
 
-      if (!res.ok) {
+        if (res.ok) { json = await res.json(); break; }
+
         const text = await res.text().catch(() => "");
+        let errBody = null;
+        try { errBody = JSON.parse(text); } catch { /* not JSON */ }
+        const code = errBody?.error?.code;
+        const param = errBody?.error?.param;
+        const fixable = res.status === 400
+          && (code === "unsupported_parameter" || code === "unsupported_value")
+          && param && attempt < 3;
+        if (fixable && param === "max_tokens" && "max_tokens" in requestBody) {
+          requestBody.max_completion_tokens = requestBody.max_tokens;
+          delete requestBody.max_tokens;
+          this.onLog(`  ⚠ ${model} rejected max_tokens — retrying with max_completion_tokens`);
+          continue;
+        }
+        if (fixable && param === "max_completion_tokens" && "max_completion_tokens" in requestBody) {
+          requestBody.max_tokens = requestBody.max_completion_tokens;
+          delete requestBody.max_completion_tokens;
+          this.onLog(`  ⚠ ${model} rejected max_completion_tokens — retrying with legacy max_tokens`);
+          continue;
+        }
+        if (fixable && param === "temperature" && "temperature" in requestBody) {
+          delete requestBody.temperature;
+          this.onLog(`  ⚠ ${model} rejected temperature — retrying with model default`);
+          continue;
+        }
         throw new Error(`openai chat ${res.status}: ${text.slice(0, 400)}`);
       }
-
-      const json = await res.json();
+      if (!json) {
+        throw new Error(`openai chat: exhausted param-compat retries for ${model}`);
+      }
       const content = json?.choices?.[0]?.message?.content || "";
       // Try to parse as JSON if the caller requested JSON mode. Tolerant —
       // if the model returns commentary outside the JSON block, regex-extract
