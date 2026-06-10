@@ -2,6 +2,7 @@
 <html lang="en"><head>
 <meta charset="utf-8">
 <title>ElevenX — cinematic AI film studio</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text x='0' y='13' font-size='13'>🎬</text></svg>">
 <meta name="viewport" content="width=1440">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -4166,10 +4167,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="5f7474d2a470" data-build-time="2026-06-10T12:21:40.027Z">
+<meta name="elevenx-build" content="683a73005629" data-build-time="2026-06-10T14:58:54.221Z">
 <script>
 (function(){
-  var info = { hash: "5f7474d2a470", time: "2026-06-10T12:21:40.027Z" };
+  var info = { hash: "683a73005629", time: "2026-06-10T14:58:54.221Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4190,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 5f7474d2a470 @ 2026-06-10T12:21:40.027Z -->
+<!-- elevenx-build: 683a73005629 @ 2026-06-10T14:58:54.221Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9238,6 +9239,22 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
       if (typeof body.max_tokens === "number") requestBody.max_completion_tokens = body.max_tokens;
       if (body.response_format)               requestBody.response_format = body.response_format;
 
+      // v4.47.8: pre-apply the session param memo. The v4.47.4 shim
+      // self-heals param 400s, but a DETERMINISTIC rejection (gpt-5.5
+      // rejects temperature on EVERY call) was being relearned per call —
+      // one wasted 400 round-trip each, observed ~8 times in a single
+      // rehearsal console capture. The memo is learned at runtime from
+      // the first structured 400 (recorded in the fix branches below)
+      // and applied silently to every later call this session. Still no
+      // hardcoded per-model table.
+      const memo = PARAM_MEMO.get(model);
+      if (memo) {
+        for (const [from, to] of memo.rename) {
+          if (from in requestBody) { requestBody[to] = requestBody[from]; delete requestBody[from]; }
+        }
+        for (const p of memo.strip) delete requestBody[p];
+      }
+
       if (this.dryRun) {
         this.onLog(`[dry-run] chatCompletion ${model} (${(body.user || "").length} chars)`);
         return { dryRun: true, request: requestBody };
@@ -9271,18 +9288,21 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
         if (fixable && param === "max_tokens" && "max_tokens" in requestBody) {
           requestBody.max_completion_tokens = requestBody.max_tokens;
           delete requestBody.max_tokens;
-          this.onLog(`  ⚠ ${model} rejected max_tokens — retrying with max_completion_tokens`);
+          paramMemoFor(model).rename.set("max_tokens", "max_completion_tokens");
+          this.onLog(`  ⚠ ${model} rejected max_tokens — retrying with max_completion_tokens (learned for this session)`);
           continue;
         }
         if (fixable && param === "max_completion_tokens" && "max_completion_tokens" in requestBody) {
           requestBody.max_tokens = requestBody.max_completion_tokens;
           delete requestBody.max_completion_tokens;
-          this.onLog(`  ⚠ ${model} rejected max_completion_tokens — retrying with legacy max_tokens`);
+          paramMemoFor(model).rename.set("max_completion_tokens", "max_tokens");
+          this.onLog(`  ⚠ ${model} rejected max_completion_tokens — retrying with legacy max_tokens (learned for this session)`);
           continue;
         }
         if (fixable && param === "temperature" && "temperature" in requestBody) {
           delete requestBody.temperature;
-          this.onLog(`  ⚠ ${model} rejected temperature — retrying with model default`);
+          paramMemoFor(model).strip.add("temperature");
+          this.onLog(`  ⚠ ${model} rejected temperature — retrying without it (learned for this session)`);
           continue;
         }
         throw new Error(`openai chat ${res.status}: ${text.slice(0, 400)}`);
@@ -9357,11 +9377,31 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
   // structured-multi-entity outputs. Flip this constant to roll back.
   const AI_AUTHOR_MODEL = "gpt-5.5";
 
+  // v4.47.8: session-level param-compat memo, keyed by model. Learned at
+  // runtime from the first structured 400 the v4.47.4 shim heals; every
+  // later request pre-applies it instead of re-tripping the same 400.
+  // In-memory only (per page session) by design — OpenAI param rules can
+  // change between sessions, and the shim re-learns in one round-trip.
+  const PARAM_MEMO = new Map();
+  function paramMemoFor(model) {
+    if (!PARAM_MEMO.has(model)) PARAM_MEMO.set(model, { strip: new Set(), rename: new Map() });
+    return PARAM_MEMO.get(model);
+  }
+  // DevTools inspection: ElevenX.__openaiParamMemo()
+  function __openaiParamMemo() {
+    const out = {};
+    for (const [m, v] of PARAM_MEMO) {
+      out[m] = { strip: [...v.strip], rename: Object.fromEntries(v.rename) };
+    }
+    return out;
+  }
+
   NS.OpenAIClient = OpenAIClient;
   NS.estimateOpenAIImageCost = estimateOpenAIImageCost;
   NS.estimateOpenAIChatCost = estimateOpenAIChatCost;
   NS.AI_AUTHOR_MODEL = AI_AUTHOR_MODEL;
   NS.CHAT_PRICING_PER_1K = CHAT_PRICING_PER_1K;
+  NS.__openaiParamMemo = __openaiParamMemo;
 })();
 
 })();
@@ -15366,6 +15406,35 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return take;
   }
   NS.__recoverPendingTake = __recoverPendingTake;
+
+  // v4.47.8: list every unfinished roll in the ACTIVE project. The
+  // rehearsal exposed the gap: __recoverPendingTake existed but there
+  // was no way to SEE what needed recovering — the user had to know
+  // shot ids by heart ("also s02 needs to be recovered"). console.table
+  // + returned array; the boot notice below points here.
+  async function __listPendingRolls() {
+    const shots = await Storage.getAll("shots");
+    const rows = shots
+      .filter(s => s?.keyframes?._pending_seedance)
+      .map(s => {
+        const p = s.keyframes._pending_seedance;
+        return {
+          shot_id: s.id,
+          request_id: p.request_id || "?",
+          render_engine: p.render_engine || p.mode || "?",
+          age_minutes: p.submitted_at ? Math.round((Date.now() - p.submitted_at) / 60000) : null,
+          has_cancel_url: !!p.cancel_url,
+        };
+      });
+    if (rows.length === 0) {
+      console.log("[pending-rolls] none in the active project.");
+    } else {
+      console.table(rows);
+      console.log(`Resume one (no re-pay): await ElevenX.__recoverPendingTake("<shot_id>")`);
+    }
+    return rows;
+  }
+  NS.__listPendingRolls = __listPendingRolls;
 
   // v4.22: introspection helper. Returns the live shape of a shot's
   // keyframes block — which field names are present, which have data,
@@ -27690,6 +27759,23 @@ JSON object only. No commentary. No fences. No trailing text.`;
     } catch (err) {
       console.error("[v4.14 integrity] migration failed:", err);
     }
+
+    // v4.47.8: surface unfinished rolls from previous sessions. The fal
+    // job kept rendering (and billing) server-side regardless of the page
+    // closing — recovery resumes polling against the saved request_id
+    // with no re-pay. Without this notice, pending rolls sat invisible
+    // until the user happened to know the DevTools incantation.
+    try {
+      const pendingRolls = (await Storage.getAll("shots")).filter(s => s?.keyframes?._pending_seedance);
+      if (pendingRolls.length > 0) {
+        const ids = pendingRolls.map(s => s.id).join(", ");
+        console.warn(`[pending-rolls] ${pendingRolls.length} unfinished roll(s) from a previous session: ${ids}`);
+        toast(
+          `⏳ ${pendingRolls.length} unfinished roll${pendingRolls.length === 1 ? "" : "s"} from a previous session (${ids}). DevTools: ElevenX.__listPendingRolls() to inspect · __recoverPendingTake(id) to resume — no re-pay.`,
+          { tone: "warn", duration: 12000 }
+        );
+      }
+    } catch { /* notice is best-effort — never block boot */ }
 
     // v4.38: re-run authoring-quality validators against existing shots.
     // The four new rules (focal_unsupported_by_cast, location_drift,
