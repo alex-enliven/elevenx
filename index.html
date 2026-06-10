@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="153fad3cfbe0" data-build-time="2026-06-09T21:58:35.094Z">
+<meta name="elevenx-build" content="03e196937b72" data-build-time="2026-06-10T09:30:31.153Z">
 <script>
 (function(){
-  var info = { hash: "153fad3cfbe0", time: "2026-06-09T21:58:35.094Z" };
+  var info = { hash: "03e196937b72", time: "2026-06-10T09:30:31.153Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 153fad3cfbe0 @ 2026-06-09T21:58:35.094Z -->
+<!-- elevenx-build: 03e196937b72 @ 2026-06-10T09:30:31.153Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -11661,6 +11661,8 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     openFormModal({
       title: "Add style asset",
       formHtml,
+      // v4.47.2: ✨ Fill with AI — kind + description + palette from the name.
+      onMount: (panel) => mountAiFillButton(panel, { entityType: "asset", applyFn: applyAssetBodyToForm }),
       onSubmit: async (form) => {
         const fd = new FormData(form);
         const display_name = String(fd.get("display_name") || "").trim();
@@ -13231,8 +13233,20 @@ JSON object only. No commentary. No fences. No trailing text.`;
       throw new Error("aiAuthorProject: input.logline is required (min 8 chars)");
     }
     if (mode !== "bootstrap_bible" && mode !== "generate_storyboard"
-        && mode !== "fix_cast_coverage" && mode !== "fill_shot_summaries") {
-      throw new Error(`aiAuthorProject: unknown mode "${mode}" (expected "bootstrap_bible" | "generate_storyboard" | "fix_cast_coverage" | "fill_shot_summaries")`);
+        && mode !== "fix_cast_coverage" && mode !== "fill_shot_summaries"
+        && mode !== "fill_entity") {
+      throw new Error(`aiAuthorProject: unknown mode "${mode}" (expected "bootstrap_bible" | "generate_storyboard" | "fix_cast_coverage" | "fill_shot_summaries" | "fill_entity")`);
+    }
+    // v4.47.2: fill_entity validates entity_type early — same cheap-guard-
+    // first ordering as the logline check above.
+    if (mode === "fill_entity") {
+      const et = input?.entity_type;
+      if (et !== "character" && et !== "environment" && et !== "asset") {
+        throw new Error(`aiAuthorProject fill_entity: unknown entity_type "${et}" (expected "character" | "environment" | "asset")`);
+      }
+      if (!input?.display_name || String(input.display_name).trim().length < 2) {
+        throw new Error("aiAuthorProject fill_entity: input.display_name is required (min 2 chars)");
+      }
     }
     // v4.42.2: route by project-level model preference. Default gpt-5.5
     // (existing OpenAI worker route). Claude models route through the
@@ -13387,6 +13401,77 @@ JSON object only. No commentary. No fences. No trailing text.`;
         current_cast_in_frame: input.shot?.cast_in_frame || [],
         missing_characters: input.missing_characters || [],
         instruction: "Return the corrected cast_in_frame array. Return JSON only.",
+      });
+    } else if (mode === "fill_entity") {
+      // v4.47.2 Part A: single-entity bible fill. Powers the "✨ Fill with
+      // AI" button in the character/environment/asset create + edit modals,
+      // AND Part B's missing-entity creation at bootstrap time. Returns ONE
+      // proposal whose body uses the SAME shapes as bootstrap_bible (the
+      // composer's characterHasVisualIdentity gate refuses characters
+      // without visual identity data — the prompt makes those fields
+      // mandatory).
+      const entityType = input.entity_type;
+      const entityName = String(input.display_name).trim();
+      const entitySlug = entityName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "entity";
+      const bodySpec = entityType === "character"
+        ? [
+            "CHARACTER body MUST include ALL of: id (snake_case slug), display_name,",
+            "identity {age, role_in_story, archetype},",
+            "physical {hair (color+length+style as one string), eyes, skin, distinctive_features: [3-4 items]},",
+            "wardrobe {episode_default: {top, bottom, footwear}, color_palette: [2-3 colors]},",
+            "voice {seedance_native_direction (1 sentence of vocal direction)},",
+            "arc {false_belief, inner_need, arc_expression},",
+            "never: [2-3 anti-pattern strings],",
+            "stability_note (1 sentence visual identity lock naming the 3 most distinctive traits),",
+            "high_risk (boolean — true if they'll appear on screen in multiple shots).",
+            "The visual identity fields (distinctive_features, hair, eyes, wardrobe, stability_note)",
+            "are MANDATORY — reference generation refuses characters without them.",
+          ].join("\n")
+        : entityType === "environment"
+        ? [
+            "ENVIRONMENT body MUST include ALL of: id (snake_case slug), display_name, description,",
+            "architecture {type, materials: [2-3 items]},",
+            "lighting {primary_source, quality, time_of_day},",
+            "palette: [3-5 colors], props: [3-5 items],",
+            "continuity_locks: [2-3 invariants the model must preserve across every shot here],",
+            "ambient_sound (1 sentence).",
+          ].join("\n")
+        : [
+            "ASSET body MUST include ALL of: id (snake_case slug), display_name,",
+            "kind ('style_frame' | 'prop' | 'fx_sheet'),",
+            "description (2-3 sentences — this becomes the primary generation prompt content),",
+            "palette: [2-4 colors].",
+          ].join("\n");
+      system = [
+        "You are a film director's AI authoring assistant.",
+        `Author a COMPLETE ${entityType} bible entry for the project below. The user supplied`,
+        "the name and possibly a hint or partial fields — respect everything they wrote and",
+        "fill ONLY what's missing, inventing details consistent with the project's style canon,",
+        "world rules, and existing cast (the new entity must be visually DISTINCT from them).",
+        "",
+        'Output ONLY a JSON object: {"proposals":[{"field":"' + entityType + "." + entitySlug + '","current":"(none)","proposed":"<JSON string of the full body>","rationale":"1 line on the creative choices"}]}',
+        "Return EXACTLY 1 proposal.",
+        "",
+        bodySpec,
+      ].join("\n");
+      user = JSON.stringify({
+        project: {
+          display_name: project?.display_name,
+          medium: project?.medium,
+          genre: project?.genre,
+          style_canon: project?.style_canon,
+          logline: project?.logline,
+          world_rules: project?.world_rules || [],
+          visual_rule: project?.visual_rule,
+        },
+        existing_cast_for_distinctiveness: castInBible,
+        entity_type: entityType,
+        display_name: entityName,
+        suggested_id: input.entity_id || entitySlug,
+        hint: input.hint || "",
+        existing_partial_fields: input.existing || {},
+        referenced_by_shots: input.referenced_by_shots || [],
+        instruction: `Author the complete ${entityType}. Use suggested_id as the id. Respect existing_partial_fields verbatim. Return JSON only.`,
       });
     } else if (mode === "fill_shot_summaries") {
       // v4.42.1 F6: batched shot summary generation. Called by
@@ -13674,6 +13759,65 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return drops;
   }
   NS.detectMultiCharacterDrops = detectMultiCharacterDrops;
+
+  // v4.47.2 Part B: detect shot proposals referencing entities that exist
+  // in NEITHER the proposal set NOR the current bible.
+  //
+  // Root cause of the 2026-06-09 "maya was missing" report: the model can
+  // propose a shot whose cast_in_frame references a character it never
+  // proposed (or the user rejects the character proposal while accepting
+  // dependent shots) — and applyBootstrapProposals persisted the dangling
+  // ref silently. The import path validates cross-refs (validCharIds,
+  // main.js import section); the bootstrap path never did.
+  //
+  // Mirror of detectMultiCharacterDrops: pure function, no Storage, no AI.
+  // Returns [{ entity_type, entity_id, referenced_by_shots[] }].
+  function detectMissingEntityRefs(proposals, existingChars = [], existingEnvs = []) {
+    if (!Array.isArray(proposals)) return [];
+    const parse = (raw) => {
+      if (raw && typeof raw === "object") return raw;
+      if (typeof raw === "string") { try { return JSON.parse(raw); } catch { return null; } }
+      return null;
+    };
+    const proposedCharIds = new Set();
+    const proposedEnvIds = new Set();
+    for (const p of proposals) {
+      if (p.field?.startsWith("character.")) {
+        const b = parse(p.proposed);
+        if (b?.id) proposedCharIds.add(b.id);
+      } else if (p.field?.startsWith("environment.")) {
+        const b = parse(p.proposed);
+        if (b?.id) proposedEnvIds.add(b.id);
+      }
+    }
+    const knownCharIds = new Set([...proposedCharIds, ...existingChars.map(c => c.id)]);
+    const knownEnvIds = new Set([...proposedEnvIds, ...existingEnvs.map(e => e.id)]);
+
+    const missing = new Map();  // "<type>:<id>" → { entity_type, entity_id, referenced_by_shots[] }
+    const note = (type, id, shotId) => {
+      const key = `${type}:${id}`;
+      if (!missing.has(key)) missing.set(key, { entity_type: type, entity_id: id, referenced_by_shots: [] });
+      missing.get(key).referenced_by_shots.push(shotId);
+    };
+    for (const p of proposals) {
+      if (!p.field?.startsWith("shot.") || p.field.includes(".cast_in_frame")) continue;
+      const body = parse(p.proposed);
+      if (!body) continue;
+      const shotId = body.id || p.field.slice("shot.".length);
+      for (const c of (body.cast_in_frame || [])) {
+        const cid = typeof c === "string" ? c : c?.character_id;
+        if (cid && !knownCharIds.has(cid)) note("character", cid, shotId);
+      }
+      for (const c of (body.cast_off_frame || [])) {
+        const cid = typeof c === "string" ? c : c?.character_id;
+        if (cid && !knownCharIds.has(cid)) note("character", cid, shotId);
+      }
+      const lid = body.location?.location_id || body.location_id;
+      if (lid && !knownEnvIds.has(lid)) note("environment", lid, shotId);
+    }
+    return [...missing.values()];
+  }
+  NS.detectMissingEntityRefs = detectMissingEntityRefs;
   NS.AI_AUTHOR_PROJECT_COST_CEILING = AI_AUTHOR_PROJECT_COST_CEILING;
 
   // v4.42 M-AI-1b: persist a set of accepted bootstrap proposals into IDB.
@@ -13837,6 +13981,56 @@ JSON object only. No commentary. No fences. No trailing text.`;
         applied.shots++;
       } catch (err) {
         errors.push({ field, error: err.message });
+      }
+    }
+
+    // v4.47.2 Part B (belt-and-suspenders): post-persist cross-reference
+    // validation. Pre-persist detection (detectMissingEntityRefs) catches
+    // model omissions, but ONLY this catches the user rejecting a
+    // character proposal while accepting shots that reference it. Stamps
+    // the SAME issue kinds the import path uses (cast_unresolved /
+    // env_unresolved) so the existing ⚠ badge + Shot Doctor +
+    // describeShotIssue surfaces work unchanged.
+    if (persistedShots.length > 0) {
+      try {
+        const allChars = await Storage.getAll("characters");
+        const allEnvs = await Storage.getAll("environments");
+        const validCharIds = new Set(allChars.map(c => c.id));
+        const validEnvIds = new Set(allEnvs.map(e => e.id));
+        let danglingCount = 0;
+        for (const shot of persistedShots) {
+          const issues = [];
+          const unresolvedCast = (shot.cast_in_frame || [])
+            .map(c => typeof c === "string" ? c : c?.character_id)
+            .filter(id => id && !validCharIds.has(id));
+          if (unresolvedCast.length > 0) {
+            issues.push({ kind: "cast_unresolved", detail: unresolvedCast });
+          }
+          const lid = shot.location?.location_id;
+          if (lid && !validEnvIds.has(lid)) {
+            issues.push({ kind: "env_unresolved", detail: lid });
+          }
+          if (issues.length > 0) {
+            shot._validation = shot._validation || { issues: [] };
+            shot._validation.issues = shot._validation.issues || [];
+            // Replace any prior unresolved-class issues, then stamp fresh.
+            shot._validation.issues = shot._validation.issues.filter(
+              i => i.kind !== "cast_unresolved" && i.kind !== "env_unresolved"
+            );
+            shot._validation.issues.push(...issues);
+            await Storage.put("shots", shot);
+            danglingCount += issues.length;
+          }
+        }
+        if (danglingCount > 0) {
+          toast(`⚠ ${danglingCount} dangling reference${danglingCount === 1 ? "" : "s"} after apply (a referenced character/location wasn't accepted). Affected shots carry ⚠ badges — add the missing entities via Cast & Locations (✨ Fill with AI makes it one click).`, { tone: "warn", duration: 10000 });
+          await reportError(new Error(`bootstrap apply left ${danglingCount} dangling ref(s)`), {
+            tag: "bootstrap-dangling-refs", userFacing: false,
+            shots: persistedShots.filter(s => (s._validation?.issues || []).some(i => i.kind === "cast_unresolved" || i.kind === "env_unresolved")).map(s => s.id),
+          });
+        }
+      } catch (err) {
+        await reportError(err, { tag: "bootstrap-postpersist-validation", userFacing: false });
       }
     }
 
@@ -21304,8 +21498,49 @@ JSON object only. No commentary. No fences. No trailing text.`;
         console.warn("[v4.42.1 detectMultiCharacterDrops]", err.message);
       }
 
+      // v4.47.2 Part B: detect shots referencing entities the model never
+      // proposed (and that don't exist in the current bible). For each
+      // missing entity, fire fill_entity and inject the AI-authored bible
+      // entry as an extra proposal — user accepts/rejects per row.
+      // (The "maya was missing" fix.)
+      let missingEntityProposals = [];
+      let missingEntityCostUsd = 0;
+      try {
+        const missingRefs = detectMissingEntityRefs(result.proposals, characters, environments);
+        if (missingRefs.length > 0) {
+          setStatus(`⚠ ${missingRefs.length} entit${missingRefs.length === 1 ? "y" : "ies"} referenced by shots but never proposed. Authoring bible entries…`);
+          for (const m of missingRefs) {
+            try {
+              const displayName = m.entity_id.replace(/_/g, " ").replace(/\b\w/g, ch => ch.toUpperCase());
+              const fill = await aiAuthorProject(
+                {
+                  logline: "(entity fill)",
+                  entity_type: m.entity_type,
+                  entity_id: m.entity_id,
+                  display_name: displayName,
+                  referenced_by_shots: m.referenced_by_shots,
+                  hint: `Referenced by shot(s) ${m.referenced_by_shots.join(", ")} in this bootstrap but never authored.`,
+                },
+                ctx,
+                "fill_entity"
+              );
+              for (const fp of (fill?.proposals || [])) {
+                fp.field = fp.field || `${m.entity_type}.${m.entity_id}`;
+                fp.rationale = `[missing entity] referenced by ${m.referenced_by_shots.join(", ")} but never proposed — AI-authored bible entry. ${fp.rationale || ""}`;
+                missingEntityProposals.push(fp);
+              }
+              missingEntityCostUsd += fill?.cost_usd || 0;
+            } catch (err) {
+              await reportError(err, { tag: "missing-entity-fill", userFacing: false, entity: m });
+            }
+          }
+        }
+      } catch (err) {
+        await reportError(err, { tag: "missing-entity-detect", userFacing: false });
+      }
+
       // Group proposals for the preview by entity type for readability.
-      const allProposals = [...result.proposals, ...dropProposals];
+      const allProposals = [...result.proposals, ...missingEntityProposals, ...dropProposals];
       const subtitle = (() => {
         const pCount = result.proposals.filter(p => p.field === "project").length;
         const cCount = result.proposals.filter(p => p.field?.startsWith("character.")).length;
@@ -21320,6 +21555,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
         if (fixCount) parts.push(`${fixCount} cast-coverage fix${fixCount === 1 ? "" : "es"}`);
         const warn = result.shot_count_warning ? `<br>⚠ ${esc(result.shot_count_warning.message)}` : "";
         const fixHint = fixCount > 0 ? `<br>⚠ AI may have dropped characters from some shots — accept the cast-coverage fixes to restore them.` : "";
+        // v4.47.2 Part B: surface AI-authored entries for entities that
+        // shots reference but the model never proposed.
+        const missingHint = missingEntityProposals.length > 0
+          ? `<br>⚠ ${missingEntityProposals.length} entit${missingEntityProposals.length === 1 ? "y was" : "ies were"} referenced by shots but never proposed — AI authored the missing bible entr${missingEntityProposals.length === 1 ? "y" : "ies"} (marked [missing entity]). Rejecting them leaves dangling references.`
+          : "";
         // v4.43.1: when Claude 404'd and we fell back to gpt-5.5, the
         // subtitle says so explicitly. Users picking claude-opus-4-7 deserve
         // to know their run actually ran on gpt-5.5 because the worker
@@ -21327,14 +21567,14 @@ JSON object only. No commentary. No fences. No trailing text.`;
         const fallbackBanner = result.fallback_info
           ? `<br>⚠ Wanted <strong>${esc(result.fallback_info.from)}</strong> but the worker doesn't have the /anthropic route yet — used <strong>${esc(result.fallback_info.to)}</strong> instead. Redeploy proxy.worker.js to enable Claude.`
           : "";
-        return `GPT proposed ${parts.join(" + ")}. Accept the ones you want; reject the rest.${warn}${fixHint}${fallbackBanner}`;
+        return `GPT proposed ${parts.join(" + ")}. Accept the ones you want; reject the rest.${warn}${fixHint}${missingHint}${fallbackBanner}`;
       })();
 
       const accepted = await openFixPreviewModal({
         title: mode === "bootstrap_bible" ? "✨ New film from logline" : "+ New shots for active project",
         subtitle,
         proposals: allProposals,
-        cost_usd: (result.cost_usd || 0) + dropFixCostUsd,
+        cost_usd: (result.cost_usd || 0) + dropFixCostUsd + missingEntityCostUsd,
       });
       if (accepted.length === 0) {
         setStatus("No proposals accepted. The project is unchanged.", "info");
@@ -21346,7 +21586,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
       // v4.42.1 F6: cost ledger captures bootstrap + drop-fixes + batched
       // shot_summary fill as ONE line so the user sees the full AI cost
       // of the operation.
-      const totalCostUsd = (result.cost_usd || 0) + dropFixCostUsd + (applyResult.summary_cost_usd || 0);
+      const totalCostUsd = (result.cost_usd || 0) + dropFixCostUsd + missingEntityCostUsd + (applyResult.summary_cost_usd || 0);
       if (totalCostUsd > 0) await trackCost(totalCostUsd, `AI Producer ${mode} (gen+fix+summaries)`);
 
       const summary = [
@@ -23992,6 +24232,194 @@ JSON object only. No commentary. No fences. No trailing text.`;
                              border:1px solid #2a2a35; border-radius:6px; font-size:13px;
                              box-sizing:border-box; font-family: inherit;`;
 
+  // ─── v4.47.2 Part A — "✨ Fill with AI" for entity create/edit modals ──────
+  //
+  // The create-character modal is 9 hand-typed fields; the composer's
+  // characterHasVisualIdentity gate (composer.js) refuses ref generation
+  // for characters without visual identity data — so a bare-name manual
+  // add was a dead end until the user typed features/wardrobe by hand.
+  // These helpers wire aiAuthorProject's fill_entity mode into all five
+  // entity modals: type a name, click ✨, the form populates (form IS the
+  // preview — user edits, then Saves).
+  //
+  // Field-mapper helpers are PURE (exported for verify-build): they write
+  // an AI entity body into the panel's named inputs. fillEmptiesOnly
+  // skips inputs the user already typed in (edit modals + respect-user-
+  // input on create).
+
+  function _setFormField(panel, name, value, fillEmptiesOnly) {
+    const el = panel.querySelector(`[name="${name}"]`);
+    if (!el) return false;                       // create modals lack some inputs — fine
+    if (value == null || value === "") return false;
+    if (el.type === "checkbox") {
+      if (!fillEmptiesOnly || !el.checked) el.checked = !!value;
+      return true;
+    }
+    if (fillEmptiesOnly && String(el.value || "").trim()) return false;
+    el.value = String(value);
+    return true;
+  }
+  function _hairToString(hair) {
+    if (!hair) return "";
+    if (typeof hair === "string") return hair;
+    return [hair.color, hair.length, hair.style].filter(Boolean).join(", ");
+  }
+
+  function applyCharacterBodyToForm(panel, body, opts = {}) {
+    const fe = opts.fillEmptiesOnly !== false;   // default true
+    let applied = 0;
+    const set = (n, v) => { if (_setFormField(panel, n, v, fe)) applied++; };
+    set("display_name", body.display_name);
+    set("age", body.identity?.age);
+    set("nationality", body.identity?.nationality);
+    set("role", body.identity?.role_in_story);
+    set("archetype", body.identity?.archetype);
+    set("hair", _hairToString(body.physical?.hair));
+    set("distinctive_features", (body.physical?.distinctive_features || []).join("\n"));
+    set("wardrobe_top", body.wardrobe?.episode_default?.top);
+    set("wardrobe_bottom", body.wardrobe?.episode_default?.bottom);
+    set("wardrobe_footwear", body.wardrobe?.episode_default?.footwear);
+    set("palette", (body.wardrobe?.color_palette || []).join(", "));
+    set("stability_note", body.stability_note);
+    set("never", (body.never || []).join("\n"));
+    set("voice_direction", body.voice?.seedance_native_direction);
+    // voice_id intentionally skipped — the AI can't know the user's
+    // ElevenLabs library; the v4.39 picker modal handles that.
+    return applied;
+  }
+  NS.applyCharacterBodyToForm = applyCharacterBodyToForm;
+
+  function applyEnvironmentBodyToForm(panel, body, opts = {}) {
+    const fe = opts.fillEmptiesOnly !== false;
+    let applied = 0;
+    const set = (n, v) => { if (_setFormField(panel, n, v, fe)) applied++; };
+    const l = body.lighting || {};
+    set("display_name", body.display_name);
+    set("architecture", body.architecture?.type);
+    set("lighting", l.description || [l.primary_source, l.quality, l.time_of_day].filter(Boolean).join(", "));
+    set("lighting_source", l.primary_source);
+    set("lighting_quality", l.quality);
+    set("lighting_time", l.time_of_day);
+    set("materials", (body.architecture?.materials || []).join(", "));
+    set("palette", (body.palette || []).join(", "));
+    set("props", (body.props || []).join("\n"));
+    set("continuity_locks", (body.continuity_locks || []).join("\n"));
+    set("ambient_sound", body.ambient_sound);
+    return applied;
+  }
+  NS.applyEnvironmentBodyToForm = applyEnvironmentBodyToForm;
+
+  function applyAssetBodyToForm(panel, body, opts = {}) {
+    const fe = opts.fillEmptiesOnly !== false;
+    let applied = 0;
+    const set = (n, v) => { if (_setFormField(panel, n, v, fe)) applied++; };
+    set("display_name", body.display_name);
+    set("kind", body.kind);
+    set("description", body.description);
+    set("palette", (body.palette || []).join(", "));
+    return applied;
+  }
+  NS.applyAssetBodyToForm = applyAssetBodyToForm;
+
+  // Supplement a create-modal row with AI-body fields the form has no
+  // inputs for (create-character lacks hair/wardrobe/stability/never/arc;
+  // create-environment lacks materials/lighting-split/continuity_locks).
+  // Form-derived values always win; the body only fills empty leaves.
+  function supplementRowFromAiBody(row, body, entityType) {
+    if (!body || typeof body !== "object") return row;
+    if (entityType === "character") {
+      row.physical = row.physical || {};
+      if (!row.physical.hair || Object.keys(row.physical.hair).length === 0) {
+        row.physical.hair = typeof body.physical?.hair === "string"
+          ? parseHairString(body.physical.hair)
+          : (body.physical?.hair || {});
+      }
+      if (!row.physical.eyes) row.physical.eyes = body.physical?.eyes || "";
+      if (!row.physical.skin) row.physical.skin = body.physical?.skin || "";
+      row.wardrobe = row.wardrobe || {};
+      row.wardrobe.episode_default = { ...(body.wardrobe?.episode_default || {}), ...(row.wardrobe.episode_default || {}) };
+      if (!row.stability_note) row.stability_note = body.stability_note || "";
+      if (!Array.isArray(row.never) || row.never.length === 0) row.never = body.never || [];
+      if (!row.arc || Object.keys(row.arc || {}).length === 0) row.arc = body.arc || {};
+      if (body.high_risk != null && row.high_risk === false) row.high_risk = !!body.high_risk;
+    } else if (entityType === "environment") {
+      row.architecture = { ...(body.architecture || {}), ...(row.architecture || {}) };
+      row.lighting = { ...(body.lighting || {}), ...(row.lighting || {}) };
+      if (!Array.isArray(row.continuity_locks) || row.continuity_locks.length === 0) {
+        row.continuity_locks = body.continuity_locks || [];
+      }
+    }
+    return row;
+  }
+  NS.supplementRowFromAiBody = supplementRowFromAiBody;
+
+  // Mounts the ✨ button into a modal (via openFormModal's onMount).
+  // On click: reads display_name + every non-empty form field (passed as
+  // existing_partial_fields so the model respects user input), fires
+  // fill_entity, stashes the full body on the FORM element (read back by
+  // create-onSubmit for the supplement merge), and populates the inputs.
+  function mountAiFillButton(panel, { entityType, applyFn }) {
+    const form = panel.querySelector("#elx-form-modal-form");
+    const nameEl = panel.querySelector('[name="display_name"]');
+    if (!form || !nameEl) return;
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "display:flex; align-items:center; gap:10px; margin:2px 0 12px;";
+    wrap.innerHTML = `
+      <button type="button" data-action-local="ai-fill-entity"
+        style="background:transparent; color:#c9a25a; border:1px solid #c9a25a;
+               padding:6px 12px; border-radius:5px; font-size:11.5px; font-weight:600; cursor:pointer;">
+        ✨ Fill with AI</button>
+      <span style="font-size:10.5px; color:#6a6a78; line-height:1.4;">
+        Type the name (and anything else you know), then let AI author the rest — consistent with the project's canon. Everything stays editable before Save.</span>
+    `;
+    nameEl.closest("div")?.insertAdjacentElement("afterend", wrap) || form.prepend(wrap);
+    const btn = wrap.querySelector("[data-action-local='ai-fill-entity']");
+    btn.addEventListener("click", async () => {
+      const display_name = String(nameEl.value || "").trim();
+      if (display_name.length < 2) {
+        toast("Type the name first — AI fills everything else.", { tone: "warn" });
+        nameEl.focus();
+        return;
+      }
+      // Gather already-typed fields so the model respects them.
+      const existing = {};
+      for (const el of form.querySelectorAll("input[name], textarea[name], select[name]")) {
+        const v = el.type === "checkbox" ? (el.checked ? "true" : "") : String(el.value || "").trim();
+        if (v && el.name !== "display_name") existing[el.name] = v;
+      }
+      btn.disabled = true;
+      btn.textContent = "✨ Authoring…";
+      setGPS(true, `AI authoring ${entityType} "${display_name}"`, "fill_entity", 30);
+      try {
+        const project = await Storage.Projects.getActive();
+        const characters = await Storage.getAll("characters");
+        const environments = await Storage.getAll("environments");
+        const result = await aiAuthorProject(
+          { logline: "(entity fill)", entity_type: entityType, display_name, existing },
+          { project, characters, environments },
+          "fill_entity"
+        );
+        const p = result?.proposals?.[0];
+        let body = null;
+        if (p?.proposed) {
+          try { body = typeof p.proposed === "string" ? JSON.parse(p.proposed) : p.proposed; } catch { /* fall through */ }
+        }
+        if (!body) throw new Error("AI returned no parseable entity body — try again or fill manually.");
+        form._aiEntityBody = body;  // read back by create-onSubmit supplement
+        const applied = applyFn(panel, body, { fillEmptiesOnly: true });
+        if (result.cost_usd) await trackCost(result.cost_usd, `AI fill ${entityType} ${display_name}`);
+        toast(`✨ Filled ${applied} field${applied === 1 ? "" : "s"} for "${display_name}" · ${fmtUsd(result.cost_usd || 0)}. Review, edit, then Save.`, { tone: "ok", duration: 6000 });
+      } catch (err) {
+        await reportError(err, { tag: "fill-entity", userFacing: true, entityType, display_name });
+      } finally {
+        setGPS(false);
+        btn.disabled = false;
+        btn.textContent = "✨ Fill with AI";
+      }
+    });
+  }
+  NS.mountAiFillButton = mountAiFillButton;
+
   function showCreateCharacterModal() {
     const formHtml = `
       ${fieldHtml("Display name", `<input name="display_name" type="text" required placeholder="e.g. Sarah Chen" style="${FIELD_INPUT_STYLE}">`)}
@@ -24025,6 +24453,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
     openFormModal({
       title: "Add character",
       formHtml,
+      // v4.47.2: ✨ Fill with AI — type the name, AI authors the bible entry.
+      onMount: (panel) => mountAiFillButton(panel, { entityType: "character", applyFn: applyCharacterBodyToForm }),
       onSubmit: async (form) => {
         const fd = new FormData(form);
         const display_name = String(fd.get("display_name") || "").trim();
@@ -24064,6 +24494,11 @@ JSON object only. No commentary. No fences. No trailing text.`;
           chosenModel: null,
           created_at: new Date().toISOString().slice(0, 10),
         };
+        // v4.47.2: the create form has no inputs for hair/wardrobe/
+        // stability_note/never/arc — if ✨ Fill with AI ran, the full body
+        // was stashed on the form; supplement the empty leaves so the
+        // AI's identity data isn't lost on save. Form values always win.
+        supplementRowFromAiBody(row, form._aiEntityBody, "character");
         await Storage.put("characters", row);
         toast(`Added "${display_name}"`, { tone: "ok" });
         await renderCastTab();
@@ -24148,6 +24583,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
     openFormModal({
       title: `Edit ${c.display_name}`,
       formHtml,
+      // v4.47.2: fill-empties only — never clobbers what's already typed.
+      onMount: (panel) => mountAiFillButton(panel, { entityType: "character", applyFn: applyCharacterBodyToForm }),
       onSubmit: async (form) => {
         const fd = new FormData(form);
         const updated = {
@@ -24226,6 +24663,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
     openFormModal({
       title: "Add environment",
       formHtml,
+      // v4.47.2: ✨ Fill with AI — type the name, AI authors the env entry.
+      onMount: (panel) => mountAiFillButton(panel, { entityType: "environment", applyFn: applyEnvironmentBodyToForm }),
       onSubmit: async (form) => {
         const fd = new FormData(form);
         const display_name = String(fd.get("display_name") || "").trim();
@@ -24244,6 +24683,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
           chosenModel: null,
           created_at: new Date().toISOString().slice(0, 10),
         };
+        // v4.47.2: supplement materials / lighting-split / continuity_locks
+        // (no create-form inputs for those) from the AI body if ✨ ran.
+        supplementRowFromAiBody(row, form._aiEntityBody, "environment");
         await Storage.put("environments", row);
         toast(`Added "${display_name}"`, { tone: "ok" });
         await renderLocationTab();
@@ -24302,6 +24744,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
     openFormModal({
       title: `Edit ${e.display_name}`,
       formHtml,
+      // v4.47.2: fill-empties only — never clobbers what's already typed.
+      onMount: (panel) => mountAiFillButton(panel, { entityType: "environment", applyFn: applyEnvironmentBodyToForm }),
       onSubmit: async (form) => {
         const fd = new FormData(form);
         const updated = {
