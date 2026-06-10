@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="03e196937b72" data-build-time="2026-06-10T09:30:31.153Z">
+<meta name="elevenx-build" content="8aac39c31436" data-build-time="2026-06-10T10:34:54.025Z">
 <script>
 (function(){
-  var info = { hash: "03e196937b72", time: "2026-06-10T09:30:31.153Z" };
+  var info = { hash: "8aac39c31436", time: "2026-06-10T10:34:54.025Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 03e196937b72 @ 2026-06-10T09:30:31.153Z -->
+<!-- elevenx-build: 8aac39c31436 @ 2026-06-10T10:34:54.025Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -9003,7 +9003,11 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
     /**
      * @param {object} body
      * @param {string} [body.system]
-     * @param {string} body.user
+     * @param {string} body.user                — single-turn prompt (ignored when messages[] given)
+     * @param {Array<{role:"user"|"assistant",content:string}>} [body.messages]
+     *        — v4.47.3 multi-turn history. When present, used INSTEAD of
+     *        body.user; system stays a separate field. Backward compatible:
+     *        every pre-v4.47.3 call site passes only { system, user }.
      * @param {string} [body.model]
      * @param {object} [body.response_format]
      * @param {number} [body.temperature]
@@ -9011,11 +9015,20 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
      * @returns {Promise<{ content: string, parsed: object|null, raw: object, cost_usd_estimated: number }>}
      */
     async chatCompletion(body) {
-      if (!body?.user) throw new Error("chatCompletion: body.user is required");
+      const hasTurns = Array.isArray(body?.messages) && body.messages.length > 0;
+      if (!body?.user && !hasTurns) throw new Error("chatCompletion: body.user or body.messages[] is required");
       const model = body.model || AI_AUTHOR_MODEL;
       const messages = [];
       if (body.system) messages.push({ role: "system", content: body.system });
-      messages.push({ role: "user", content: body.user });
+      if (hasTurns) {
+        for (const m of body.messages) {
+          if (m && (m.role === "user" || m.role === "assistant") && m.content) {
+            messages.push({ role: m.role, content: String(m.content) });
+          }
+        }
+      } else {
+        messages.push({ role: "user", content: body.user });
+      }
 
       const requestBody = {
         model,
@@ -9487,7 +9500,12 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
      *   { content, parsed, raw, cost_usd_estimated, model }
      */
     async chatCompletion(body) {
-      if (!body?.user) throw new Error("chatCompletion: body.user is required");
+      // v4.47.3: optional multi-turn history. When body.messages[] is given,
+      // it's used INSTEAD of body.user — the Messages API takes alternating
+      // user/assistant turns natively. Backward compatible: every
+      // pre-v4.47.3 call site passes only { system, user }.
+      const hasTurns = Array.isArray(body?.messages) && body.messages.length > 0;
+      if (!body?.user && !hasTurns) throw new Error("chatCompletion: body.user or body.messages[] is required");
       const model = body.model || CLAUDE_DEFAULT_MODEL;
       const wantsJson = body.response_format?.type === "json_object";
 
@@ -9495,10 +9513,16 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
       // bootstrap-bible-class outputs (~4K).
       const max_tokens = typeof body.max_tokens === "number" ? body.max_tokens : 4000;
 
+      const turns = hasTurns
+        ? body.messages
+            .filter(m => m && (m.role === "user" || m.role === "assistant") && m.content)
+            .map(m => ({ role: m.role, content: String(m.content) }))
+        : [{ role: "user", content: body.user }];
+
       const requestBody = {
         model,
         max_tokens,
-        messages: [{ role: "user", content: body.user }],
+        messages: turns,
         temperature: typeof body.temperature === "number" ? body.temperature : 0.7,
       };
       if (body.system) requestBody.system = body.system;
@@ -13818,6 +13842,181 @@ JSON object only. No commentary. No fences. No trailing text.`;
     return [...missing.values()];
   }
   NS.detectMissingEntityRefs = detectMissingEntityRefs;
+
+  // ─── v4.47.3 — AI Producer Q&A chat ─────────────────────────────────────
+  //
+  // Conversational layer over the project: "what characters are missing in
+  // the cast vs the story?", "which shots have no approved take?". Every
+  // answer is grounded in a compact context pack built from live IDB —
+  // the same data the validators cross-reference, finally queryable as
+  // prose instead of per-shot badges.
+  //
+  // The `conversations` IDB store (defined in v1, dormant ever since)
+  // finally wakes up as the per-project chat history.
+
+  // Compact, token-bounded serialization of the whole project. ~2-6K
+  // tokens for a 10-shot film. Prose fields truncated so a pathological
+  // bible can't blow the context budget.
+  async function buildProjectContextPack() {
+    const project = await Storage.Projects.getActive();
+    const characters = await Storage.getAll("characters");
+    const environments = await Storage.getAll("environments");
+    const assets = await Storage.getAll("assets");
+    const shots = (await Storage.getAll("shots")).sort((a, b) => (a.shot_number || 0) - (b.shot_number || 0));
+    const trunc = (s, n) => { const v = String(s || "").trim(); return v.length > n ? v.slice(0, n - 1) + "…" : v; };
+    return {
+      project: {
+        display_name: project?.display_name,
+        logline: trunc(project?.logline, 300),
+        style_canon: trunc(project?.style_canon, 300),
+        medium: project?.medium,
+        genre: project?.genre,
+        world_rules: (project?.world_rules || []).slice(0, 6),
+      },
+      characters: characters.map(c => ({
+        id: c.id,
+        display_name: c.display_name,
+        role_in_story: c.identity?.role_in_story,
+        archetype: c.identity?.archetype,
+        distinctive_features: (c.physical?.distinctive_features || []).slice(0, 2),
+        has_refs: !!(c.refs?.user?.head_on?.dataUrl || c.refs?.seedream?.head_on?.dataUrl || c.refs?.gpt?.head_on?.dataUrl),
+        voice_id_set: !!(c.voice?.elevenlabs_fallback?.voice_id && c.voice.elevenlabs_fallback.voice_id !== "TBD"),
+      })),
+      environments: environments.map(e => ({
+        id: e.id,
+        display_name: e.display_name,
+        architecture_type: e.architecture?.type,
+      })),
+      assets: assets.map(a => ({ id: a.id, display_name: a.display_name, kind: a.kind })),
+      shots: shots.map(s => ({
+        id: s.id,
+        shot_number: s.shot_number,
+        display_name: s.display_name,
+        focal_point: trunc(s.the_moment?.focal_point, 200),
+        description: trunc(s.the_moment?.description, 200),
+        emotional_beat: trunc(s.the_moment?.emotional_beat, 100),
+        cast_in_frame: (s.cast_in_frame || []).map(c => typeof c === "string" ? c : c?.character_id).filter(Boolean),
+        cast_off_frame: (s.cast_off_frame || []).map(c => typeof c === "string" ? c : c?.character_id).filter(Boolean),
+        location_id: s.location?.location_id || null,
+        has_approved_take: (s.takes || []).some(t => t.status === "approved"),
+        validation_issues: (s._validation?.issues || []).map(i => i.kind),
+      })),
+    };
+  }
+  NS.buildProjectContextPack = buildProjectContextPack;
+
+  // Conversation persistence over the (previously dormant) conversations
+  // store. PROJECT_SCOPED, so Storage.put injects project_id and
+  // Storage.getAll filters to the active project automatically.
+  // autoIncrement keyPath "id" → omit id on put; rows come back ordered
+  // by insertion (id ascending).
+  async function saveConversationMessage({ role, content, suggested_actions, cost_usd }) {
+    return Storage.put("conversations", {
+      role,
+      content: String(content || ""),
+      suggested_actions: Array.isArray(suggested_actions) ? suggested_actions : [],
+      cost_usd: cost_usd || 0,
+      created_at: Date.now(),
+    });
+  }
+  NS.saveConversationMessage = saveConversationMessage;
+
+  async function loadConversation(limit = 50) {
+    const all = await Storage.getAll("conversations");
+    all.sort((a, b) => (a.id || 0) - (b.id || 0));
+    return all.slice(-limit);
+  }
+  NS.loadConversation = loadConversation;
+
+  async function clearConversation() {
+    const all = await Storage.getAll("conversations");
+    for (const row of all) await Storage.delete("conversations", row.id);
+    return all.length;
+  }
+  NS.clearConversation = clearConversation;
+
+  // Ask the Producer. Routes per project.ai_author_model (same prefix rule
+  // as aiAuthorProject), grounds the question in the context pack, and
+  // returns { answer_markdown, suggested_actions[], cost_usd, model }.
+  // history = [{ role, content }] (last N turns, oldest first).
+  async function askAIProducer(question, history = []) {
+    const q = String(question || "").trim();
+    if (q.length < 2) throw new Error("askAIProducer: question is required");
+    const project = await Storage.Projects.getActive();
+    const model = (project?.ai_author_model || NS.AI_AUTHOR_MODEL || "gpt-5.5").trim();
+    const isClaude = model.startsWith("claude-");
+    let client = isClaude ? State.anthropic : State.openai;
+    if (!client) {
+      throw new Error(isClaude
+        ? "Anthropic client not configured — redeploy the worker with /anthropic route, or switch the AI Director model to gpt-5.5."
+        : "OpenAI client not configured. Set the Worker URL in Connection settings.");
+    }
+    const pack = await buildProjectContextPack();
+    const system = [
+      `You are the AI Producer for "${pack.project.display_name || "this project"}" — the director's production assistant inside ElevenX.`,
+      "Answer questions about the project's bible and storyboard using ONLY the PROJECT CONTEXT JSON below.",
+      "Be precise: name entities by display_name AND id. When listing gaps (e.g. characters named in shot",
+      "focal_point/description prose but absent from that shot's cast_in_frame, or absent from the cast bible",
+      "entirely), enumerate them exactly — never vague.",
+      "Keep answers short: a few sentences or a tight list. No preamble.",
+      "",
+      "When your answer identifies entities that are MISSING from the bible (characters, environments, or",
+      "assets referenced in story prose but not in the bible lists), include them in suggested_actions so",
+      "the user can create them in one click.",
+      "",
+      'Output ONLY a JSON object: {"answer_markdown":"<answer; **bold** and line breaks allowed>",',
+      '"suggested_actions":[{"type":"create_character"|"create_environment"|"create_asset","display_name":"...","hint":"1 line of context"}]}',
+      "suggested_actions MUST be [] when nothing is missing.",
+      "",
+      "PROJECT CONTEXT:",
+      JSON.stringify(pack),
+    ].join("\n");
+    const turns = [
+      ...history.slice(-10).map(m => ({ role: m.role, content: m.content })),
+      { role: "user", content: q },
+    ];
+
+    let result;
+    try {
+      result = await client.chatCompletion({
+        system,
+        messages: turns,
+        model,
+        response_format: { type: "json_object" },
+        temperature: 0.3,
+        max_tokens: 1200,
+      });
+    } catch (err) {
+      // v4.43.1 pattern: Claude 404 (worker not redeployed) → single
+      // gpt-5.5 retry, visibly.
+      const is404 = isClaude && /\b404\b/.test(err?.message || "");
+      if (is404 && State.openai) {
+        toast(`⚠ Claude unavailable (worker not redeployed) — answered with gpt-5.5 instead.`, { tone: "warn", duration: 7000 });
+        await reportError(err, { tag: "producer-qa-fallback", userFacing: false, attempted_model: model });
+        result = await State.openai.chatCompletion({
+          system, messages: turns, model: "gpt-5.5",
+          response_format: { type: "json_object" }, temperature: 0.3, max_tokens: 1200,
+        });
+      } else {
+        throw err;
+      }
+    }
+
+    const parsed = result.parsed || {};
+    const answer = String(parsed.answer_markdown || result.content || "").trim();
+    if (!answer) throw new Error("Producer returned an empty answer — try rephrasing.");
+    const VALID_ACTION_TYPES = new Set(["create_character", "create_environment", "create_asset"]);
+    const actions = (Array.isArray(parsed.suggested_actions) ? parsed.suggested_actions : [])
+      .filter(a => a && VALID_ACTION_TYPES.has(a.type) && a.display_name)
+      .slice(0, 6);
+    return {
+      answer_markdown: answer,
+      suggested_actions: actions,
+      cost_usd: result.cost_usd_estimated || 0,
+      model: result.model,
+    };
+  }
+  NS.askAIProducer = askAIProducer;
   NS.AI_AUTHOR_PROJECT_COST_CEILING = AI_AUTHOR_PROJECT_COST_CEILING;
 
   // v4.42 M-AI-1b: persist a set of accepted bootstrap proposals into IDB.
@@ -21321,6 +21520,27 @@ JSON object only. No commentary. No fences. No trailing text.`;
             <p style="margin:0;"><strong>Cost</strong>: ~$0.30–$0.80 per generation, hard-capped at $1.50. After accepting, cast / location reference images cost $0.05 each via Seedream.</p>
           </div>
         </details>
+
+        <!-- v4.47.3: Ask the Producer — conversational Q&A over the project -->
+        <div style="border-top:1px solid #2a2a35; margin-top:20px; padding-top:20px;">
+          <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:10px;">
+            <h2 style="margin:0; font-size:15px; font-weight:600;">Ask the Producer</h2>
+            <button id="elx-producer-qa-clear" type="button"
+              style="background:none; border:none; color:#6a6a78; font-size:11px; cursor:pointer; padding:2px 6px;">Clear chat</button>
+          </div>
+          <p style="margin:0 0 12px; font-size:11.5px; color:#9a9aab; line-height:1.5;">
+            Questions about your project — answered from the live bible + storyboard. Try: <em>"what characters are missing in the cast vs the story?"</em> · <em>"which shots have no approved take?"</em>
+          </p>
+          <div id="elx-producer-qa" style="display:flex; flex-direction:column; gap:10px; max-height:420px; overflow-y:auto; margin-bottom:12px;"></div>
+          <div style="display:flex; gap:8px;">
+            <input id="elx-producer-qa-input" type="text"
+              placeholder="Ask anything about the project…"
+              style="${FIELD_INPUT_STYLE} flex:1;">
+            <button id="elx-producer-qa-send" type="button"
+              style="background:#c9a25a; color:#14141a; border:none; padding:8px 18px;
+                     border-radius:6px; font-size:12.5px; font-weight:600; cursor:pointer;">Ask</button>
+          </div>
+        </div>
       </div>
     `;
 
@@ -21394,6 +21614,114 @@ JSON object only. No commentary. No fences. No trailing text.`;
     const onStoryboard = () => handleAIProducerSubmit("generate_storyboard");
     $("#elx-producer-bootstrap").addEventListener("click", onBootstrap);
     $("#elx-producer-storyboard").addEventListener("click", onStoryboard);
+
+    // ── v4.47.3 — Ask the Producer wiring ─────────────────────────────
+    const qaList = $("#elx-producer-qa", s1Section);
+    const qaInput = $("#elx-producer-qa-input", s1Section);
+    const qaSend = $("#elx-producer-qa-send", s1Section);
+    const qaClear = $("#elx-producer-qa-clear", s1Section);
+    if (qaList && qaInput && qaSend) {
+      // Markdown-lite: escape, then **bold** + line breaks. Enough for the
+      // Producer's terse answers without pulling a renderer into the bundle.
+      const mdLite = (s) => esc(s)
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/\n/g, "<br>");
+      const appendBubble = ({ role, content, suggested_actions }) => {
+        const isUser = role === "user";
+        const el = document.createElement("div");
+        el.style.cssText = `
+          max-width:88%; padding:9px 13px; border-radius:10px; font-size:12.5px; line-height:1.55;
+          ${isUser
+            ? "align-self:flex-end; background:rgba(201,162,90,0.14); border:1px solid rgba(201,162,90,0.35); color:#e8e8ee;"
+            : "align-self:flex-start; background:#14141a; border:1px solid #2a2a35; color:#c8c8d4;"}
+        `;
+        el.innerHTML = mdLite(content);
+        // Action chips under assistant answers that identified missing entities
+        const actions = Array.isArray(suggested_actions) ? suggested_actions : [];
+        if (!isUser && actions.length > 0) {
+          const chips = document.createElement("div");
+          chips.style.cssText = "display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;";
+          for (const a of actions) {
+            const chip = document.createElement("button");
+            chip.type = "button";
+            const noun = a.type === "create_character" ? "character" : a.type === "create_environment" ? "location" : "asset";
+            chip.textContent = `✨ Create ${a.display_name} (${noun})`;
+            chip.style.cssText = `
+              background:transparent; color:#c9a25a; border:1px solid #c9a25a;
+              padding:4px 10px; border-radius:12px; font-size:11px; font-weight:600; cursor:pointer;`;
+            chip.addEventListener("click", () => {
+              // Hand off to the matching create modal; mountAiFillButton
+              // picks up the prefill and auto-fires the ✨ fill (v4.47.2).
+              State._pendingEntityPrefill = {
+                entityType: noun === "location" ? "environment" : noun,
+                display_name: a.display_name,
+                hint: a.hint || "",
+              };
+              if (a.type === "create_character") showCreateCharacterModal();
+              else if (a.type === "create_environment") showCreateEnvironmentModal();
+              else showCreateAssetModal();
+            });
+            chips.appendChild(chip);
+          }
+          el.appendChild(chips);
+        }
+        qaList.appendChild(el);
+        qaList.scrollTop = qaList.scrollHeight;
+      };
+
+      // Render persisted history (the dormant conversations store, alive).
+      loadConversation(50).then(rows => {
+        for (const r of rows) appendBubble(r);
+      }).catch(err => reportError(err, { tag: "producer-qa", userFacing: false, phase: "load-history" }));
+
+      const ask = async () => {
+        const q = qaInput.value.trim();
+        if (q.length < 2) { qaInput.focus(); return; }
+        qaInput.value = "";
+        qaSend.disabled = true;
+        appendBubble({ role: "user", content: q });
+        await saveConversationMessage({ role: "user", content: q }).catch(() => {});
+        // Thinking indicator
+        const thinking = document.createElement("div");
+        thinking.style.cssText = "align-self:flex-start; color:#6a6a78; font-size:11.5px; padding:4px 13px;";
+        thinking.textContent = "Producer is thinking…";
+        qaList.appendChild(thinking);
+        qaList.scrollTop = qaList.scrollHeight;
+        try {
+          const history = (await loadConversation(20))
+            .filter(r => r.role === "user" || r.role === "assistant")
+            .slice(0, -1)  // exclude the question we just saved — passed separately
+            .map(r => ({ role: r.role, content: r.content }));
+          const result = await askAIProducer(q, history);
+          thinking.remove();
+          appendBubble({ role: "assistant", content: result.answer_markdown, suggested_actions: result.suggested_actions });
+          await saveConversationMessage({
+            role: "assistant",
+            content: result.answer_markdown,
+            suggested_actions: result.suggested_actions,
+            cost_usd: result.cost_usd,
+          }).catch(() => {});
+          if (result.cost_usd) await trackCost(result.cost_usd, "AI Producer Q&A");
+        } catch (err) {
+          thinking.remove();
+          appendBubble({ role: "assistant", content: `⚠ ${err.message}` });
+          await reportError(err, { tag: "producer-qa", userFacing: false, question_length: q.length });
+        } finally {
+          qaSend.disabled = false;
+          qaInput.focus();
+        }
+      };
+      qaSend.addEventListener("click", ask);
+      qaInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); ask(); } });
+      if (qaClear) {
+        qaClear.addEventListener("click", async () => {
+          if (!confirm("Clear the Producer chat history for this project?")) return;
+          const n = await clearConversation();
+          qaList.innerHTML = "";
+          toast(`Cleared ${n} message${n === 1 ? "" : "s"}.`);
+        });
+      }
+    }
   }
 
   // v4.42 M-AI-1c: AI Producer chat submit handler. Reads the form, fires
@@ -24417,6 +24745,17 @@ JSON object only. No commentary. No fences. No trailing text.`;
         btn.textContent = "✨ Fill with AI";
       }
     });
+
+    // v4.47.3: hand-off from the Producer Q&A action chips. A chip sets
+    // State._pendingEntityPrefill before opening this modal; we consume it
+    // here — prefill the name and auto-fire the ✨ fill. Cleared on use so
+    // a manually-opened modal later isn't surprised.
+    const pending = State._pendingEntityPrefill;
+    if (pending && pending.entityType === entityType && pending.display_name) {
+      State._pendingEntityPrefill = null;
+      nameEl.value = pending.display_name;
+      setTimeout(() => btn.click(), 60);
+    }
   }
   NS.mountAiFillButton = mountAiFillButton;
 
