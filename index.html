@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="f0b9d42e57b4" data-build-time="2026-06-10T10:40:02.035Z">
+<meta name="elevenx-build" content="3746d58e37a6" data-build-time="2026-06-10T11:23:44.217Z">
 <script>
 (function(){
-  var info = { hash: "f0b9d42e57b4", time: "2026-06-10T10:40:02.035Z" };
+  var info = { hash: "3746d58e37a6", time: "2026-06-10T11:23:44.217Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: f0b9d42e57b4 @ 2026-06-10T10:40:02.035Z -->
+<!-- elevenx-build: 3746d58e37a6 @ 2026-06-10T11:23:44.217Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -6350,6 +6350,27 @@ class FalClient {
     }
   }
 
+  // ─── v4.47.5: cancel a queued/running fal job ─────────────────────────
+  // Best-effort: fal cancels jobs still IN_QUEUE reliably; an IN_PROGRESS
+  // render may complete (and bill) anyway. The caller owns the honest
+  // messaging. cancel_url lives on queue.fal.run, so the existing
+  // #rewriteToWorker /fal/* route proxies it — no worker changes.
+  async cancelRequest(pending) {
+    if (!pending?.cancel_url) {
+      throw new Error("cancelRequest: pending bag has no cancel_url (job submitted before v4.47.5 — not cancellable from the app)");
+    }
+    const url = this.#rewriteToWorker(pending.cancel_url);
+    this.onLog(`→ CANCEL ${pending.request_id || "?"} (${pending.endpoint || "?"})`);
+    const res = await this.fetch(url, { method: "PUT" });
+    // fal returns 202 on accepted cancellation; 400-class if already done.
+    if (!res.ok && res.status !== 202) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`fal cancel failed: ${res.status} — ${t.slice(0, 200)}`);
+    }
+    this.onLog(`  ✓ cancel accepted (status ${res.status})`);
+    return { canceled: true, status: res.status };
+  }
+
   // ─── Kling fallback ────────────────────────────────────────────────────
 
   async klingProImageToVideo(body, opts = {}) {
@@ -6612,6 +6633,10 @@ class FalClient {
           request_id: submitJson.request_id,
           status_url: submitJson.status_url,
           response_url: submitJson.response_url,
+          // v4.47.5: capture cancel_url so a running roll can be stopped.
+          // Present in fal's queue submit response since forever — we just
+          // never stored it, which made every roll unstoppable from the app.
+          cancel_url: submitJson.cancel_url,
           endpoint,
           submitted_at: Date.now(),
         });
@@ -6625,6 +6650,22 @@ class FalClient {
     let lastLog = 0;
 
     while (true) {
+      // v4.47.5: caller-controlled abort. Checked every poll iteration so
+      // a GPS "✕ Cancel roll" click stops the loop within ~2s. The flagged
+      // error lets handleRollShot treat it as a quiet cancel, not a failure.
+      if (typeof opts.shouldAbort === "function" && opts.shouldAbort()) {
+        const err = new Error(`fal poll aborted by user for ${endpoint}`);
+        err._fal_aborted = true;
+        err._fal_pending = {
+          request_id: submitJson.request_id,
+          status_url: submitJson.status_url,
+          response_url: submitJson.response_url,
+          cancel_url: submitJson.cancel_url,
+          endpoint,
+          submitted_at: start,
+        };
+        throw err;
+      }
       if (Date.now() - start > maxWaitMs) {
         // v4.26: attach the submit metadata to the error so the caller
         // can persist it + retry via resumeFalPolling.
@@ -6633,6 +6674,7 @@ class FalClient {
           request_id: submitJson.request_id,
           status_url: submitJson.status_url,
           response_url: submitJson.response_url,
+          cancel_url: submitJson.cancel_url,
           endpoint,
           submitted_at: start,
         };
@@ -10436,6 +10478,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
     costSpentUsd: 0,
     activeJobs: 0,
     activeShotId: null,         // currently open in Shot Editor
+    activeRoll: null,           // v4.47.5: { shotId, pending, abort } while a roll is in flight
   };
 
   // Image-generation models registry. Both stay wired in the backend so we
@@ -18242,18 +18285,29 @@ JSON object only. No commentary. No fences. No trailing text.`;
         : sfxReady > 0
         ? `<span title="${sfxReady} SFX event${sfxReady === 1 ? "" : "s"} ready in FCPXML" style="position:absolute; top:8px; right:8px; background:rgba(74,222,128,0.12); color:#4ade80; border:1px solid rgba(74,222,128,0.35); padding:3px 7px; border-radius:3px; font-size:10px; font-weight:600;">🎚️ ${sfxReady}✓</span>`
         : "";
+      // v4.47.5 F4: a keyframe-only thumbnail is visually identical to a
+      // rolled take — the rehearsal agent misread an anchor still as a
+      // finished clip. When the thumb came from keyframes.startDataUrl and
+      // the shot has zero takes, say so on the card.
+      const thumbIsKeyframeOnly = !!thumbUrl && !approved && !latestTake && !!s.keyframes?.startDataUrl;
+      const anchorTag = thumbIsKeyframeOnly
+        ? `<span title="This is the approved start keyframe (a still image) — no video has been rolled yet." style="position:absolute; bottom:36px; left:8px; background:rgba(20,20,26,0.92); color:#c9a25a; border:1px solid rgba(201,162,90,0.45); padding:2px 7px; border-radius:3px; font-size:9.5px; font-weight:600; letter-spacing:0.03em;">⚓ anchor frame · not rolled</span>`
+        : "";
       card.innerHTML = `
         <div class="elx-shot__thumb-only" style="${thumbStyle}">
           <span class="mode-pill ${modeClass} elx-shot__mode-corner">${modeShort}</span>
           ${issueBadge}
           ${sfxBadge}
+          ${anchorTag}
           <div class="elx-shot__overlay">
             <span class="elx-shot__num">${esc(shotNum)}</span>
             <span class="elx-shot__name">${esc(s.display_name || s.id)}</span>
             ${summary ? `<span class="elx-shot__summary" style="display:block; font-size:10.5px; color:#c0c0ce; line-height:1.35; margin-top:4px; font-style:italic;">${esc(summary)}</span>` : ""}
           </div>
           ${!thumbUrl ? `<div class="elx-shot__empty-hint">no take yet</div>` : ""}
-          <button class="btn elx-shot__hover-cta" data-action="roll-shot" data-shot-id="${esc(s.id)}">
+          <button class="btn elx-shot__hover-cta" data-action="roll-shot" data-shot-id="${esc(s.id)}"
+                  style="top:auto; bottom:8px; left:50%; transform:translateX(-50%); padding:4px 12px; font-size:11px;"
+                  title="PAID render — a confirm dialog with the cost estimate shows before anything is submitted.">
             ${approved ? `↻ Re-roll · $${estCost}` : `▶ Roll Seedance · $${estCost}`}
           </button>
         </div>
@@ -20197,7 +20251,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         `${completed+1}/${pending.length} · est $${((s.timecode?.duration_seconds||0)*0.30).toFixed(2)}`,
         (completed / pending.length) * 100);
       try {
-        await handleRollShot(s.id);
+        // v4.47.5: the batch confirm above covered the total — skip the
+        // per-shot PAID-render confirm so 10 shots don't mean 10 dialogs.
+        await handleRollShot(s.id, { skipConfirm: true });
       } catch (err) {
         console.error(`[batch-roll] ${s.id} failed:`, err);
       }
@@ -20211,7 +20267,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
     toast(`Batch complete · ${completed}/${pending.length} shots rolled${skippedSuffix}.`);
   }
 
-  async function handleRollShot(shotId) {
+  async function handleRollShot(shotId, opts = {}) {
     if (!State.fal) { toast("Set your Worker URL first.", { tone: "warn" }); showConnectionPanel(); return; }
     const shot = await Storage.get("shots", shotId);
     if (!shot) return;
@@ -20670,6 +20726,28 @@ JSON object only. No commentary. No fences. No trailing text.`;
       return;
     }
 
+    // v4.47.5 F1 — PAID-render confirm. Caught live during the rehearsal
+    // smoke: a click meant as navigation landed on the storyboard hover
+    // CTA and committed ~$2.42 with zero confirmation. v4.36 removed
+    // AUTO-roll but never gated the manual click itself. Every roll entry
+    // point now passes through this one confirm; the batch path
+    // (roll-all-pending) confirms ONCE with the total and passes
+    // skipConfirm per shot. Dry-run above never reaches here ($0).
+    if (!opts.skipConfirm) {
+      const shotLabel = `S${String(shot.shot_number || "?").padStart(2, "0")} "${shot.display_name || shotId}"`;
+      const ok = confirm(
+        `Roll ${routing.engine} for ${shotLabel}?\n\n` +
+        `Estimated cost: ${fmtUsd(estCost)} — this is a PAID render.\n\n` +
+        `OK to roll · Cancel to abort (nothing submitted, nothing billed).`
+      );
+      if (!ok) {
+        toast(`Roll canceled — nothing submitted, nothing billed.`, { duration: 4000 });
+        State.activeJobs--;
+        setGPS(false);
+        return;
+      }
+    }
+
     // v4.27 unified routing: routing.engine is the dispatch decision.
     // Gate state overrides bible-declared mode. The pre-v4.27 routing
     // only fired Kling for shots whose bible mode was image_to_video, so
@@ -20690,8 +20768,13 @@ JSON object only. No commentary. No fences. No trailing text.`;
       let result;
       // v4.26: onSubmit callback persists request_id + status/response
       // URLs to the shot the moment fal acknowledges the submission.
+      // v4.47.5: also registers State.activeRoll so the GPS overlay can
+      // surface a ✕ Cancel control, and threads shouldAbort into the
+      // poll loop so the cancel takes effect within ~2s.
       const submitOpts = {
         onSubmit: async (meta) => {
+          State.activeRoll = { shotId, pending: meta, abort: { requested: false } };
+          renderRollCancelAffordance();
           try {
             const fresh = await Storage.get("shots", shotId);
             fresh.keyframes = fresh.keyframes || {};
@@ -20707,6 +20790,7 @@ JSON object only. No commentary. No fences. No trailing text.`;
             console.warn("[v4.26] failed to persist pending metadata:", err);
           }
         },
+        shouldAbort: () => !!State.activeRoll?.abort?.requested,
       };
 
       // v4.27: dispatch on engine, not composer_mode. The composer mode
@@ -20882,6 +20966,24 @@ JSON object only. No commentary. No fences. No trailing text.`;
         toast(`Shot has dialogue but ElevenLabs isn't configured — set the API key in Connection to enable auto-VO.`, { tone: "warn", duration: 7000 });
       }
     } catch (err) {
+      // v4.47.5: user-initiated cancel is a quiet exit, not a failure.
+      // The cancelRequest PUT already fired from the GPS affordance; we
+      // just clear the pending metadata so recovery doesn't resurrect it.
+      if (err._fal_aborted) {
+        try {
+          const fresh = await Storage.get("shots", shotId);
+          if (fresh?.keyframes?._pending_seedance) {
+            fresh.keyframes._pending_seedance = null;
+            await Storage.put("shots", fresh);
+          }
+        } catch { /* best effort */ }
+        toast(
+          `Roll canceled for ${shot.display_name || shotId}. Cancel was sent to fal — if the render had already finished server-side, the charge may still apply.`,
+          { tone: "warn", duration: 8000 }
+        );
+        await reportError(err, { tag: "roll-shot-canceled", userFacing: false, shotId, request_id: err._fal_pending?.request_id });
+        return;
+      }
       // v4.26: detect timeout-with-pending-job and surface the recovery
       // affordance instead of treating it as a generic failure. The
       // shot's _pending_seedance was already persisted via onSubmit, so
@@ -20916,8 +21018,80 @@ JSON object only. No commentary. No fences. No trailing text.`;
     } finally {
       setGPS(false);
       State.activeJobs--;
+      // v4.47.5: roll finished/failed/canceled — drop the cancel affordance.
+      State.activeRoll = null;
+      renderRollCancelAffordance();
     }
   }
+
+  // ─── v4.47.5 — GPS cancel affordance + DevTools cancel helper ────────
+  //
+  // While a roll is in flight (State.activeRoll set by onSubmit), a small
+  // "✕ Cancel roll" button floats next to the GPS overlay. Clicking it
+  // flips the abort flag (the poll loop exits within one interval) and
+  // best-effort PUTs fal's cancel_url. Honest by design: an IN_PROGRESS
+  // render may complete server-side and still bill — the toast says so.
+  function renderRollCancelAffordance() {
+    const existing = document.getElementById("elx-roll-cancel");
+    if (!State.activeRoll) {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) return;  // already showing
+    const btn = document.createElement("button");
+    btn.id = "elx-roll-cancel";
+    btn.type = "button";
+    btn.textContent = "✕ Cancel roll";
+    btn.title = "Stop polling and ask fal to cancel this render. If the render already finished server-side, the charge may still apply.";
+    btn.style.cssText = `
+      position: fixed; top: 12px; right: 16px; z-index: 9650;
+      background: #14141a; color: #f87171; border: 1px solid #f87171;
+      padding: 6px 12px; border-radius: 6px; font-size: 11.5px; font-weight: 600;
+      cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+      font-family: Inter, system-ui, sans-serif;
+    `;
+    btn.addEventListener("click", async () => {
+      const active = State.activeRoll;
+      if (!active) { btn.remove(); return; }
+      btn.disabled = true;
+      btn.textContent = "Canceling…";
+      active.abort.requested = true;  // poll loop exits within ~2s
+      try {
+        if (active.pending?.cancel_url && State.fal) {
+          await State.fal.cancelRequest(active.pending);
+        }
+      } catch (err) {
+        // Cancel PUT failing is non-fatal — the poll abort already stops
+        // the client side; the render may simply complete unwatched.
+        await reportError(err, { tag: "roll-cancel", userFacing: false, shotId: active.shotId });
+      }
+    });
+    document.body.appendChild(btn);
+  }
+  NS.renderRollCancelAffordance = renderRollCancelAffordance;
+
+  // DevTools symmetry with __recoverPendingTake: cancel a roll whose page
+  // was reloaded mid-flight (no State.activeRoll, but _pending_seedance
+  // persisted with cancel_url since v4.47.5).
+  async function __cancelPendingRoll(shotId) {
+    const shot = await Storage.get("shots", shotId);
+    const pending = shot?.keyframes?._pending_seedance;
+    if (!pending) {
+      toast(`No pending roll on ${shotId}.`, { tone: "warn" });
+      return { canceled: false, reason: "no_pending" };
+    }
+    let result = { canceled: false };
+    try {
+      if (pending.cancel_url && State.fal) result = await State.fal.cancelRequest(pending);
+    } catch (err) {
+      await reportError(err, { tag: "roll-cancel", userFacing: true, shotId });
+    }
+    shot.keyframes._pending_seedance = null;
+    await Storage.put("shots", shot);
+    toast(`Pending roll cleared for ${shotId}.${result.canceled ? " Cancel sent to fal." : ""} If the render already finished server-side, the charge may still apply.`, { tone: "warn", duration: 8000 });
+    return result;
+  }
+  NS.__cancelPendingRoll = __cancelPendingRoll;
 
   // ─── Helpers ────────────────────────────────────────────────────────
   async function blobToDataUrl(blob) {
