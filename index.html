@@ -4166,10 +4166,10 @@ a { color: inherit; text-decoration: none; }
 </style>
 
 
-<meta name="elevenx-build" content="3746d58e37a6" data-build-time="2026-06-10T11:23:44.217Z">
+<meta name="elevenx-build" content="c9a0ae1b0254" data-build-time="2026-06-10T12:09:18.064Z">
 <script>
 (function(){
-  var info = { hash: "3746d58e37a6", time: "2026-06-10T11:23:44.217Z" };
+  var info = { hash: "c9a0ae1b0254", time: "2026-06-10T12:09:18.064Z" };
   window.BUILD_INFO = info;
   (window.ElevenX = window.ElevenX || {}).BUILD_INFO = info;
   // Self-healing: if anything later wipes window.ElevenX or BUILD_INFO,
@@ -4189,7 +4189,7 @@ a { color: inherit; text-decoration: none; }
 </script>
 
 </head>
-<!-- elevenx-build: 3746d58e37a6 @ 2026-06-10T11:23:44.217Z -->
+<!-- elevenx-build: c9a0ae1b0254 @ 2026-06-10T12:09:18.064Z -->
 <body>
 
 <!-- Splash thumbnail for the standalone bundle. -->
@@ -7755,6 +7755,10 @@ function composeActionBeat({ shot, cast, environment, criticalProps, camera, aud
 
   // BEAT 2: middle — the verb-driven action
   const middle = [];
+  // v4.47.6: blocking-derived movement line with screen direction — the
+  // 180°-rule primitive. Empty string for static / unblocked shots.
+  const movementLine = blockingMovementLine(shot, environment);
+  if (movementLine) middle.push(movementLine);
   if (shot.the_moment?.verb && shot.the_moment?.focal_point) {
     // YAML verbs use snake_case ("cuts_off", "turns_back"); render as prose
     const verbProse = capitalize(String(shot.the_moment.verb).replace(/_/g, " "));
@@ -8572,6 +8576,109 @@ function speedRampPromptBias(speedRamp) {
   }
 }
 
+// ─── v4.47.6 — Spatial layer (world map + blocking → prompt language) ──────
+//
+// Prompt-native spatial structure: named zones, connections, landmarks with
+// fixed relative positions, and screen-direction enums. NO coordinates, NO
+// camera solver — language the image/video models actually respond to.
+// shot.blocking === null means "no spatial data authored" and every consumer
+// below returns null/empty, keeping pre-v4.47.6 behavior byte-identical.
+
+function shotIsCrossZone(shot) {
+  const b = shot?.blocking;
+  return !!(b?.start?.zone && b?.end?.zone && b.start.zone !== b.end.zone);
+}
+
+function zoneById(environment, zoneId) {
+  if (!zoneId) return null;
+  return (environment?.zones || []).find(z => z?.id === zoneId) || null;
+}
+
+function facingPhrase(facing) {
+  switch (facing) {
+    case "frame_left":       return "facing frame-left";
+    case "frame_right":      return "facing frame-right";
+    case "toward_camera":    return "facing toward the camera";
+    case "away_from_camera": return "facing away from the camera, into the depth of the scene";
+    default:                 return "";
+  }
+}
+
+// Travel direction for movement prose, derived from the start point's facing.
+function travelPhrase(facing) {
+  switch (facing) {
+    case "frame_left":       return "traveling right-to-left across the frame";
+    case "frame_right":      return "traveling left-to-right across the frame";
+    case "toward_camera":    return "moving toward the camera";
+    case "away_from_camera": return "moving away from the camera, deeper into the scene";
+    default:                 return "";
+  }
+}
+
+function landmarkGeographyLine(environment) {
+  const landmarks = (environment?.landmarks || []).filter(l => l?.name && l?.fixed_position);
+  if (landmarks.length === 0) return "";
+  return `Fixed geography (identical in every frame of this environment): ${landmarks.map(l => `${l.name} — ${l.fixed_position}`).join("; ")}.`;
+}
+
+// [Spatial] block for keyframe prompts. slot = "start" | "end".
+function buildSpatialKeyframeBlock(shot, slot, environment) {
+  const b = shot?.blocking;
+  if (!b) return null;
+  const point = slot === "end" ? b.end : b.start;
+  if (!point || (!point.zone && !point.position_note)) return null;
+  const zone = zoneById(environment, point.zone);
+  const lines = [];
+  const placeName = zone?.name || point.zone || "";
+  if (placeName) {
+    lines.push(`The character is at: ${placeName}${zone?.description ? ` (${zone.description})` : ""}.`);
+  }
+  if (point.position_note) lines.push(`${point.position_note}.`);
+  const f = facingPhrase(point.facing);
+  if (f) lines.push(`They are ${f}.`);
+  const geo = landmarkGeographyLine(environment);
+  if (geo) lines.push(geo);
+  if (lines.length === 0) return null;
+  return `[Spatial] ${lines.join(" ")}`;
+}
+
+// Cross-zone replacement for the v4.36 exact [Composition Lock]. The exact
+// lock is correct for static state-changes but actively wrong for movement
+// shots — it forces near-identical frames or the model breaks it and
+// re-rolls the geography (the S02 statue-side-swap audit finding).
+function buildTrackingLockText(shot, environment) {
+  const b = shot?.blocking || {};
+  const startZone = zoneById(environment, b.start?.zone);
+  const endZone   = zoneById(environment, b.end?.zone);
+  const startName = startZone?.name || b.start?.zone || "the start position";
+  const endName   = endZone?.name || b.end?.zone || "the end position";
+  const geo = landmarkGeographyLine(environment);
+  return [
+    `[Tracking Lock] The first input image is the APPROVED START FRAME of this shot — the character was at ${startName}.`,
+    `This is a MOVEMENT shot: the camera has TRACKED with the subject. Same environment, same lighting direction, same materials and fixed geography${geo ? ` (${geo.replace(/^Fixed geography [^:]*: /, "").replace(/\.$/, "")})` : ""},`,
+    `but the character is NOW at ${endName}${b.end?.position_note ? ` — ${b.end.position_note}` : ""}.`,
+    b.path_note ? `They got there by: ${b.path_note}.` : "",
+    `Do NOT reproduce the start frame's composition — the framing has moved with the subject and the visible slice of the environment has shifted accordingly.`,
+    `The second input image is the character's identity reference.`,
+  ].filter(Boolean).join(" ");
+}
+
+// Movement line for the video prompt's [Action Sequence] beat. Returns ""
+// for static / unblocked shots.
+function blockingMovementLine(shot, environment) {
+  if (!shotIsCrossZone(shot)) return "";
+  const b = shot.blocking;
+  const startZone = zoneById(environment, b.start?.zone);
+  const endZone   = zoneById(environment, b.end?.zone);
+  const travel = travelPhrase(b.start?.facing);
+  return [
+    `Movement: from ${startZone?.name || b.start.zone} to ${endZone?.name || b.end.zone}`,
+    travel ? `, ${travel}` : "",
+    b.path_note ? `. ${capitalize(b.path_note)}` : "",
+    `.`,
+  ].join("").replace(/\.\.$/, ".");
+}
+
 
 /* === auto-exposed to ElevenX namespace === */
 window.ElevenX.composeSeedance = composeSeedance;
@@ -8592,6 +8699,10 @@ window.ElevenX.GENRE_PRESETS = GENRE_PRESETS;
 window.ElevenX.SPEED_RAMP_PRESETS = SPEED_RAMP_PRESETS;
 window.ElevenX.genrePromptBias = genrePromptBias;
 window.ElevenX.speedRampPromptBias = speedRampPromptBias;
+window.ElevenX.shotIsCrossZone = shotIsCrossZone;
+window.ElevenX.buildSpatialKeyframeBlock = buildSpatialKeyframeBlock;
+window.ElevenX.buildTrackingLockText = buildTrackingLockText;
+window.ElevenX.blockingMovementLine = blockingMovementLine;
 
 })();
 </script>
@@ -9782,6 +9893,13 @@ window.ElevenX.chainSeedanceClips = chainSeedanceClips;
     speedRampPromptBias:                   NS.speedRampPromptBias,
     GENRE_PRESETS:                         NS.GENRE_PRESETS,
     SPEED_RAMP_PRESETS:                    NS.SPEED_RAMP_PRESETS,
+    // v4.47.6: spatial layer — world map + blocking → prompt language.
+    // Keyframe-gen in main.js consumes these so prompt wording stays
+    // single-sourced in composer.js.
+    shotIsCrossZone:                       NS.shotIsCrossZone,
+    buildSpatialKeyframeBlock:             NS.buildSpatialKeyframeBlock,
+    buildTrackingLockText:                 NS.buildTrackingLockText,
+    blockingMovementLine:                  NS.blockingMovementLine,
   };
   NS.modeResolver = {
     resolveMode:    NS.resolveMode,
@@ -9886,7 +10004,15 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
   // [Style Canon] + [Aesthetic] + [Camera] bias. shot.speed_ramp default
   // "auto" adds 1-2 qualifier sentences to the [Action Sequence] block per
   // preset. One UI choice → many composer-prompt decisions.
-  const DB_VER  = 9;
+  //
+  // v10: spatial layer (v4.47.6). environment.zones[] (named places with
+  // connects_to, incl. cross-env "<env_id>:<zone_id>" links) +
+  // environment.landmarks[] (fixed relative positions) + shot.blocking
+  // ({ start, end, path_note } — where the avatar starts/ends and which
+  // screen direction they face/move). Prompt-native world map: the
+  // composer compiles these into [Spatial] / [Tracking Lock] blocks so
+  // movement shots stop re-rolling the environment's geography per frame.
+  const DB_VER  = 10;
 
   // The stores that get the project_id filter treatment.
   const PROJECT_SCOPED = ["characters", "environments", "assets", "shots", "takes", "conversations"];
@@ -10069,7 +10195,7 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
         // (caught 2026-05-20: v6's project cursor was being clobbered by
         // v7's project cursor when a fresh IDB ran all migrations at once).
         // Idempotent — every assignment guards on `=== undefined`.
-        if (oldVersion < 9) {
+        if (oldVersion < 10) {
           // Projects: v6 added `aspect`, v7 added `ai_author_model`,
           // v9 added `genre`. Single cursor walk over projects.
           const projOs = txn.objectStore("projects");
@@ -10122,6 +10248,27 @@ window.ElevenX.SEED_DATA = {"characters":[{"id":"aisha","display_name":"Aisha Be
               if (row.speed_ramp === undefined) {
                 row.speed_ramp = "auto"; dirty = true;
               }
+              // v10: blocking = null sentinel — "no spatial data authored".
+              // The composer treats null as legacy/static and keeps the
+              // exact pre-v4.47.6 behavior (backward compatible).
+              if (row.blocking === undefined) {
+                row.blocking = null; dirty = true;
+              }
+              if (dirty) c.update(row);
+              c.continue();
+            };
+          }
+          // Environments: v10 added zones[] + landmarks[] (the world map).
+          if (db.objectStoreNames.contains("environments")) {
+            const envOs = txn.objectStore("environments");
+            const ecur = envOs.openCursor();
+            ecur.onsuccess = (ev) => {
+              const c = ev.target.result;
+              if (!c) return;
+              const row = c.value;
+              let dirty = false;
+              if (!Array.isArray(row.zones)) { row.zones = []; dirty = true; }
+              if (!Array.isArray(row.landmarks)) { row.landmarks = []; dirty = true; }
               if (dirty) c.update(row);
               c.continue();
             };
@@ -17274,6 +17421,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         props: e.props || [],
         ambient_sound: e.ambient_sound || "",
         continuity_locks: e.continuity_locks || [],
+        // v4.47.6 spatial layer — the world map travels with the bible.
+        zones: Array.isArray(e.zones) ? e.zones : [],
+        landmarks: Array.isArray(e.landmarks) ? e.landmarks : [],
         refs: { user: {}, seedream: {}, gpt: {} },
         chosenModel: null,
         created_at: new Date().toISOString().slice(0, 10),
@@ -17551,6 +17701,9 @@ JSON object only. No commentary. No fences. No trailing text.`;
         cast_in_frame: remappedCastInFrame,
         cast_lockdown_required: (remappedCastInFrame || []).length >= 3,
         generation: s.generation || { mode: "auto" },
+        // v4.47.6 spatial layer — blocking travels with the bible. Null
+        // (legacy/static) keeps composer behavior identical to pre-spatial.
+        blocking: s.blocking || null,
         prompt_engineering: s.prompt_engineering || {},
         // v4.16: auto-mirror cast_in_frame[].dialogue → voiceover[]. Audit
         // (2026-05-16) found dialogue was split across two stores —
@@ -19472,17 +19625,36 @@ JSON object only. No commentary. No fences. No trailing text.`;
       shot.keyframes?.start?.approved_dataUrl
     ) ? shot.keyframes.start.approved_dataUrl : null;
 
+    // v4.47.6: [Spatial] block — where the character is in the world map
+    // (zone + position + facing + the env's fixed landmark geography).
+    // Null when shot.blocking is null (legacy/static) → prompt unchanged.
+    const spatialBlock = composer.buildSpatialKeyframeBlock?.(shot, slot, environment) || null;
+    const spatialPromptText = spatialBlock
+      ? `${promptText}\n\n${spatialBlock}`
+      : promptText;
+
     // v4.36: prepend an explicit composition-locking instruction to the
     // prompt when a composition anchor is in play. The first image
     // Seedream sees is the composition anchor (start frame), the second
     // is the character ref. The model needs to know WHICH role each
     // image plays — otherwise it might blend them naively.
-    const finalPromptText = compositionAnchor
-      ? [
-          `[Composition Lock] The first input image is the APPROVED START FRAME of this shot. Match its camera position, environment composition, lighting direction, and spatial arrangement of props/architecture EXACTLY. The second input image is the character's identity reference. Only the character's pose and the state described below change between start and end — every other visual element stays put.`,
-          promptText,
-        ].join("\n\n")
-      : promptText;
+    //
+    // v4.47.6: the lock is now CONDITIONAL on blocking. Same-zone (or
+    // unblocked) shots keep the exact v4.36 lock — correct for static
+    // state-changes. Cross-zone shots get the [Tracking Lock] variant:
+    // same environment/lighting/geography but the camera has tracked
+    // with the subject. The exact lock on a movement shot either forced
+    // near-identical frames (which the v4.41 similarity gate flags) or
+    // the model broke it and re-rolled the geography (the S02
+    // statue-side-swap audit finding).
+    const lockText = compositionAnchor
+      ? (composer.shotIsCrossZone?.(shot)
+          ? composer.buildTrackingLockText(shot, environment)
+          : `[Composition Lock] The first input image is the APPROVED START FRAME of this shot. Match its camera position, environment composition, lighting direction, and spatial arrangement of props/architecture EXACTLY. The second input image is the character's identity reference. Only the character's pose and the state described below change between start and end — every other visual element stays put.`)
+      : null;
+    const finalPromptText = lockText
+      ? [lockText, spatialPromptText].join("\n\n")
+      : spatialPromptText;
 
     // v4.40 INPUT-2: resolve the project's style anchor BEFORE the N-candidate
     // loop. Same anchor for every candidate (palette/lighting/composition
@@ -25253,6 +25425,53 @@ JSON object only. No commentary. No fences. No trailing text.`;
   // Parallel to showEditCharacterModal. Architecture / lighting / palette /
   // props are the composer-readable fields; without them the env reads as
   // "interior of a space" with no specific identity.
+  // ─── v4.47.6 — zone/landmark line formats (world map authoring) ───────
+  //
+  // Zones:     "id — description — connects: a, b"   (connects optional;
+  //            cross-env connection syntax "<env_id>:<zone_id>")
+  // Landmarks: "name — fixed position"
+  // Tolerant split on em-dash or double-hyphen separators. Slug helper
+  // mirrors the bootstrap id convention (lowercase snake_case).
+  function spatialSlug(s) {
+    return String(s || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  }
+  function parseZoneLines(text) {
+    return String(text || "").split("\n").map(l => l.trim()).filter(Boolean).map(line => {
+      const parts = line.split(/\s+—\s+|\s+--\s+/);
+      const id = spatialSlug(parts[0]);
+      if (!id) return null;
+      let description = "";
+      let connects_to = [];
+      for (const p of parts.slice(1)) {
+        const m = p.match(/^connects:\s*(.+)$/i);
+        if (m) connects_to = m[1].split(",").map(c => c.trim()).filter(Boolean);
+        else if (!description) description = p.trim();
+      }
+      return { id, name: parts[0].trim(), description, connects_to };
+    }).filter(Boolean);
+  }
+  function serializeZoneLines(zones) {
+    return (zones || []).map(z => {
+      const bits = [z.name || z.id];
+      if (z.description) bits.push(z.description);
+      if (Array.isArray(z.connects_to) && z.connects_to.length) bits.push(`connects: ${z.connects_to.join(", ")}`);
+      return bits.join(" — ");
+    }).join("\n");
+  }
+  function parseLandmarkLines(text) {
+    return String(text || "").split("\n").map(l => l.trim()).filter(Boolean).map(line => {
+      const parts = line.split(/\s+—\s+|\s+--\s+/);
+      const name = parts[0].trim();
+      if (!name) return null;
+      return { id: spatialSlug(name), name, fixed_position: (parts[1] || "").trim() };
+    }).filter(Boolean);
+  }
+  function serializeLandmarkLines(landmarks) {
+    return (landmarks || []).map(l => [l.name || l.id, l.fixed_position].filter(Boolean).join(" — ")).join("\n");
+  }
+  NS.parseZoneLines = parseZoneLines;
+  NS.parseLandmarkLines = parseLandmarkLines;
+
   async function showEditEnvironmentModal(locId) {
     const e = await Storage.get("environments", locId);
     if (!e) { toast(`Environment ${locId} not found`, { tone: "err" }); return; }
@@ -25294,6 +25513,16 @@ JSON object only. No commentary. No fences. No trailing text.`;
         `<textarea name="continuity_locks" rows="2" placeholder="One per line — e.g.\nmoonlight angle from upper-left\nviolet fog at ankle height" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc((e.continuity_locks || []).join("\n"))}</textarea>`,
         "Invariants the model must preserve across every shot in this environment."
       )}
+      ${fieldHtml(
+        "Map: named places (one per line)",
+        `<textarea name="zones" rows="3" placeholder="One per line — e.g.\nfountain — dry fountain at the courtyard's center\ncolonnade — shadowed west walkway — connects: fountain, throne_doors" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(serializeZoneLines(e.zones))}</textarea>`,
+        "Format: name — description — connects: a, b. Shots reference these places in their blocking so characters move through a consistent world (cross-environment link: other_env:place)."
+      )}
+      ${fieldHtml(
+        "Map: fixed landmarks (one per line)",
+        `<textarea name="landmarks" rows="2" placeholder="One per line — e.g.\nCracked lion statue — west side of the courtyard\nBroken archway — frames the north sky" style="${FIELD_INPUT_STYLE} resize:vertical;">${esc(serializeLandmarkLines(e.landmarks))}</textarea>`,
+        "Format: name — fixed position. Injected into every keyframe prompt so geography never flips between frames."
+      )}
     `;
     openFormModal({
       title: `Edit ${e.display_name}`,
@@ -25321,6 +25550,8 @@ JSON object only. No commentary. No fences. No trailing text.`;
           props: splitList(fd.get("props")),
           ambient_sound: String(fd.get("ambient_sound") || "").trim(),
           continuity_locks: splitList(fd.get("continuity_locks")),
+          zones: parseZoneLines(fd.get("zones")),
+          landmarks: parseLandmarkLines(fd.get("landmarks")),
         };
         await Storage.put("environments", updated);
         toast(`Saved "${updated.display_name}". Click Re-roll on the env card to regenerate.`, { tone: "ok", duration: 8000 });
@@ -25730,6 +25961,37 @@ JSON object only. No commentary. No fences. No trailing text.`;
         "Primary environment. Used as the [Environment] block in the composer."
       )}
       ${fieldHtml(
+        "Where the scene starts / ends",
+        `<datalist id="elx-zone-list">${
+          (environments.find(e => e.id === s.location?.location_id)?.zones || [])
+            .map(z => `<option value="${esc(z.id)}">${esc(z.name || z.id)}</option>`).join("")
+        }</datalist>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+          <div>
+            <input name="blocking_start_zone" list="elx-zone-list" type="text" value="${esc(s.blocking?.start?.zone || "")}" placeholder="starts at… (place from the location's map)" style="${FIELD_INPUT_STYLE}">
+            <select name="blocking_start_facing" style="${FIELD_INPUT_STYLE} margin-top:6px;">
+              <option value="" ${!s.blocking?.start?.facing ? "selected" : ""}>— facing (start) —</option>
+              <option value="frame_left" ${s.blocking?.start?.facing === "frame_left" ? "selected" : ""}>facing frame-left</option>
+              <option value="frame_right" ${s.blocking?.start?.facing === "frame_right" ? "selected" : ""}>facing frame-right</option>
+              <option value="toward_camera" ${s.blocking?.start?.facing === "toward_camera" ? "selected" : ""}>toward camera</option>
+              <option value="away_from_camera" ${s.blocking?.start?.facing === "away_from_camera" ? "selected" : ""}>away from camera</option>
+            </select>
+          </div>
+          <div>
+            <input name="blocking_end_zone" list="elx-zone-list" type="text" value="${esc(s.blocking?.end?.zone || "")}" placeholder="ends at… (same place = static shot)" style="${FIELD_INPUT_STYLE}">
+            <select name="blocking_end_facing" style="${FIELD_INPUT_STYLE} margin-top:6px;">
+              <option value="" ${!s.blocking?.end?.facing ? "selected" : ""}>— facing (end) —</option>
+              <option value="frame_left" ${s.blocking?.end?.facing === "frame_left" ? "selected" : ""}>facing frame-left</option>
+              <option value="frame_right" ${s.blocking?.end?.facing === "frame_right" ? "selected" : ""}>facing frame-right</option>
+              <option value="toward_camera" ${s.blocking?.end?.facing === "toward_camera" ? "selected" : ""}>toward camera</option>
+              <option value="away_from_camera" ${s.blocking?.end?.facing === "away_from_camera" ? "selected" : ""}>away from camera</option>
+            </select>
+          </div>
+        </div>
+        <input name="blocking_path" type="text" value="${esc(s.blocking?.path_note || "")}" placeholder="how they get there — e.g. sprints west across the gap, leaps the dry fountain" style="${FIELD_INPUT_STYLE} margin-top:6px;">`,
+        "v4.47.6 — the world-map layer. Different start/end places make this a movement shot: the end frame tracks WITH the character instead of copying the start composition, and the video prompt carries the screen direction. Leave empty for static shots."
+      )}
+      ${fieldHtml(
         "Cast in frame",
         `<div style="background:#0a0a0c; border:1px solid #2a2a35; border-radius:6px; padding:8px 12px;">${castOptions}</div>`,
         "Check every character visible in the shot."
@@ -25907,6 +26169,23 @@ JSON object only. No commentary. No fences. No trailing text.`;
           },
           // v4.45 M-AI-3: speed_ramp preset biases the [Action Sequence] block
           speed_ramp: String(fd.get("speed_ramp") || "auto"),
+          // v4.47.6: blocking from the "Where the scene starts / ends" row.
+          // All fields empty → null (legacy/static — composer behavior
+          // byte-identical to pre-spatial). position_note isn't editable in
+          // this compact row, so AI-authored notes are preserved on re-save.
+          blocking: (() => {
+            const sz = String(fd.get("blocking_start_zone") || "").trim();
+            const ez = String(fd.get("blocking_end_zone") || "").trim();
+            const sf = String(fd.get("blocking_start_facing") || "");
+            const ef = String(fd.get("blocking_end_facing") || "");
+            const path = String(fd.get("blocking_path") || "").trim();
+            if (!sz && !ez && !sf && !ef && !path) return null;
+            return {
+              start: { zone: sz || null, position_note: s.blocking?.start?.position_note || "", facing: sf || null },
+              end:   { zone: ez || sz || null, position_note: s.blocking?.end?.position_note || "", facing: ef || null },
+              path_note: path,
+            };
+          })(),
           audio: (() => {
             // v4.46 M-AI-5 Part A: parse sfx_events textarea back into the
             // structured array. Preserves cached audio on existing events
